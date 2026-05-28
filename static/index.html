@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Lyra</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #0A0A0F; overflow: hidden; font-family: system-ui, sans-serif; }
+    canvas { display: block; }
+    #controls {
+      position: fixed; bottom: 28px; left: 50%;
+      transform: translateX(-50%);
+      display: flex; gap: 8px; z-index: 10;
+    }
+    .btn {
+      padding: 7px 14px;
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.15);
+      color: rgba(255,255,255,0.7);
+      border-radius: 6px; cursor: pointer;
+      font-size: 12px; letter-spacing: 0.04em;
+      transition: background 0.2s, color 0.2s;
+    }
+    .btn:hover { background: rgba(255,255,255,0.1); }
+    .btn.active {
+      border-color: var(--c);
+      color: #fff;
+      background: rgba(255,255,255,0.12);
+      box-shadow: 0 0 10px var(--c);
+    }
+  </style>
+</head>
+<body>
+  <div id="controls"></div>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script>
+  // ── Scene ──────────────────────────────────────────────────────────
+  const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+  renderer.setPixelRatio(devicePixelRatio);
+  renderer.setSize(innerWidth, innerHeight);
+  document.body.prepend(renderer.domElement);
+
+  const scene  = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.1, 100);
+  camera.position.z = 4.5;
+  scene.add(new THREE.AmbientLight(0xffffff, 0.08));
+
+  addEventListener('resize', () => {
+    camera.aspect = innerWidth / innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight);
+  });
+
+  // ── State ──────────────────────────────────────────────────────────
+  const STATES = {
+    idle:       '#4A9EFF',
+    thinking:   '#9B59FF',
+    speaking:   '#2ECC71',
+    curious:    '#00D4FF',
+    processing: '#F39C12',
+    confused:   '#FF4444',
+    focused:    '#F0F0F0',
+  };
+
+  let currentState = 'idle';
+  const targetColor  = new THREE.Color(STATES.idle);
+  const currentColor = new THREE.Color(STATES.idle);
+
+  // ── Behaviors ─────────────────────────────────────────────────────
+  // speed:   per-ring orbit speed multipliers (negative = reverse)
+  // drift:   rings wander their tilt angles
+  // lock:    rings freeze tilt at base angle
+  // tight:   orbit radius shrinks ~20%
+  // pulse:   nucleus blinks at 0.5s interval
+  // flicker: nucleus emissive flickers randomly
+  // bright:  nucleus at max steady glow
+  // dim:     nucleus at low emissive
+  const B = {
+    idle:       { speed: [1.00, 1.00,  1.00], drift: false, lock: false, tight: false, pulse: false, flicker: false, bright: false, dim: false },
+    thinking:   { speed: [0.70, 1.30,  0.90], drift: true,  lock: false, tight: false, pulse: false, flicker: false, bright: false, dim: true  },
+    speaking:   { speed: [1.40, 1.40,  1.40], drift: false, lock: false, tight: false, pulse: true,  flicker: false, bright: false, dim: false },
+    curious:    { speed: [1.00, 1.00,  1.00], drift: false, lock: false, tight: true,  pulse: false, flicker: false, bright: false, dim: false },
+    processing: { speed: [2.50, 2.50,  2.50], drift: false, lock: false, tight: false, pulse: false, flicker: true,  bright: false, dim: false },
+    confused:   { speed: [1.50, 0.80, -1.20], drift: true,  lock: false, tight: false, pulse: false, flicker: false, bright: false, dim: true  },
+    focused:    { speed: [0.05, 0.05,  0.05], drift: false, lock: true,  tight: false, pulse: false, flicker: false, bright: true,  dim: false },
+  };
+
+  // ── Geometry helpers ───────────────────────────────────────────────
+  function emissiveMat(intensity) {
+    return new THREE.MeshStandardMaterial({
+      emissive: currentColor.clone(),
+      emissiveIntensity: intensity,
+      metalness: 0.4,
+      roughness: 0.5,
+    });
+  }
+
+  // ── Nucleus ────────────────────────────────────────────────────────
+  const nucleusMat = emissiveMat(1.5);
+  scene.add(new THREE.Mesh(new THREE.SphereGeometry(0.18, 32, 32), nucleusMat));
+
+  // ── Rings ──────────────────────────────────────────────────────────
+  const ORBIT_R    = 1.05;
+  const TRAIL_N    = 6;
+  const BASE_TILTS = [
+    [0,                 0],   // Ring 1 — equatorial
+    [Math.PI * 7 / 18,  0],  // Ring 2 — 70°
+    [Math.PI * 11 / 18, 0],  // Ring 3 — 110°
+  ];
+
+  const rings = BASE_TILTS.map(([bx, bz], i) => {
+    const ringMat = emissiveMat(0.6);
+    const ring = new THREE.Mesh(new THREE.TorusGeometry(ORBIT_R, 0.011, 8, 96), ringMat);
+    ring.rotation.set(bx, 0, bz);
+    scene.add(ring);
+
+    const dotMat = emissiveMat(2.2);
+    const dot = new THREE.Mesh(new THREE.SphereGeometry(0.044, 16, 16), dotMat);
+    scene.add(dot);
+
+    const trail = Array.from({ length: TRAIL_N }, (_, j) => {
+      const f   = 1 - (j + 1) / (TRAIL_N + 1);
+      const mat = new THREE.MeshStandardMaterial({
+        emissive: currentColor.clone(),
+        emissiveIntensity: 1.6 * f,
+        transparent: true,
+        opacity: 0.45 * f,
+      });
+      const m = new THREE.Mesh(new THREE.SphereGeometry(0.032 * f, 8, 8), mat);
+      scene.add(m);
+      return { mesh: m, mat };
+    });
+
+    return {
+      ring, ringMat, dot, dotMat, trail,
+      bx, bz,
+      driftX: 0, driftZ: 0,
+      angle: (i * Math.PI * 2) / 3,
+      radius: ORBIT_R,
+    };
+  });
+
+  // ── Animation ──────────────────────────────────────────────────────
+  let pulseT = 0;
+
+  function orbitPos(angle, radius, rx, rz) {
+    return new THREE.Vector3(Math.cos(angle) * radius, Math.sin(angle) * radius, 0)
+      .applyEuler(new THREE.Euler(rx, 0, rz));
+  }
+
+  function updateAtom(dt) {
+    const beh = B[currentState];
+
+    currentColor.lerp(targetColor, 1 - Math.pow(0.001, dt));
+
+    let ni;
+    if      (beh.pulse)   { pulseT += dt; ni = 1.5 + 1.5 * Math.sin(pulseT * Math.PI / 0.5); }
+    else if (beh.flicker) { ni = 0.6 + Math.random() * 2.0; }
+    else if (beh.bright)  { ni = 3.5; }
+    else if (beh.dim)     { ni = 0.4; }
+    else                  { ni = 1.5; }
+    nucleusMat.emissive.copy(currentColor);
+    nucleusMat.emissiveIntensity = ni;
+
+    rings.forEach((r, i) => {
+      r.angle += beh.speed[i] * 0.55 * dt;
+
+      if (beh.drift) {
+        r.driftX += (Math.random() - 0.5) * 0.004;
+        r.driftZ += (Math.random() - 0.5) * 0.004;
+        r.driftX  = Math.max(-0.35, Math.min(0.35, r.driftX));
+        r.driftZ  = Math.max(-0.35, Math.min(0.35, r.driftZ));
+      } else {
+        r.driftX *= 0.94;
+        r.driftZ *= 0.94;
+      }
+
+      const rx = beh.lock ? r.bx : r.bx + r.driftX;
+      const rz = beh.lock ? r.bz : r.bz + r.driftZ;
+      r.ring.rotation.set(rx, 0, rz);
+
+      const tR = beh.tight ? ORBIT_R * 0.80 : ORBIT_R;
+      r.radius += (tR - r.radius) * 0.04;
+
+      const sign = beh.speed[i] < 0 ? -1 : 1;
+      r.dot.position.copy(orbitPos(r.angle, r.radius, rx, rz));
+      r.trail.forEach(({ mesh, mat }, j) => {
+        mesh.position.copy(orbitPos(r.angle - sign * (j + 1) * 0.13, r.radius, rx, rz));
+        mat.emissive.copy(currentColor);
+      });
+
+      r.ringMat.emissive.copy(currentColor);
+      r.dotMat.emissive.copy(currentColor);
+    });
+  }
+
+  const clock = new THREE.Clock();
+  (function animate() {
+    requestAnimationFrame(animate);
+    updateAtom(Math.min(clock.getDelta(), 0.05));
+    renderer.render(scene, camera);
+  })();
+
+  // ── State polling ──────────────────────────────────────────────────
+  function applyState(data) {
+    currentState = data.state;
+    targetColor.set(data.color);
+    pulseT = 0;
+    document.querySelectorAll('.btn').forEach(b => {
+      const on = b.dataset.s === currentState;
+      b.classList.toggle('active', on);
+      if (on) b.style.setProperty('--c', data.color);
+    });
+  }
+
+  setInterval(async () => {
+    try { applyState(await (await fetch('/state')).json()); }
+    catch { /* retry next tick */ }
+  }, 100);
+
+  // ── Controls ───────────────────────────────────────────────────────
+  const ctrl = document.getElementById('controls');
+  Object.entries(STATES).forEach(([s, color]) => {
+    const btn      = document.createElement('button');
+    btn.className  = 'btn' + (s === 'idle' ? ' active' : '');
+    btn.dataset.s  = s;
+    btn.textContent = s;
+    if (s === 'idle') btn.style.setProperty('--c', color);
+    btn.onclick = async () => {
+      try {
+        applyState(await (await fetch('/state', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ state: s }),
+        })).json());
+      } catch (e) { console.warn('state update failed', e); }
+    };
+    ctrl.appendChild(btn);
+  });
+  </script>
+</body>
+</html>
