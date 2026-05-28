@@ -5,8 +5,20 @@
   <title>Lyra</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { background: #030308; overflow: hidden; font-family: system-ui, sans-serif; }
+    body { background: #030308; overflow: hidden; font-family: monospace; }
     canvas { display: block; }
+    #hud {
+      position: fixed; top: 20px; left: 20px;
+      pointer-events: none; opacity: 0.75;
+      color: #4A9EFF; transition: color 0.6s;
+    }
+    #hud h2 {
+      font-size: 13px; font-weight: normal;
+      letter-spacing: 0.18em; margin-bottom: 5px;
+    }
+    #hud-state {
+      font-size: 11px; letter-spacing: 0.12em; opacity: 0.8;
+    }
     #controls {
       position: fixed; bottom: 28px; left: 50%;
       transform: translateX(-50%);
@@ -31,6 +43,10 @@
   </style>
 </head>
 <body>
+  <div id="hud">
+    <h2>LYRA CORE // ONLINE</h2>
+    <p id="hud-state">STATE: IDLE</p>
+  </div>
   <div id="controls"></div>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
   <script>
@@ -42,14 +58,14 @@
 
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0x030308);
-  scene.fog = new THREE.FogExp2(0x030308, 0.08);
+  scene.fog = new THREE.FogExp2(0x030308, 0.04);
 
-  const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.1, 100);
-  camera.position.set(0.4, 0.25, 4.3);
+  const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.1, 200);
+  camera.position.set(1.2, 0.7, 14);
   camera.lookAt(0, 0, 0);
 
   // Core light bleeds outward onto rings; hemisphere gives cool rim fill
-  const coreLight = new THREE.PointLight(0x4A9EFF, 4, 8);
+  const coreLight = new THREE.PointLight(0x4A9EFF, 4, 30);
   scene.add(coreLight);
   scene.add(new THREE.HemisphereLight(0x112244, 0x000000, 0.2));
 
@@ -96,18 +112,18 @@
   // ── Nucleus ────────────────────────────────────────────────────────
   // Dark base + strong emissive = hologram core
   const nucleusMat = new THREE.MeshStandardMaterial({
-    color: new THREE.Color(0x020208),
+    color: new THREE.Color(0x001133),
     emissive: currentColor.clone(),
     emissiveIntensity: 2.0,
     transparent: true,
-    opacity: 0.85,
+    opacity: 0.9,
     metalness: 0.9,
     roughness: 0.1,
   });
-  scene.add(new THREE.Mesh(new THREE.SphereGeometry(0.22, 64, 64), nucleusMat));
+  scene.add(new THREE.Mesh(new THREE.SphereGeometry(0.85, 64, 64), nucleusMat));
 
   // ── Rings ──────────────────────────────────────────────────────────
-  const ORBIT_R    = 1.05;
+  const ORBIT_R    = 3.8;
   const TRAIL_N    = 6;
   const BASE_TILTS = [
     [0,                 0],   // Ring 1 — equatorial
@@ -125,7 +141,7 @@
       blending: THREE.AdditiveBlending,
       depthWrite: false,
     });
-    const ring = new THREE.Mesh(new THREE.TorusGeometry(ORBIT_R, 0.05, 16, 80), ringMat);
+    const ring = new THREE.Mesh(new THREE.TorusGeometry(ORBIT_R, 0.18, 16, 80), ringMat);
     ring.rotation.set(bx, 0, bz);
     scene.add(ring);
 
@@ -135,7 +151,7 @@
       metalness: 0.5,
       roughness: 0.1,
     });
-    const dot = new THREE.Mesh(new THREE.SphereGeometry(0.055, 32, 32), dotMat);
+    const dot = new THREE.Mesh(new THREE.SphereGeometry(0.2, 32, 32), dotMat);
     scene.add(dot);
 
     const trail = Array.from({ length: TRAIL_N }, (_, j) => {
@@ -147,7 +163,7 @@
         opacity: 0.5 * f,
         depthWrite: false,
       });
-      const m = new THREE.Mesh(new THREE.SphereGeometry(0.04 * f, 16, 16), mat);
+      const m = new THREE.Mesh(new THREE.SphereGeometry(0.15 * f, 16, 16), mat);
       scene.add(m);
       return { mesh: m, mat };
     });
@@ -208,7 +224,7 @@
       const sign = beh.speed[i] < 0 ? -1 : 1;
       r.dot.position.copy(orbitPos(r.angle, r.radius, rx, rz));
       r.trail.forEach(({ mesh, mat }, j) => {
-        mesh.position.copy(orbitPos(r.angle - sign * (j + 1) * 0.13, r.radius, rx, rz));
+        mesh.position.copy(orbitPos(r.angle - sign * (j + 1) * 0.06, r.radius, rx, rz));
         mat.emissive.copy(currentColor);
         mat.emissiveIntensity = ni * (1 - (j + 1) / (TRAIL_N + 1));
       });
@@ -230,6 +246,8 @@
     if (data.state !== currentState) pulseT = 0;
     currentState = data.state;
     targetColor.set(data.color);
+    document.getElementById('hud').style.color = data.color;
+    document.getElementById('hud-state').textContent = 'STATE: ' + data.state.toUpperCase();
     document.querySelectorAll('.btn').forEach(b => {
       const on = b.dataset.s === currentState;
       b.classList.toggle('active', on);
