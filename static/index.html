@@ -101,7 +101,7 @@
   // dim:     nucleus at low emissive
   const B = {
     idle:       { speed: [1.00, 1.00,  1.00], drift: false, lock: false, tight: false, pulse: false, flicker: false, bright: false, dim: false },
-    thinking:   { speed: [0.70, 1.30,  0.90], drift: true,  lock: false, tight: false, pulse: false, flicker: false, bright: false, dim: true  },
+    thinking:   { speed: [0.70, 1.30,  0.90], precess: true, drift: false, lock: false, tight: false, pulse: false, flicker: false, bright: false, dim: true  },
     speaking:   { speed: [1.40, 1.40,  1.40], drift: false, lock: false, tight: false, pulse: true,  flicker: false, bright: false, dim: false },
     curious:    { speed: [1.00, 1.00,  1.00], drift: false, lock: false, tight: true,  pulse: false, flicker: false, bright: false, dim: false },
     processing: { speed: [2.50, 2.50,  2.50], drift: false, lock: false, tight: false, pulse: false, flicker: true,  bright: false, dim: false },
@@ -199,6 +199,7 @@
       bx, bz,
       tiltX: bx, tiltZ: bz,
       driftX: 0, driftZ: 0,
+      phase: (i * Math.PI * 2) / 3,
       angle: (i * Math.PI * 2) / 3,
       radius: ORBIT_R,
     };
@@ -234,7 +235,13 @@
     rings.forEach((r, i) => {
       r.angle += beh.speed[i] * 0.55 * dt;
 
-      if (beh.drift) {
+      if (beh.precess) {
+        // slow sinusoidal precession — each ring orbits its base tilt smoothly
+        const speeds = [0.40, 0.65, 0.35];
+        r.phase += speeds[i] * dt;
+        r.tiltX = r.bx + Math.sin(r.phase) * 0.45;
+        r.tiltZ = r.bz + Math.cos(r.phase * 0.7) * 0.28;
+      } else if (beh.drift) {
         r.driftX += (Math.random() - 0.5) * 0.006;
         r.driftZ += (Math.random() - 0.5) * 0.006;
         r.driftX  = Math.max(-0.5, Math.min(0.5, r.driftX));
@@ -249,6 +256,9 @@
       }
 
       r.ring.rotation.set(r.tiltX, 0, r.tiltZ);
+      // sync ring visual radius to match dot orbit radius (fixes tight-mode mismatch)
+      const rs = r.radius / ORBIT_R;
+      r.ring.scale.set(rs, rs, 1);
 
       const tR = beh.tight ? ORBIT_R * 0.80 : ORBIT_R;
       r.radius += (tR - r.radius) * 0.04;
