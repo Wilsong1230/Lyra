@@ -143,6 +143,17 @@
     [-Math.PI / 9,  0],   // Ring 3 — polar, 110° (symmetric to Ring 2)
   ];
 
+  // Per-state target tilts [rx, rz] for each ring. null = random drift.
+  const STATE_TILTS = {
+    idle:       [[Math.PI/2, 0],          [Math.PI/9, 0],            [-Math.PI/9, 0]          ],
+    thinking:   null,
+    speaking:   [[Math.PI/2, 0],          [Math.PI/4, 0],            [-Math.PI/4, 0]          ],
+    curious:    [[Math.PI/3, 0],          [Math.PI/3,  Math.PI/4],   [Math.PI/3, -Math.PI/4]  ],
+    processing: [[Math.PI/2, 0],          [Math.PI/2,  Math.PI/3],   [Math.PI/2, -Math.PI/3]  ],
+    confused:   null,
+    focused:    [[Math.PI/2, 0],          [Math.PI/5.5, 0],          [-Math.PI/5.5, 0]        ],
+  };
+
   const rings = BASE_TILTS.map(([bx, bz], i) => {
     // Clean circle line — no mesh grid, just a glowing orbit trace
     const ringMat = new THREE.LineBasicMaterial({
@@ -186,6 +197,7 @@
     return {
       ring, ringMat, dot, dotMat, trail,
       bx, bz,
+      tiltX: bx, tiltZ: bz,
       driftX: 0, driftZ: 0,
       angle: (i * Math.PI * 2) / 3,
       radius: ORBIT_R,
@@ -223,26 +235,28 @@
       r.angle += beh.speed[i] * 0.55 * dt;
 
       if (beh.drift) {
-        r.driftX += (Math.random() - 0.5) * 0.004;
-        r.driftZ += (Math.random() - 0.5) * 0.004;
-        r.driftX  = Math.max(-0.35, Math.min(0.35, r.driftX));
-        r.driftZ  = Math.max(-0.35, Math.min(0.35, r.driftZ));
+        r.driftX += (Math.random() - 0.5) * 0.006;
+        r.driftZ += (Math.random() - 0.5) * 0.006;
+        r.driftX  = Math.max(-0.5, Math.min(0.5, r.driftX));
+        r.driftZ  = Math.max(-0.5, Math.min(0.5, r.driftZ));
+        r.tiltX   = r.bx + r.driftX;
+        r.tiltZ   = r.bz + r.driftZ;
       } else {
-        r.driftX *= 0.94;
-        r.driftZ *= 0.94;
+        const [tx, tz] = STATE_TILTS[currentState][i];
+        const lf = 1 - Math.pow(0.001, dt);
+        r.tiltX += (tx - r.tiltX) * lf;
+        r.tiltZ += (tz - r.tiltZ) * lf;
       }
 
-      const rx = beh.lock ? r.bx : r.bx + r.driftX;
-      const rz = beh.lock ? r.bz : r.bz + r.driftZ;
-      r.ring.rotation.set(rx, 0, rz);
+      r.ring.rotation.set(r.tiltX, 0, r.tiltZ);
 
       const tR = beh.tight ? ORBIT_R * 0.80 : ORBIT_R;
       r.radius += (tR - r.radius) * 0.04;
 
       const sign = beh.speed[i] < 0 ? -1 : 1;
-      r.dot.position.copy(orbitPos(r.angle, r.radius, rx, rz));
+      r.dot.position.copy(orbitPos(r.angle, r.radius, r.tiltX, r.tiltZ));
       r.trail.forEach(({ mesh, mat }, j) => {
-        mesh.position.copy(orbitPos(r.angle - sign * (j + 1) * 0.06, r.radius, rx, rz));
+        mesh.position.copy(orbitPos(r.angle - sign * (j + 1) * 0.06, r.radius, r.tiltX, r.tiltZ));
         mat.emissive.copy(currentColor);
         mat.emissiveIntensity = ni * (1 - (j + 1) / (TRAIL_N + 1));
       });
