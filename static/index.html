@@ -187,6 +187,7 @@
       r.trail.forEach(({ mesh, mat }, j) => {
         mesh.position.copy(orbitPos(r.angle - sign * (j + 1) * 0.13, r.radius, rx, rz));
         mat.emissive.copy(currentColor);
+        mat.emissiveIntensity = ni * (1 - (j + 1) / (TRAIL_N + 1));
       });
 
       r.ringMat.emissive.copy(currentColor);
@@ -203,9 +204,9 @@
 
   // ── State polling ──────────────────────────────────────────────────
   function applyState(data) {
+    if (data.state !== currentState) pulseT = 0;
     currentState = data.state;
     targetColor.set(data.color);
-    pulseT = 0;
     document.querySelectorAll('.btn').forEach(b => {
       const on = b.dataset.s === currentState;
       b.classList.toggle('active', on);
