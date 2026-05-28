@@ -61,7 +61,7 @@
   scene.fog = new THREE.FogExp2(0x030308, 0.04);
 
   const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.1, 200);
-  camera.position.set(1.2, 0.7, 7);
+  camera.position.set(1.2, 0.7, 10);
   camera.lookAt(0, 0, 0);
 
   // Core light bleeds outward onto rings; hemisphere gives cool rim fill
@@ -114,34 +114,49 @@
   const nucleusMat = new THREE.MeshStandardMaterial({
     color: new THREE.Color(0x001133),
     emissive: currentColor.clone(),
-    emissiveIntensity: 2.0,
+    emissiveIntensity: 2.5,
     transparent: true,
-    opacity: 0.9,
+    opacity: 0.92,
     metalness: 0.9,
-    roughness: 0.1,
+    roughness: 0.05,
   });
-  scene.add(new THREE.Mesh(new THREE.SphereGeometry(0.85, 64, 64), nucleusMat));
+  scene.add(new THREE.Mesh(new THREE.SphereGeometry(1.275, 64, 64), nucleusMat));
+
+  // Geodesic cage — slowly rotates, gives the nucleus structure and depth
+  const shellMat = new THREE.MeshBasicMaterial({
+    color: currentColor.clone(),
+    wireframe: true,
+    transparent: true,
+    opacity: 0.2,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+  });
+  const shellMesh = new THREE.Mesh(new THREE.IcosahedronGeometry(1.6, 1), shellMat);
+  scene.add(shellMesh);
 
   // ── Rings ──────────────────────────────────────────────────────────
   const ORBIT_R    = 3.8;
   const TRAIL_N    = 6;
   const BASE_TILTS = [
-    [0,                 0],   // Ring 1 — equatorial
-    [Math.PI * 7 / 18,  0],  // Ring 2 — 70°
-    [Math.PI * 11 / 18, 0],  // Ring 3 — 110°
+    [Math.PI / 2,   0],   // Ring 1 — equatorial (flat horizontal)
+    [Math.PI / 9,   0],   // Ring 2 — polar, 70° from equatorial
+    [-Math.PI / 9,  0],   // Ring 3 — polar, 110° (symmetric to Ring 2)
   ];
 
   const rings = BASE_TILTS.map(([bx, bz], i) => {
-    // Wireframe + additive blending = overlapping wires glow like light
-    const ringMat = new THREE.MeshBasicMaterial({
+    // Clean circle line — no mesh grid, just a glowing orbit trace
+    const ringMat = new THREE.LineBasicMaterial({
       color: currentColor.clone(),
-      wireframe: true,
       transparent: true,
-      opacity: 0.3,
+      opacity: 0.65,
       blending: THREE.AdditiveBlending,
       depthWrite: false,
     });
-    const ring = new THREE.Mesh(new THREE.TorusGeometry(ORBIT_R, 0.18, 16, 80), ringMat);
+    const circlePts = Array.from({ length: 129 }, (_, k) => {
+      const a = (k / 128) * Math.PI * 2;
+      return new THREE.Vector3(Math.cos(a) * ORBIT_R, Math.sin(a) * ORBIT_R, 0);
+    });
+    const ring = new THREE.Line(new THREE.BufferGeometry().setFromPoints(circlePts), ringMat);
     ring.rotation.set(bx, 0, bz);
     scene.add(ring);
 
@@ -198,6 +213,9 @@
     else                  { ni = 1.5; }
     nucleusMat.emissive.copy(currentColor);
     nucleusMat.emissiveIntensity = ni;
+    shellMat.color.copy(currentColor);
+    shellMesh.rotation.y += 0.3 * dt;
+    shellMesh.rotation.x += 0.15 * dt;
     coreLight.color.copy(currentColor);
     coreLight.intensity = ni * 2.5;
 
