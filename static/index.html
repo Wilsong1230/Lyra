@@ -202,6 +202,7 @@
       phase: (i * Math.PI * 2) / 3,
       angle: (i * Math.PI * 2) / 3,
       radius: ORBIT_R,
+      speed: B.idle.speed[i],
     };
   });
 
@@ -233,14 +234,19 @@
     coreLight.intensity = ni * 2.5;
 
     rings.forEach((r, i) => {
-      r.angle += beh.speed[i] * 0.55 * dt;
+      // Interpolate speed to avoid abrupt rhythm changes on state switch
+      r.speed += (beh.speed[i] - r.speed) * Math.min(0.06 * 60 * dt, 1);
+      r.angle += r.speed * 0.55 * dt;
 
+      const lf = 1 - Math.pow(0.001, dt);
       if (beh.precess) {
-        // slow sinusoidal precession — each ring orbits its base tilt smoothly
+        // Lerp toward the precession target so entry from other states is smooth
         const speeds = [0.40, 0.65, 0.35];
         r.phase += speeds[i] * dt;
-        r.tiltX = r.bx + Math.sin(r.phase) * 0.45;
-        r.tiltZ = r.bz + Math.cos(r.phase * 0.7) * 0.28;
+        const px = r.bx + Math.sin(r.phase) * 0.45;
+        const pz = r.bz + Math.cos(r.phase * 0.7) * 0.28;
+        r.tiltX += (px - r.tiltX) * lf;
+        r.tiltZ += (pz - r.tiltZ) * lf;
       } else if (beh.drift) {
         r.driftX += (Math.random() - 0.5) * 0.006;
         r.driftZ += (Math.random() - 0.5) * 0.006;
@@ -250,7 +256,6 @@
         r.tiltZ   = r.bz + r.driftZ;
       } else {
         const [tx, tz] = STATE_TILTS[currentState][i];
-        const lf = 1 - Math.pow(0.001, dt);
         r.tiltX += (tx - r.tiltX) * lf;
         r.tiltZ += (tz - r.tiltZ) * lf;
       }
@@ -263,7 +268,7 @@
       const tR = beh.tight ? ORBIT_R * 0.80 : ORBIT_R;
       r.radius += (tR - r.radius) * 0.04;
 
-      const sign = beh.speed[i] < 0 ? -1 : 1;
+      const sign = r.speed < 0 ? -1 : 1;
       r.dot.position.copy(orbitPos(r.angle, r.radius, r.tiltX, r.tiltZ));
       r.trail.forEach(({ mesh, mat }, j) => {
         mesh.position.copy(orbitPos(r.angle - sign * (j + 1) * 0.06, r.radius, r.tiltX, r.tiltZ));
@@ -285,7 +290,16 @@
 
   // ── State polling ──────────────────────────────────────────────────
   function applyState(data) {
-    if (data.state !== currentState) pulseT = 0;
+    if (data.state !== currentState) {
+      pulseT = 0;
+      // Seed drift offsets from the current tilt so entering confused never snaps
+      if (B[data.state].drift) {
+        rings.forEach(r => {
+          r.driftX = Math.max(-0.5, Math.min(0.5, r.tiltX - r.bx));
+          r.driftZ = Math.max(-0.5, Math.min(0.5, r.tiltZ - r.bz));
+        });
+      }
+    }
     currentState = data.state;
     targetColor.set(data.color);
     document.getElementById('hud').style.color = data.color;
