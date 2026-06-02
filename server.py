@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import io
 import os
+import threading
 from contextlib import asynccontextmanager
+
+import httpx
 
 import numpy as np
 import sounddevice as sd
@@ -46,3 +50,39 @@ def health():
 @app.get("/voices")
 def voices():
     return {"voices": KOKORO_VOICES}
+
+
+class SpeakRequest(BaseModel):
+    text: str
+    sync_emotion: bool = True
+
+
+@app.post("/speak")
+def speak(req: SpeakRequest):
+    chunks = [audio for _, _, audio in _tts(req.text, voice=KOKORO_VOICE)]
+    audio = np.concatenate(chunks)
+
+    if req.sync_emotion:
+        try:
+            httpx.post(f"{EMBODIMENT_URL}/state", json={"state": "speaking"}, timeout=2)
+        except Exception:
+            pass
+
+    def _play_and_reset():
+        try:
+            sd.play(audio, samplerate=SAMPLE_RATE)
+            sd.wait()
+        except Exception:
+            pass
+        if req.sync_emotion:
+            try:
+                httpx.post(f"{EMBODIMENT_URL}/state", json={"state": "idle"}, timeout=2)
+            except Exception:
+                pass
+
+    threading.Thread(target=_play_and_reset, daemon=True).start()
+
+    buf = io.BytesIO()
+    sf.write(buf, audio, SAMPLE_RATE, format="WAV")
+    buf.seek(0)
+    return Response(content=buf.read(), media_type="audio/wav")
