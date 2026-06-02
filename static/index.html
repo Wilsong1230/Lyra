@@ -199,9 +199,10 @@
       bx, bz,
       tiltX: bx, tiltZ: bz,
       driftX: 0, driftZ: 0,
+      driftBiasX: 0, driftBiasZ: 0,
       phase: (i * Math.PI * 2) / 3,
       angle: (i * Math.PI * 2) / 3,
-      precessZBias: 0,
+      precessXBias: 0, precessZBias: 0,
       radius: ORBIT_R,
       speed: B.idle.speed[i],
     };
@@ -246,17 +247,21 @@
         r.phase += speeds[i] * dt;
         const px = r.bx + Math.sin(r.phase) * 0.45;
         const pz = r.bz + Math.cos(r.phase * 0.7) * 0.28;
-        // Decay the Z bias seeded on entry so Z transitions without jumping
+        // Decay X/Z biases seeded on entry so neither axis jumps
+        r.precessXBias *= Math.pow(0.002, dt);
         r.precessZBias *= Math.pow(0.002, dt);
-        r.tiltX += (px - r.tiltX) * lf;
+        r.tiltX += ((px + r.precessXBias) - r.tiltX) * lf;
         r.tiltZ += ((pz + r.precessZBias) - r.tiltZ) * lf;
       } else if (beh.drift) {
         r.driftX += (Math.random() - 0.5) * 0.006;
         r.driftZ += (Math.random() - 0.5) * 0.006;
         r.driftX  = Math.max(-0.5, Math.min(0.5, r.driftX));
         r.driftZ  = Math.max(-0.5, Math.min(0.5, r.driftZ));
-        r.tiltX   = r.bx + r.driftX;
-        r.tiltZ   = r.bz + r.driftZ;
+        // Bias decays to zero, pulling the ring back into the drift range smoothly
+        r.driftBiasX *= Math.pow(0.002, dt);
+        r.driftBiasZ *= Math.pow(0.002, dt);
+        r.tiltX = r.bx + r.driftX + r.driftBiasX;
+        r.tiltZ = r.bz + r.driftZ + r.driftBiasZ;
       } else {
         const [tx, tz] = STATE_TILTS[currentState][i];
         r.tiltX += (tx - r.tiltX) * lf;
@@ -296,11 +301,15 @@
     if (data.state !== currentState) {
       pulseT = 0;
       const newBeh = B[data.state];
-      // Seed drift offsets from the current tilt so entering confused never snaps
+      // Seed drift offsets from current tilt. When the ring is outside the drift
+      // range (coming from curious/processing), the clamp would snap it; instead
+      // capture the excess as a decaying bias so the transition stays smooth.
       if (newBeh.drift) {
         rings.forEach(r => {
           r.driftX = Math.max(-0.5, Math.min(0.5, r.tiltX - r.bx));
           r.driftZ = Math.max(-0.5, Math.min(0.5, r.tiltZ - r.bz));
+          r.driftBiasX = r.tiltX - (r.bx + r.driftX);
+          r.driftBiasZ = r.tiltZ - (r.bz + r.driftZ);
         });
       }
       // Seed phase so the precess formula starts at the current tilt position.
@@ -310,7 +319,9 @@
         rings.forEach(r => {
           const ratio = (r.tiltX - r.bx) / 0.45;
           r.phase = Math.asin(Math.max(-1, Math.min(1, ratio)));
+          const px0 = r.bx + Math.sin(r.phase) * 0.45;
           const pz0 = r.bz + Math.cos(r.phase * 0.7) * 0.28;
+          r.precessXBias = r.tiltX - px0;
           r.precessZBias = r.tiltZ - pz0;
         });
       }
