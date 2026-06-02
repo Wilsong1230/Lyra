@@ -100,5 +100,4 @@ async def transcribe(file: UploadFile):
         result = _stt.transcribe(tmp_path)
         return {"text": result["text"]}
     finally:
-        import os as _os
-        _os.unlink(tmp_path)
+        os.unlink(tmp_path)
