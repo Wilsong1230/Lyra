@@ -52,6 +52,15 @@ _kokoro = None
 _coqui = None
 _stt: whisper.Whisper | None = None
 
+_ENV_WINDOW = int(SAMPLE_RATE * 0.05)  # 50ms windows
+
+
+def _amplitude_envelope(audio: np.ndarray) -> list[float]:
+    n = len(audio) // _ENV_WINDOW
+    rms = [float(np.sqrt(np.mean(audio[i * _ENV_WINDOW:(i + 1) * _ENV_WINDOW] ** 2))) for i in range(n)]
+    peak = max(rms) if rms else 1.0
+    return [round(v / peak, 4) for v in rms] if peak > 0 else rms
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -97,16 +106,22 @@ def speak(req: SpeakRequest):
 
     if req.sync_emotion:
         try:
-            httpx.post(f"{EMBODIMENT_URL}/state", json={"state": "speaking"}, timeout=2)
+            envelope = _amplitude_envelope(audio)
+            httpx.post(f"{EMBODIMENT_URL}/state", json={"state": "speaking", "amplitude_envelope": envelope}, timeout=2)
         except Exception:
             pass
 
     def _play_and_reset():
         try:
-            sd.play(audio, samplerate=SAMPLE_RATE)
-            sd.wait()
+            device = sd.default.device[1]  # default output device
+            sd.play(audio, samplerate=SAMPLE_RATE, device=device, blocking=True)
         except Exception as e:
             print(f"[voice] playback error: {e}", flush=True)
+            # log available devices to help debug
+            try:
+                print(f"[voice] available devices: {sd.query_devices()}", flush=True)
+            except Exception:
+                pass
         finally:
             if req.sync_emotion:
                 try:
