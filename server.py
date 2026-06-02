@@ -6,18 +6,28 @@ import tempfile
 import threading
 from contextlib import asynccontextmanager
 
-import httpx
+import torch
 
+_real_torch_load = torch.load
+def _patched_torch_load(*args, **kwargs):
+    kwargs.setdefault("weights_only", False)
+    return _real_torch_load(*args, **kwargs)
+torch.load = _patched_torch_load
+
+import httpx
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
 import whisper
-from kokoro import KPipeline
 from fastapi import FastAPI, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel
 
+TTS_ENGINE = os.getenv("TTS_ENGINE", "kokoro")  # "kokoro" or "coqui"
+
 KOKORO_VOICE = os.getenv("KOKORO_VOICE", "bf_emma")
+COQUI_VOICE = os.getenv("COQUI_VOICE", "Claribel Dervla")
+COQUI_LANG = os.getenv("COQUI_LANG", "en")
 WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", "base")
 EMBODIMENT_URL = os.getenv("EMBODIMENT_URL", "http://localhost:8000")
 SAMPLE_RATE = 24000
@@ -28,15 +38,32 @@ KOKORO_VOICES = [
     "bf_emma", "bf_isabella", "bm_george", "bm_lewis",
 ]
 
-_tts: KPipeline | None = None
+COQUI_VOICES = [
+    "Claribel Dervla", "Daisy Studious", "Grace Oshea", "Gracie Wise",
+    "Tammie Ema", "Alison Dietlinde", "Ana Florence", "Annmarie Nele",
+    "Asya Anara", "Brenda Stern", "Gitta Nikolaus", "Henriette Usha",
+    "Sofia Hellen", "Tammy Grit", "Tanja Adelina", "Vjollca Johnnie",
+    "Andrew Chipper", "Badr Odhiambo", "Dionisio Schuyler", "Royston Min",
+    "Viktor Eka", "Abrahan Mack", "Adde Michal", "Baldur Sanjin",
+    "Craig Gutsy", "Damien Black", "Gilberto Mathias", "Ilkin Urbano",
+]
+
+_kokoro = None
+_coqui = None
 _stt: whisper.Whisper | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _tts, _stt
-    _tts = KPipeline(lang_code="b")
+    global _kokoro, _coqui, _stt
+    if TTS_ENGINE == "coqui":
+        from TTS.api import TTS
+        _coqui = TTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=torch.cuda.is_available())
+    else:
+        from kokoro import KPipeline
+        _kokoro = KPipeline(lang_code="b")
     _stt = whisper.load_model(WHISPER_MODEL_NAME)
+    print(f"[voice] ready  engine={TTS_ENGINE}", flush=True)
     yield
 
 
@@ -45,12 +72,13 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "tts_voice": KOKORO_VOICE, "stt_model": WHISPER_MODEL_NAME}
+    voice = COQUI_VOICE if TTS_ENGINE == "coqui" else KOKORO_VOICE
+    return {"status": "ok", "engine": TTS_ENGINE, "tts_voice": voice, "stt_model": WHISPER_MODEL_NAME}
 
 
 @app.get("/voices")
 def voices():
-    return {"voices": KOKORO_VOICES}
+    return {"voices": COQUI_VOICES if TTS_ENGINE == "coqui" else KOKORO_VOICES}
 
 
 class SpeakRequest(BaseModel):
@@ -60,8 +88,12 @@ class SpeakRequest(BaseModel):
 
 @app.post("/speak")
 def speak(req: SpeakRequest):
-    chunks = [audio for _, _, audio in _tts(req.text, voice=KOKORO_VOICE)]
-    audio = np.concatenate(chunks)
+    if TTS_ENGINE == "coqui":
+        wav = _coqui.tts(text=req.text, speaker=COQUI_VOICE, language=COQUI_LANG)
+        audio = np.array(wav, dtype=np.float32)
+    else:
+        chunks = [a for _, _, a in _kokoro(req.text, voice=KOKORO_VOICE)]
+        audio = np.concatenate(chunks)
 
     if req.sync_emotion:
         try:
@@ -73,8 +105,8 @@ def speak(req: SpeakRequest):
         try:
             sd.play(audio, samplerate=SAMPLE_RATE)
             sd.wait()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[voice] playback error: {e}", flush=True)
         finally:
             if req.sync_emotion:
                 try:
