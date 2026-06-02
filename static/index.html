@@ -292,11 +292,19 @@
   function applyState(data) {
     if (data.state !== currentState) {
       pulseT = 0;
+      const newBeh = B[data.state];
       // Seed drift offsets from the current tilt so entering confused never snaps
-      if (B[data.state].drift) {
+      if (newBeh.drift) {
         rings.forEach(r => {
           r.driftX = Math.max(-0.5, Math.min(0.5, r.tiltX - r.bx));
           r.driftZ = Math.max(-0.5, Math.min(0.5, r.tiltZ - r.bz));
+        });
+      }
+      // Seed phase so the precess formula starts at the current tilt position
+      if (newBeh.precess) {
+        rings.forEach(r => {
+          const ratio = (r.tiltX - r.bx) / 0.45;
+          r.phase = Math.asin(Math.max(-1, Math.min(1, ratio)));
         });
       }
     }
