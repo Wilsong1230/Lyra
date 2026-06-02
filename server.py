@@ -74,11 +74,12 @@ def speak(req: SpeakRequest):
             sd.wait()
         except Exception:
             pass
-        if req.sync_emotion:
-            try:
-                httpx.post(f"{EMBODIMENT_URL}/state", json={"state": "idle"}, timeout=2)
-            except Exception:
-                pass
+        finally:
+            if req.sync_emotion:
+                try:
+                    httpx.post(f"{EMBODIMENT_URL}/state", json={"state": "idle"}, timeout=2)
+                except Exception:
+                    pass
 
     threading.Thread(target=_play_and_reset, daemon=True).start()
 
