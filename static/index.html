@@ -76,6 +76,9 @@
   });
 
   // ── State ──────────────────────────────────────────────────────────
+  let currentAmplitude = 0;
+  let smoothAmplitude  = 0;
+
   const STATES = {
     idle:       '#4A9EFF',
     thinking:   '#9B59FF',
@@ -120,7 +123,8 @@
     metalness: 0.9,
     roughness: 0.05,
   });
-  scene.add(new THREE.Mesh(new THREE.SphereGeometry(1.275, 64, 64), nucleusMat));
+  const nucleusMesh = new THREE.Mesh(new THREE.SphereGeometry(1.275, 64, 64), nucleusMat);
+  scene.add(nucleusMesh);
 
   // Geodesic cage — slowly rotates, gives the nucleus structure and depth
   const shellMat = new THREE.MeshBasicMaterial({
@@ -221,17 +225,29 @@
 
     currentColor.lerp(targetColor, 1 - Math.pow(0.001, dt));
 
+    // Smooth amplitude with fast attack, slow decay
+    const target = currentState === 'speaking' ? currentAmplitude : 0;
+    const rate   = target > smoothAmplitude ? 12 : 4;
+    smoothAmplitude += (target - smoothAmplitude) * Math.min(rate * dt, 1);
+
     let ni;
-    if      (beh.pulse)   { pulseT += dt; ni = 1.5 + 1.5 * Math.sin(pulseT * Math.PI / 0.5); }
+    if (currentState === 'speaking' && smoothAmplitude > 0.01) {
+      ni = 1.2 + smoothAmplitude * 3.0;
+    } else if (beh.pulse)   { pulseT += dt; ni = 1.5 + 1.5 * Math.sin(pulseT * Math.PI / 0.5); }
     else if (beh.flicker) { ni = 0.6 + Math.random() * 2.0; }
     else if (beh.bright)  { ni = 3.5; }
     else if (beh.dim)     { ni = 0.4; }
     else                  { ni = 1.5; }
+
+    // Nucleus scale pulses with voice amplitude
+    const nucleusScale = currentState === 'speaking' ? 1 + smoothAmplitude * 0.18 : 1;
     nucleusMat.emissive.copy(currentColor);
     nucleusMat.emissiveIntensity = ni;
+    nucleusMesh.scale.setScalar(nucleusScale);
     shellMat.color.copy(currentColor);
     shellMesh.rotation.y += 0.3 * dt;
     shellMesh.rotation.x += 0.15 * dt;
+    shellMesh.scale.setScalar(nucleusScale);
     coreLight.color.copy(currentColor);
     coreLight.intensity = ni * 2.5;
 
@@ -338,8 +354,11 @@
   }
 
   setInterval(async () => {
-    try { applyState(await (await fetch('/state')).json()); }
-    catch { /* retry next tick */ }
+    try {
+      const data = await (await fetch('/state')).json();
+      currentAmplitude = data.amplitude ?? 0;
+      applyState(data);
+    } catch { /* retry next tick */ }
   }, 100);
 
   // ── Controls ───────────────────────────────────────────────────────
