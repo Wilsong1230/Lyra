@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import os
+import tempfile
 import threading
 from contextlib import asynccontextmanager
 
@@ -87,3 +88,17 @@ def speak(req: SpeakRequest):
     sf.write(buf, audio, SAMPLE_RATE, format="WAV")
     buf.seek(0)
     return Response(content=buf.read(), media_type="audio/wav")
+
+
+@app.post("/transcribe")
+async def transcribe(file: UploadFile):
+    data = await file.read()
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        tmp.write(data)
+        tmp_path = tmp.name
+    try:
+        result = _stt.transcribe(tmp_path)
+        return {"text": result["text"]}
+    finally:
+        import os as _os
+        _os.unlink(tmp_path)

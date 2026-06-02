@@ -70,3 +70,19 @@ def test_speak_continues_when_emotion_sync_fails(client):
         r = client.post("/speak", json={"text": "Hello."})
     assert r.status_code == 200
     assert r.content[:4] == b"RIFF"
+
+
+import io as _io
+
+
+def test_transcribe_returns_text(client):
+    fake_wav = _io.BytesIO(b"RIFF" + b"\x00" * 36)
+    r = client.post("/transcribe", files={"file": ("test.wav", fake_wav, "audio/wav")})
+    assert r.status_code == 200
+    assert "text" in r.json()
+    assert r.json()["text"] == "hello world"
+
+
+def test_transcribe_requires_file(client):
+    r = client.post("/transcribe")
+    assert r.status_code == 422
