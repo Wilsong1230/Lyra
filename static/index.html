@@ -201,6 +201,7 @@
       driftX: 0, driftZ: 0,
       phase: (i * Math.PI * 2) / 3,
       angle: (i * Math.PI * 2) / 3,
+      precessZBias: 0,
       radius: ORBIT_R,
       speed: B.idle.speed[i],
     };
@@ -245,8 +246,10 @@
         r.phase += speeds[i] * dt;
         const px = r.bx + Math.sin(r.phase) * 0.45;
         const pz = r.bz + Math.cos(r.phase * 0.7) * 0.28;
+        // Decay the Z bias seeded on entry so Z transitions without jumping
+        r.precessZBias *= Math.pow(0.002, dt);
         r.tiltX += (px - r.tiltX) * lf;
-        r.tiltZ += (pz - r.tiltZ) * lf;
+        r.tiltZ += ((pz + r.precessZBias) - r.tiltZ) * lf;
       } else if (beh.drift) {
         r.driftX += (Math.random() - 0.5) * 0.006;
         r.driftZ += (Math.random() - 0.5) * 0.006;
@@ -300,11 +303,15 @@
           r.driftZ = Math.max(-0.5, Math.min(0.5, r.tiltZ - r.bz));
         });
       }
-      // Seed phase so the precess formula starts at the current tilt position
+      // Seed phase so the precess formula starts at the current tilt position.
+      // Also seed precessZBias so the Z axis starts at the current tiltZ and
+      // smoothly converges onto the precess orbit rather than snapping to it.
       if (newBeh.precess) {
         rings.forEach(r => {
           const ratio = (r.tiltX - r.bx) / 0.45;
           r.phase = Math.asin(Math.max(-1, Math.min(1, ratio)));
+          const pz0 = r.bz + Math.cos(r.phase * 0.7) * 0.28;
+          r.precessZBias = r.tiltZ - pz0;
         });
       }
     }
