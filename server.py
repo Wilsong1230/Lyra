@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import io
 import os
-import tempfile
 import threading
 from contextlib import asynccontextmanager
 
@@ -18,17 +17,16 @@ import httpx
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
-import whisper
-from fastapi import FastAPI, UploadFile
+from fastapi import FastAPI
 from fastapi.responses import Response
+from kokoro import KPipeline
 from pydantic import BaseModel
 
-TTS_ENGINE = os.getenv("TTS_ENGINE", "kokoro")  # "kokoro" or "coqui"
+TTS_ENGINE = os.getenv("TTS_ENGINE", "kokoro")
 
 KOKORO_VOICE = os.getenv("KOKORO_VOICE", "bf_emma")
 COQUI_VOICE = os.getenv("COQUI_VOICE", "Claribel Dervla")
 COQUI_LANG = os.getenv("COQUI_LANG", "en")
-WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", "base")
 EMBODIMENT_URL = os.getenv("EMBODIMENT_URL", "http://localhost:8000")
 SAMPLE_RATE = 24000
 
@@ -50,9 +48,8 @@ COQUI_VOICES = [
 
 _kokoro = None
 _coqui = None
-_stt: whisper.Whisper | None = None
 
-_ENV_WINDOW = int(SAMPLE_RATE * 0.05)  # 50ms windows
+_ENV_WINDOW = int(SAMPLE_RATE * 0.05)
 
 
 def _amplitude_envelope(audio: np.ndarray) -> list[float]:
@@ -64,14 +61,12 @@ def _amplitude_envelope(audio: np.ndarray) -> list[float]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _kokoro, _coqui, _stt
+    global _kokoro, _coqui
     if TTS_ENGINE == "coqui":
         from TTS.api import TTS
         _coqui = TTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=torch.cuda.is_available())
     else:
-        from kokoro import KPipeline
         _kokoro = KPipeline(lang_code="b")
-    _stt = whisper.load_model(WHISPER_MODEL_NAME)
     print(f"[voice] ready  engine={TTS_ENGINE}", flush=True)
     yield
 
@@ -82,7 +77,7 @@ app = FastAPI(lifespan=lifespan)
 @app.get("/health")
 def health():
     voice = COQUI_VOICE if TTS_ENGINE == "coqui" else KOKORO_VOICE
-    return {"status": "ok", "engine": TTS_ENGINE, "tts_voice": voice, "stt_model": WHISPER_MODEL_NAME}
+    return {"status": "ok", "engine": TTS_ENGINE, "tts_voice": voice}
 
 
 @app.get("/voices")
@@ -107,21 +102,17 @@ def speak(req: SpeakRequest):
     if req.sync_emotion:
         try:
             envelope = _amplitude_envelope(audio)
-            httpx.post(f"{EMBODIMENT_URL}/state", json={"state": "speaking", "amplitude_envelope": envelope}, timeout=2)
+            httpx.post(f"{EMBODIMENT_URL}/state",
+                       json={"state": "speaking", "amplitude_envelope": envelope}, timeout=2)
         except Exception:
             pass
 
     def _play_and_reset():
         try:
-            device = sd.default.device[1]  # default output device
+            device = sd.default.device[1]
             sd.play(audio, samplerate=SAMPLE_RATE, device=device, blocking=True)
         except Exception as e:
             print(f"[voice] playback error: {e}", flush=True)
-            # log available devices to help debug
-            try:
-                print(f"[voice] available devices: {sd.query_devices()}", flush=True)
-            except Exception:
-                pass
         finally:
             if req.sync_emotion:
                 try:
@@ -135,16 +126,3 @@ def speak(req: SpeakRequest):
     sf.write(buf, audio, SAMPLE_RATE, format="WAV")
     buf.seek(0)
     return Response(content=buf.read(), media_type="audio/wav")
-
-
-@app.post("/transcribe")
-async def transcribe(file: UploadFile):
-    data = await file.read()
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        tmp.write(data)
-        tmp_path = tmp.name
-    try:
-        result = _stt.transcribe(tmp_path)
-        return {"text": result["text"]}
-    finally:
-        os.unlink(tmp_path)
