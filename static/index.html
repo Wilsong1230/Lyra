@@ -87,6 +87,7 @@
     processing: '#F39C12',
     confused:   '#FF4444',
     focused:    '#F0F0F0',
+    listening:  '#FF9500',
   };
 
   let currentState = 'idle';
@@ -110,6 +111,7 @@
     processing: { speed: [2.50, 2.50,  2.50], drift: false, lock: false, tight: false, pulse: false, flicker: true,  bright: false, dim: false },
     confused:   { speed: [1.50, 0.80, -1.20], drift: true,  lock: false, tight: false, pulse: false, flicker: false, bright: false, dim: true  },
     focused:    { speed: [0.05, 0.05,  0.05], drift: false, lock: true,  tight: false, pulse: false, flicker: false, bright: true,  dim: false },
+    listening:  { speed: [0.60, 0.60, 0.60], drift: false, lock: false, tight: true,  pulse: false, flicker: false, bright: false, dim: true  },
   };
 
   // ── Nucleus ────────────────────────────────────────────────────────
@@ -156,6 +158,7 @@
     processing: [[Math.PI/2, 0],          [Math.PI/2,  Math.PI/3],   [Math.PI/2, -Math.PI/3]  ],
     confused:   null,
     focused:    [[Math.PI/2, 0],          [Math.PI/5.5, 0],          [-Math.PI/5.5, 0]        ],
+    listening:  [[Math.PI/2, 0],          [Math.PI/9, 0],            [-Math.PI/9, 0]          ],
   };
 
   const rings = BASE_TILTS.map(([bx, bz], i) => {

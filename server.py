@@ -23,6 +23,7 @@ STATES = {
     "processing": "#F39C12",
     "confused":   "#FF4444",
     "focused":    "#F0F0F0",
+    "listening":  "#FF9500",
 }
 
 state = {"state": "idle", "color": STATES["idle"]}
