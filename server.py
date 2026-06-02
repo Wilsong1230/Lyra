@@ -24,7 +24,7 @@ KOKORO_VOICES = [
 ]
 
 _tts: KPipeline | None = None
-_stt = None
+_stt: whisper.Whisper | None = None
 
 
 @asynccontextmanager
