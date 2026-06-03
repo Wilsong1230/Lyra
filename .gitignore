@@ -11,3 +11,4 @@ build/
 .env
 *.onnx
 
+docs/superpowers/
