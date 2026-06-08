@@ -1,0 +1,29 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.5.2.0
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "mod", "mod", "{4721CDBE-9835-733F-D50B-18F505229922}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "LyraIntegration", "mod\LyraIntegration\LyraIntegration.csproj", "{C3BECBBE-B818-D6D2-3372-E76FE2935D4D}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{C3BECBBE-B818-D6D2-3372-E76FE2935D4D}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{C3BECBBE-B818-D6D2-3372-E76FE2935D4D}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{C3BECBBE-B818-D6D2-3372-E76FE2935D4D}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{C3BECBBE-B818-D6D2-3372-E76FE2935D4D}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{C3BECBBE-B818-D6D2-3372-E76FE2935D4D} = {4721CDBE-9835-733F-D50B-18F505229922}
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {52D2A637-46C8-47E8-AD3B-CC4B64E65F5B}
+	EndGlobalSection
+EndGlobal
