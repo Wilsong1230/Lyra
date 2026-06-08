@@ -12,17 +12,20 @@ Core AI services for Lyra.
 ## Setup
 
 ```bash
-# Install lyra-memory first (lyra_ai depends on it)
+# 1. Install lyra-memory into its own venv
 cd lyra-memory
 python3 -m venv venv && source venv/bin/activate
 pip install -e .
+deactivate
 
-# Install lyra_ai
+# 2. Install lyra_ai — also install lyra-memory into this venv
+#    (lyra_ai imports lyra_memory; both must be on the same Python path)
 cd ../lyra_ai
 python3 -m venv .venv && source .venv/bin/activate
+pip install -e ../lyra-memory   # cross-service dependency
 pip install -e ".[dev]"
 
-# Run
+# 3. Run
 lyra
 ```
 
