@@ -2,9 +2,23 @@ from __future__ import annotations
 import io
 import sys
 from contextlib import redirect_stdout
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from lyra.cli import main
+
+
+async def _async_stream(items):
+    for item in items:
+        yield item
+
+
+def _make_mock_assistant() -> MagicMock:
+    """Return a MagicMock assistant with async lifecycle/chat methods."""
+    m = MagicMock()
+    m.start = AsyncMock()
+    m.stop = AsyncMock()
+    m.chat_with_tools = AsyncMock()
+    return m
 
 
 def _run_main(inputs: list[str], mock_assistant: MagicMock | None = None) -> str:
@@ -16,7 +30,7 @@ def _run_main(inputs: list[str], mock_assistant: MagicMock | None = None) -> str
     mock_memory.get_history.return_value = []
 
     if mock_assistant is None:
-        mock_assistant = MagicMock()
+        mock_assistant = _make_mock_assistant()
 
     input_iter = iter(inputs)
 
@@ -53,8 +67,8 @@ def test_stream_appears_in_help():
 
 
 def test_streaming_output_prints_chunks():
-    mock_assistant = MagicMock()
-    mock_assistant.stream_chat_with_tools.return_value = iter(["Hello", " world"])
+    mock_assistant = _make_mock_assistant()
+    mock_assistant.stream_chat_with_tools.side_effect = lambda *a, **kw: _async_stream(["Hello", " world"])
 
     output = _run_main(["/stream", "hello", "/quit"], mock_assistant=mock_assistant)
     assert "Hello world" in output
@@ -62,7 +76,7 @@ def test_streaming_output_prints_chunks():
 
 
 def test_non_streaming_path_unchanged():
-    mock_assistant = MagicMock()
+    mock_assistant = _make_mock_assistant()
     mock_assistant.chat_with_tools.return_value = "Hello world"
 
     output = _run_main(["hello", "/quit"], mock_assistant=mock_assistant)
@@ -72,7 +86,7 @@ def test_non_streaming_path_unchanged():
 
 
 def test_cli_calls_chat_with_tools_not_chat():
-    mock_assistant = MagicMock()
+    mock_assistant = _make_mock_assistant()
     mock_assistant.chat_with_tools.return_value = "You have a terminal open."
 
     output = _run_main(["what's on my screen?", "/quit"], mock_assistant=mock_assistant)
@@ -83,8 +97,8 @@ def test_cli_calls_chat_with_tools_not_chat():
 
 
 def test_cli_calls_stream_chat_with_tools_not_stream_chat():
-    mock_assistant = MagicMock()
-    mock_assistant.stream_chat_with_tools.return_value = iter(["You have", " a browser open."])
+    mock_assistant = _make_mock_assistant()
+    mock_assistant.stream_chat_with_tools.side_effect = lambda *a, **kw: _async_stream(["You have", " a browser open."])
 
     output = _run_main(["/stream", "what's on my screen?", "/quit"], mock_assistant=mock_assistant)
 
