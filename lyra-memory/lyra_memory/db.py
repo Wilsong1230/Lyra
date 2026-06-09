@@ -73,7 +73,16 @@ async def init_db(path: Path) -> aiosqlite.Connection:
     await conn.executescript(_CREATE_SQL)
     await conn.executescript(_CREATE_VEC_SQL)
     await conn.commit()
+    await _migrate(conn)
     return conn
+
+
+async def _migrate(conn: aiosqlite.Connection) -> None:
+    async with conn.execute("PRAGMA table_info(episodes)") as cur:
+        columns = {row[1] for row in await cur.fetchall()}
+    if "salience" not in columns:
+        await conn.execute("ALTER TABLE episodes ADD COLUMN salience REAL DEFAULT 0.0")
+        await conn.commit()
 
 
 async def get_recent_episodes(conn: aiosqlite.Connection, limit: int) -> list[dict]:

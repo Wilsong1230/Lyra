@@ -812,3 +812,44 @@ async def test_candidate_pool_semantic_deduplication(tmp_db_path: Path):
     assert candidates[0].evidence_count == 2
 
     await conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Migration tests
+# ---------------------------------------------------------------------------
+
+async def test_init_db_migrates_missing_salience_column(tmp_db_path: Path):
+    """init_db must add the salience column to a pre-existing episodes table
+    that was created without it, without losing existing rows."""
+    import aiosqlite as _aiosqlite
+
+    # Build a stale DB: episodes table WITHOUT the salience column
+    async with _aiosqlite.connect(tmp_db_path) as stale:
+        await stale.execute(
+            "CREATE TABLE episodes ("
+            "  id                INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  content           TEXT NOT NULL,"
+            "  ts                REAL NOT NULL,"
+            "  source_items_json TEXT NOT NULL"
+            ")"
+        )
+        await stale.execute(
+            "INSERT INTO episodes (content, ts, source_items_json) VALUES (?, ?, ?)",
+            ("an old episode from before the migration", 1000.0, "[]"),
+        )
+        await stale.commit()
+
+    # init_db on the same path — must migrate without data loss
+    conn = await init_db(tmp_db_path)
+
+    async with conn.execute("PRAGMA table_info(episodes)") as cur:
+        columns = {row[1] for row in await cur.fetchall()}
+    assert "salience" in columns
+
+    async with conn.execute("SELECT id, content, salience FROM episodes") as cur:
+        rows = await cur.fetchall()
+    assert len(rows) == 1
+    assert rows[0][1] == "an old episode from before the migration"
+    assert rows[0][2] == 0.0  # DEFAULT 0.0 applied to pre-existing row
+
+    await conn.close()
