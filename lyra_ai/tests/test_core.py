@@ -324,3 +324,95 @@ def test_failures_scaffold_runs_cleanly_through_stub():
     for r in trace:
         assert r.affect.valence == pytest.approx(0.0)
         # Phase 3: assert r.affect.valence < 0.0 after n failures
+
+
+# ── CognitiveCore gate wiring (Phase 2.2) ────────────────────────────────────
+
+from lyra_core.gate import GateDecision
+
+
+def test_tick_with_gate_wiring_still_returns_empty_list():
+    """Gate pass-through must not change the empty-intent Phase 0 behavior."""
+    core = CognitiveCore()
+    intents, affect = core.tick([])
+    assert intents == []
+    assert affect.valence == pytest.approx(0.0)
+
+
+def test_gate_intents_passes_allowed_kinds_through():
+    core = CognitiveCore()
+    speak = Intent(kind=IntentKind.speak, payload={"text": "hello"})
+    noop = Intent(kind=IntentKind.noop, payload={})
+    result = core._gate_intents([speak, noop])
+    assert result == [speak, noop]
+
+
+def test_gate_intents_drops_blocked_kind():
+    core = CognitiveCore()
+    research = Intent(kind=IntentKind.research, payload={})
+    assert core._gate_intents([research]) == []
+
+
+def test_gate_intents_mixed_list_keeps_allowed_drops_blocked():
+    core = CognitiveCore()
+    speak = Intent(kind=IntentKind.speak, payload={"text": "hi"})
+    research = Intent(kind=IntentKind.research, payload={})
+    noop = Intent(kind=IntentKind.noop, payload={})
+    result = core._gate_intents([speak, research, noop])
+    assert result == [speak, noop]
+
+
+def test_gate_intents_logs_blocked_intent(capsys):
+    core = CognitiveCore()
+    research = Intent(kind=IntentKind.research, payload={})
+    core._gate_intents([research])
+    captured = capsys.readouterr()
+    assert "[gate] BLOCKED" in captured.out
+    assert "research" in captured.out
+
+
+def test_gate_intents_allowed_intent_produces_no_log(capsys):
+    core = CognitiveCore()
+    speak = Intent(kind=IntentKind.speak, payload={"text": "hi"})
+    core._gate_intents([speak])
+    captured = capsys.readouterr()
+    assert captured.out == ""
+
+
+def test_default_gate_blocks_research():
+    """Safe-by-default: no-arg CognitiveCore uses a real HarmGate and drops research."""
+    core = CognitiveCore()
+    research = Intent(kind=IntentKind.research, payload={})
+    assert core._gate_intents([research]) == []
+
+
+def test_injected_gate_that_blocks_all_returns_empty():
+    """Injectable gate: a stub that blocks everything produces empty output."""
+    class _BlockAll:
+        def check(self, intent):
+            return GateDecision(allowed=False, reason="stub: block all")
+
+    core = CognitiveCore(gate=_BlockAll())
+    speak = Intent(kind=IntentKind.speak, payload={"text": "hi"})
+    noop = Intent(kind=IntentKind.noop, payload={})
+    assert core._gate_intents([speak, noop]) == []
+
+
+def test_injected_gate_that_allows_all_passes_everything_through():
+    """Injectable gate: a stub that allows everything lets all intents pass."""
+    class _AllowAll:
+        def check(self, intent):
+            return GateDecision(allowed=True)
+
+    core = CognitiveCore(gate=_AllowAll())
+    research = Intent(kind=IntentKind.research, payload={})
+    speak = Intent(kind=IntentKind.speak, payload={"text": "hi"})
+    assert core._gate_intents([research, speak]) == [research, speak]
+
+
+def test_introspect_unaffected_by_gate_wiring():
+    """introspect() is read-only; gate must not be involved."""
+    core = CognitiveCore()
+    state = core.introspect()
+    assert state.valence == pytest.approx(0.0)
+    assert state.arousal == pytest.approx(0.0)

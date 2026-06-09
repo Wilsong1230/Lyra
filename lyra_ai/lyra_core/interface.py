@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 
 
@@ -128,12 +129,41 @@ class CognitiveCore:
     through drives, update affect, and produce intents here.
     """
 
+    def __init__(self, gate=None) -> None:
+        from lyra_core.gate import HarmGate
+        self._gate = gate if gate is not None else HarmGate()
+
+    def _gate_intents(self, intents: list[Intent]) -> list[Intent]:
+        """Run intents through the harm gate; drop blocked ones and log each block.
+
+        This is the single chokepoint all intents must pass before leaving the
+        core.  Phase 3's action-selection will produce intents that flow into
+        tick() and therefore through here automatically — nothing bypasses it.
+        A blocked intent must never vanish silently; the log line is the trace.
+        """
+        allowed = []
+        for intent in intents:
+            decision = self._gate.check(intent)
+            if decision.allowed:
+                allowed.append(intent)
+            else:
+                print(
+                    f"[{datetime.now().isoformat()}] [gate] BLOCKED"
+                    f" {intent.kind}: {decision.reason}"
+                )
+        return allowed
+
     def tick(self, observations: list[Observation]) -> tuple[list[Intent], AffectState]:
         """Ingest observations, return (intents, affect).
 
         Phase 0: ignores all input, returns empty intent list and neutral affect.
+        All intents pass through _gate_intents before returning — the chokepoint
+        exists now so Phase 3 action-selection inherits it automatically.
         """
-        return [], AffectState()
+        intents: list[Intent] = []
+        affect = AffectState()
+        intents = self._gate_intents(intents)
+        return intents, affect
 
     def introspect(self) -> AffectState:
         """Read current affect WITHOUT advancing the core (read-only port).
