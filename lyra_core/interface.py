@@ -55,6 +55,10 @@ class Observation:
 
     # Reserved: prediction-outcome pairing for the competence drive (Phase 3).
     # An action_outcome observation may carry what was expected vs what happened.
+    # NOTE: str | None is Phase 0 convenience only. The eventual competence-drive
+    # shape is expected to be STRUCTURED (a value/confidence or distribution that
+    # can be diffed into a numeric prediction-error magnitude). String is a
+    # placeholder — not a decided contract.
     predicted: str | None = None
     actual:    str | None = None
 
@@ -130,3 +134,19 @@ class CognitiveCore:
         Phase 0: ignores all input, returns empty intent list and neutral affect.
         """
         return [], AffectState()
+
+    def introspect(self) -> AffectState:
+        """Read current affect WITHOUT advancing the core (read-only port).
+
+        Phase 0 stub: returns neutral AffectState().
+
+        This is deliberately separate from tick() so that observing the
+        box never mutates it. Later phases:
+          - returns the core's actually-held current AffectState
+          - will likely also expose recent affect history (metacognitive
+            seam) — reserve that as a future addition, do NOT add a history
+            param now.
+        introspect() must NEVER mutate state or advance a tick. It is the
+        port the telemetry/dashboard and Lyra's own self-reading use.
+        """
+        return AffectState()

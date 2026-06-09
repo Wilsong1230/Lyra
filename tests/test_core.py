@@ -198,3 +198,36 @@ def test_tick_ignores_observations_phase0():
     assert intents == []
     assert affect.valence == pytest.approx(0.0)
     assert affect.arousal == pytest.approx(0.0)
+
+
+# ── CognitiveCore.introspect() ────────────────────────────────────────────────
+
+def test_introspect_returns_affect_state():
+    core = CognitiveCore()
+    result = core.introspect()
+    assert isinstance(result, AffectState)
+
+
+def test_introspect_returns_neutral_affect_phase0():
+    core = CognitiveCore()
+    state = core.introspect()
+    assert state.valence == pytest.approx(0.0)
+    assert state.arousal == pytest.approx(0.0)
+
+
+def test_introspect_is_non_mutating():
+    """introspect() must never change what tick() or a subsequent introspect() returns.
+
+    Sequence: introspect → tick([]) → introspect.
+    All three must yield neutral, equivalent affect — the read-only port
+    must not advance the core or alter its internal state.
+    """
+    core = CognitiveCore()
+    before = core.introspect()
+    _, after_tick = core.tick([])
+    after = core.introspect()
+
+    assert before.valence == pytest.approx(0.0)
+    assert after_tick.valence == pytest.approx(0.0)
+    assert after.valence == pytest.approx(0.0)
+    assert before.arousal == pytest.approx(after.arousal)
