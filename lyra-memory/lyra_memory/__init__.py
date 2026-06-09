@@ -70,10 +70,10 @@ class MemorySystem:
             raise RuntimeError("MemorySystem has not been started — call await mem.start() first")
         self.working_memory.add_turn(role, content)
 
-    async def add_observation(self, content: str) -> None:
+    async def add_observation(self, content: str, source: str | None = None) -> None:
         if self.working_memory is None:
             raise RuntimeError("MemorySystem has not been started — call await mem.start() first")
-        self.working_memory.add_observation(content)
+        self.working_memory.add_observation(content, source=source)
 
     async def add_reflection(self, content: str) -> None:
         if self.working_memory is None:
