@@ -1,11 +1,14 @@
 from __future__ import annotations
 import datetime
+import logging
 from pathlib import Path
 import aiosqlite
 from lyra_memory import config
 from lyra_memory.config import SEARCH_EPISODES_DEFAULT_LIMIT, RETRIEVAL_EPISODE_LIMIT
 from lyra_memory.db import load_vec_extension
 from lyra_memory.embeddings import embed
+
+_log = logging.getLogger(__name__)
 
 
 async def build_context(memory: object) -> str:
@@ -29,15 +32,18 @@ async def build_context(memory: object) -> str:
             + "\n".join(f"[{i.role or i.type}]: {i.content}" for i in working)
         )
 
-        query = " ".join(i.content for i in working)
-        db_path = getattr(memory, "_db_path", None)
-        try:
-            eps = await search_episodes(query, limit=RETRIEVAL_EPISODE_LIMIT, path=db_path)
-        except Exception as e:
-            print(f"[{datetime.datetime.now().isoformat()}] [retrieval] episode retrieval failed: {e}")
-            eps = []
-        if eps:
-            parts.append("## Past Reflections\n" + "\n".join(f"- {e['content']}" for e in eps))
+        # Use the most recent user turn as the focused search query.
+        # Skip retrieval entirely if there is no user-role item.
+        last_user = next((i for i in reversed(working) if i.role == "user"), None)
+        if last_user:
+            db_path = getattr(memory, "_db_path", None)
+            try:
+                eps = await search_episodes(last_user.content, limit=RETRIEVAL_EPISODE_LIMIT, path=db_path)
+            except Exception as e:
+                print(f"[{datetime.datetime.now().isoformat()}] [retrieval] episode retrieval failed: {e}")
+                eps = []
+            if eps:
+                parts.append("## Past Reflections\n" + "\n".join(f"- {e['content']}" for e in eps))
 
     return "\n\n".join(parts)
 
@@ -52,8 +58,7 @@ async def search_episodes(
     limit: int = SEARCH_EPISODES_DEFAULT_LIMIT,
     path: Path | None = None,
 ) -> list[dict]:
-    ts = datetime.datetime.now().isoformat(timespec="seconds")
-    print(f"[{ts}] search_episodes query={query!r} limit={limit}")
+    _log.debug("search_episodes query=%r limit=%d", query, limit)
     query_vec = await embed(query)
     async with aiosqlite.connect(path or config.DB_PATH) as conn:
         await load_vec_extension(conn)

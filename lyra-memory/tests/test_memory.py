@@ -523,7 +523,9 @@ async def test_system_prompt_includes_relevant_episodes(tmp_db_path: Path):
         await conn.commit()
 
         wm = WorkingMemory()
-        wm.add_turn("user", "Tell me about analytical thinking and numbers")  # matches math_content
+        # user-role item is the focused query source — must be semantically close to math_content
+        wm.add_turn("user", "Tell me about analytical thinking and numbers")
+        wm.add_turn("lyra", "That's a fascinating topic.")  # non-user turn must not dilute query
 
         pool = CandidatePool(conn)
         identity = IdentityEngine(conn, pool)
@@ -532,11 +534,61 @@ async def test_system_prompt_includes_relevant_episodes(tmp_db_path: Path):
             structured_state = StructuredState(conn)
             working_memory = wm
             identity_engine = identity
-            db = conn
+            _db_path = tmp_db_path
 
         prompt = await build_system_prompt(_FakeMemory())
         assert "## Past Reflections" in prompt
-        assert "mathematics" in prompt  # relevant episode surfaced
+        assert "mathematics" in prompt  # focused query on user turn surfaced the relevant episode
+
+        await conn.close()
+    finally:
+        _cfg.DB_PATH = original_db_path
+        _cfg.CORE_PROMPT = original_core
+
+
+async def test_no_episode_retrieval_when_no_user_turn(tmp_db_path: Path):
+    """Episode retrieval must be skipped entirely when working memory has no
+    user-role items. Past Reflections must not appear even when the DB
+    contains a semantically matching episode."""
+    import time as _time
+    from lyra_memory.embeddings import embed as _embed
+
+    original_db_path = _cfg.DB_PATH
+    original_core = _cfg.CORE_PROMPT
+    _cfg.CORE_PROMPT = "You are Lyra."
+    _cfg.DB_PATH = tmp_db_path
+    try:
+        conn = await init_db(tmp_db_path)
+
+        # Seed an episode semantically close to what lyra's turn will say
+        math_content = "Lyra reflected on her love of mathematics and logical reasoning."
+        cur = await conn.execute(
+            "INSERT INTO episodes (content, ts, source_items_json) VALUES (?, ?, ?)",
+            (math_content, _time.time(), "[]"),
+        )
+        await conn.execute(
+            "INSERT INTO vec_episodes(rowid, embedding) VALUES (?, ?)",
+            (cur.lastrowid, await _embed(math_content)),
+        )
+        await conn.commit()
+
+        wm = WorkingMemory()
+        # Only lyra-role and observation items — no user-role items at all
+        wm.add_turn("lyra", "I really enjoy mathematics and logical reasoning.")
+        wm.add_observation("screen shows a math textbook")
+
+        pool = CandidatePool(conn)
+        identity = IdentityEngine(conn, pool)
+
+        class _FakeMemory:
+            structured_state = StructuredState(conn)
+            working_memory = wm
+            identity_engine = identity
+            _db_path = tmp_db_path
+
+        prompt = await build_system_prompt(_FakeMemory())
+        assert "## Past Reflections" not in prompt
+        assert "You are Lyra." in prompt
 
         await conn.close()
     finally:
