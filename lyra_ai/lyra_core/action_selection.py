@@ -56,14 +56,22 @@ class ActionSelector:
         self,
         drive_pressures: dict[str, float],
         affect: AffectState,
+        bias=None,
     ) -> list[Intent]:
         """Return the chosen Intent list.
 
         Reads drive pressures and affect values passed in — does NOT reach
         into drive or affect engine internals.  Deterministic given inputs.
+
+        bias: optional duck-typed SelectionBias; uses .affect_weight_delta to
+        shift the effective affect_weight (negative = more persistent, positive
+        = quits easier).  Clamped to 0.0 at the low end.
         """
+        effective_weight = self._affect_weight
+        if bias is not None:
+            effective_weight = max(0.0, effective_weight + bias.affect_weight_delta)
         # Frustration: how much accumulated negative affect pushes back
-        frustration = max(0.0, -affect.valence) * self._affect_weight
+        frustration = max(0.0, -affect.valence) * effective_weight
 
         chosen: list[Intent] = []
 
