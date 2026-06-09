@@ -41,8 +41,8 @@ class MemorySystem:
             self.structured_state = StructuredState(self.db)
             self.working_memory = WorkingMemory()
             self.candidate_pool = CandidatePool(self.db)
-            self.dreaming_loop = DreamingLoop(self.db, self.working_memory, self.candidate_pool)
             self.identity_engine = IdentityEngine(self.db, self.candidate_pool)
+            self.dreaming_loop = DreamingLoop(self.db, self.working_memory, self.candidate_pool, self.identity_engine)
 
             self.dreaming_loop.start(idle_seconds=idle_seconds, poll_seconds=poll_seconds)
         except Exception:

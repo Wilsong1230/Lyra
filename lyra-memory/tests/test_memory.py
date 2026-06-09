@@ -231,7 +231,7 @@ async def test_dreaming_loop_count_trigger(tmp_db_path: Path):
     conn = await init_db(tmp_db_path)
     wm = WorkingMemory()
     pool = CandidatePool(conn)
-    loop = DreamingLoop(conn, wm, pool)
+    loop = DreamingLoop(conn, wm, pool, IdentityEngine(conn, pool))
 
     mock_reflection = "I have been thinking deeply about questions and curiosity in conversation."
     mock_obs = json.dumps([{"trait_name": "curiosity_depth", "trait_value": "deep philosophical interest", "category": "cognitive"}])
@@ -260,7 +260,7 @@ async def test_dreaming_loop_idle_trigger(tmp_db_path: Path):
     conn = await init_db(tmp_db_path)
     wm = WorkingMemory()
     pool = CandidatePool(conn)
-    loop = DreamingLoop(conn, wm, pool)
+    loop = DreamingLoop(conn, wm, pool, IdentityEngine(conn, pool))
 
     mock_reflection = "Reflecting on a quiet moment between exchanges."
 
@@ -282,7 +282,7 @@ async def test_dreaming_loop_no_trigger_when_empty(tmp_db_path: Path):
     conn = await init_db(tmp_db_path)
     wm = WorkingMemory()
     pool = CandidatePool(conn)
-    loop = DreamingLoop(conn, wm, pool)
+    loop = DreamingLoop(conn, wm, pool, IdentityEngine(conn, pool))
 
     with patch.object(loop, "_call_llm", new=AsyncMock()) as mock_llm:
         await loop._maybe_dream()  # nothing in working memory
@@ -480,7 +480,7 @@ async def test_dreaming_loop_no_re_reflection(tmp_db_path: Path):
     conn = await init_db(tmp_db_path)
     wm = WorkingMemory()
     pool = CandidatePool(conn)
-    loop = DreamingLoop(conn, wm, pool)
+    loop = DreamingLoop(conn, wm, pool, IdentityEngine(conn, pool))
 
     mock_reflection = "I have been thinking about many conversations."
     mock_obs = json.dumps([{"trait_name": "conversational_depth", "trait_value": "deep thinker", "category": "cognitive"}])
@@ -500,6 +500,46 @@ async def test_dreaming_loop_no_re_reflection(tmp_db_path: Path):
 
     episodes = await get_recent_episodes(conn, 10)
     assert len(episodes) == 1  # only one episode from the first dream
+
+    await conn.close()
+
+
+async def test_dream_cycle_consolidates_trait_into_traits_table(tmp_db_path: Path):
+    """Verify that a dream cycle calls consolidate() and promotes a candidate
+    that has reached the surface threshold into the traits table."""
+    conn = await init_db(tmp_db_path)
+    wm = WorkingMemory()
+    pool = CandidatePool(conn)
+    identity = IdentityEngine(conn, pool)
+    loop = DreamingLoop(conn, wm, pool, identity)
+
+    trait_name = "consistent_curiosity"
+    trait_value = "consistently asks probing questions"
+    # pre-seed 5 observations — exactly the surface threshold
+    for _ in range(5):
+        await pool.add_observation(trait_name, trait_value, "cognitive")
+
+    mock_reflection = "Lyra has been consistently curious throughout the conversation."
+    # mock obs returns a different trait so the pre-seeded one is the only surface candidate
+    mock_obs = json.dumps([{"trait_name": "unrelated_trait", "trait_value": "some value", "category": "behavioral"}])
+
+    with patch.object(loop, "_call_llm", new=AsyncMock(side_effect=[mock_reflection, mock_obs])):
+        for i in range(10):
+            wm.add_turn("user", f"message {i}")
+        await loop._dream()
+
+    # consolidate() must have promoted the pre-seeded trait
+    traits = await identity.get_top_traits()
+    promoted = next((t for t in traits if t.name == trait_name), None)
+    assert promoted is not None, f"Expected {trait_name!r} in traits table; got {[t.name for t in traits]}"
+    assert promoted.stability == "surface"
+    assert 0.0 < promoted.confidence <= 1.0
+
+    # dream-marker behavior must still hold
+    assert wm.count_since_last_dream() == 0  # mark_dreamed() was called
+
+    episodes = await get_recent_episodes(conn, 10)
+    assert len(episodes) == 1  # exactly one episode from the single dream
 
     await conn.close()
 

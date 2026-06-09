@@ -8,6 +8,7 @@ from datetime import datetime
 from lyra_memory.config import DREAM_MODEL, OPENROUTER_BASE, DREAM_TRIGGER_ITEMS, DREAM_POLL_SECONDS
 from lyra_memory.working_memory import WorkingMemory
 from lyra_memory.candidate_pool import CandidatePool
+from lyra_memory.identity_engine import IdentityEngine
 from lyra_memory.embeddings import embed
 
 _OBS_PROMPT = (
@@ -21,10 +22,11 @@ _OBS_PROMPT = (
 
 
 class DreamingLoop:
-    def __init__(self, conn: aiosqlite.Connection, working_memory: WorkingMemory, candidate_pool: CandidatePool) -> None:
+    def __init__(self, conn: aiosqlite.Connection, working_memory: WorkingMemory, candidate_pool: CandidatePool, identity_engine: IdentityEngine) -> None:
         self._conn = conn
         self._wm = working_memory
         self._pool = candidate_pool
+        self._identity = identity_engine
         self._task: asyncio.Task | None = None
         self._idle_seconds: int = 300
         self._poll_seconds: int = DREAM_POLL_SECONDS
@@ -97,6 +99,11 @@ class DreamingLoop:
                 await self._pool.add_observation(obs["trait_name"], obs["trait_value"], obs["category"])
         except (json.JSONDecodeError, KeyError, TypeError) as e:
             print(f"\r\033[K[{datetime.now().isoformat()}] [DreamingLoop] structured obs parse error: {e}")
+
+        try:
+            await self._identity.consolidate()
+        except Exception as e:
+            print(f"\r\033[K[{datetime.now().isoformat()}] [DreamingLoop] consolidate error: {e}")
 
         self._wm.mark_dreamed()
 
