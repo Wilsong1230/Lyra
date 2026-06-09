@@ -231,3 +231,96 @@ def test_introspect_is_non_mutating():
     assert after_tick.valence == pytest.approx(0.0)
     assert after.valence == pytest.approx(0.0)
     assert before.arousal == pytest.approx(after.arousal)
+
+
+# ── Harness ───────────────────────────────────────────────────────────────────
+
+from lyra_core.harness import Harness, Script, TickRecord, failures, outcome, sensory
+
+
+def test_run_produces_one_record_per_tick():
+    h = Harness()
+    script: Script = [
+        [sensory("frame 0")],
+        [sensory("frame 1"), sensory("frame 2")],
+        [],  # empty tick is valid
+    ]
+    trace = h.run(script)
+    assert len(trace) == 3
+
+
+def test_tick_records_have_sequential_indices():
+    h = Harness()
+    trace = h.run([[sensory("a")], [sensory("b")], [sensory("c")]])
+    assert [r.index for r in trace] == [0, 1, 2]
+
+
+def test_tick_record_observations_match_input():
+    h = Harness()
+    obs0 = sensory("hello", source="vision")
+    obs1 = outcome("done", predicted="fast", actual="slow")
+    script: Script = [[obs0], [obs1]]
+    trace = h.run(script)
+    assert trace[0].observations == [obs0]
+    assert trace[1].observations == [obs1]
+
+
+def test_tick_record_intents_empty_against_stub():
+    h = Harness()
+    trace = h.run([[sensory("x")], [sensory("y")]])
+    assert all(r.intents == [] for r in trace)
+
+
+def test_tick_record_affect_neutral_against_stub():
+    h = Harness()
+    trace = h.run([[sensory("x")], [sensory("y")], []])
+    for r in trace:
+        assert isinstance(r.affect, AffectState)
+        assert r.affect.valence == pytest.approx(0.0)
+        assert r.affect.arousal == pytest.approx(0.0)
+
+
+def test_run_empty_script_returns_empty_trace():
+    h = Harness()
+    assert h.run([]) == []
+
+
+def test_harness_constructs_own_core_when_none_given():
+    """Harness() with no argument must build its own CognitiveCore and run."""
+    h = Harness()
+    trace = h.run([[sensory("self-constructed core")]])
+    assert len(trace) == 1
+
+
+def test_harness_accepts_injected_core():
+    core = CognitiveCore()
+    h = Harness(core=core)
+    trace = h.run([[sensory("injected")]])
+    assert len(trace) == 1
+
+
+def test_failures_scaffold_produces_correct_tick_count():
+    script = failures(5)
+    assert len(script) == 5
+
+
+def test_failures_scaffold_each_tick_has_one_action_outcome_observation():
+    from lyra_core.interface import ObservationKind
+    script = failures(5)
+    for batch in script:
+        assert len(batch) == 1
+        assert batch[0].kind == ObservationKind.action_outcome
+
+
+def test_failures_scaffold_runs_cleanly_through_stub():
+    """Phase 0: failures(n) produces n neutral records against the stub.
+
+    # Phase 3: assert affect degrades here — frustration must accumulate
+    # across repeated action_outcome failures and eventually override a drive.
+    """
+    h = Harness()
+    trace = h.run(failures(5))
+    assert len(trace) == 5
+    for r in trace:
+        assert r.affect.valence == pytest.approx(0.0)
+        # Phase 3: assert r.affect.valence < 0.0 after n failures
