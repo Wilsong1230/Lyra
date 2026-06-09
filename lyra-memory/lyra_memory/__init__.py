@@ -45,6 +45,14 @@ class MemorySystem:
             self.dreaming_loop = DreamingLoop(self.db, self.working_memory, self.candidate_pool, self.identity_engine)
 
             self.dreaming_loop.start(idle_seconds=idle_seconds, poll_seconds=poll_seconds)
+
+            # Pre-warm the embedding model so the first build_system_prompt() call
+            # doesn't pay the model-loading penalty inside a tight caller timeout.
+            from lyra_memory.embeddings import embed
+            try:
+                await embed("warmup")
+            except Exception:
+                pass
         except Exception:
             if self.db is not None:
                 await self.db.close()

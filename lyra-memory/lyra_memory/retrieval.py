@@ -30,8 +30,9 @@ async def build_context(memory: object) -> str:
         )
 
         query = " ".join(i.content for i in working)
+        db_path = getattr(memory, "_db_path", None)
         try:
-            eps = await search_episodes(query, limit=RETRIEVAL_EPISODE_LIMIT)
+            eps = await search_episodes(query, limit=RETRIEVAL_EPISODE_LIMIT, path=db_path)
         except Exception as e:
             print(f"[{datetime.datetime.now().isoformat()}] [retrieval] episode retrieval failed: {e}")
             eps = []
