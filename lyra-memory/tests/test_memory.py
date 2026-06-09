@@ -62,6 +62,8 @@ async def test_db_creates_tables(tmp_db_path: Path):
         "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
     ) as cur:
         tables = {row[0] for row in await cur.fetchall()}
+    async with conn.execute("PRAGMA table_info(episodes)") as cur:
+        episode_columns = {row[1] for row in await cur.fetchall()}
     await conn.close()
     assert "facts" in tables
     assert "episodes" in tables
@@ -69,6 +71,7 @@ async def test_db_creates_tables(tmp_db_path: Path):
     assert "traits" in tables
     assert "vec_episodes" in tables
     assert "vec_candidates" in tables
+    assert "salience" in episode_columns
 
 
 async def test_get_recent_episodes_empty(tmp_db_path: Path):
@@ -287,6 +290,59 @@ async def test_dreaming_loop_no_trigger_when_empty(tmp_db_path: Path):
     with patch.object(loop, "_call_llm", new=AsyncMock()) as mock_llm:
         await loop._maybe_dream()  # nothing in working memory
         mock_llm.assert_not_called()
+
+    await conn.close()
+
+
+async def test_dream_writes_high_salience_episode(tmp_db_path: Path):
+    """Episodes produced from high-salience source items carry a high peak salience."""
+    conn = await init_db(tmp_db_path)
+    wm = WorkingMemory()
+    pool = CandidatePool(conn)
+    loop = DreamingLoop(conn, wm, pool, IdentityEngine(conn, pool))
+
+    # emotion keyword + '!' -> high score on every turn
+    for i in range(10):
+        wm.add_turn("user", f"I feel so excited about this amazing discovery number {i}!")
+
+    expected_salience = max(item.score for item in wm.get_undreamed())
+    assert expected_salience > 0.5, "test setup: emotion+punct items must score > 0.5"
+
+    mock_reflection = "Lyra felt excitement throughout the session."
+    mock_obs = json.dumps([])
+    with patch.object(loop, "_call_llm", new=AsyncMock(side_effect=[mock_reflection, mock_obs])):
+        await loop._dream()
+
+    episodes = await get_recent_episodes(conn, 10)
+    assert len(episodes) == 1
+    assert episodes[0]["salience"] == pytest.approx(expected_salience)
+    assert episodes[0]["salience"] > 0
+
+    await conn.close()
+
+
+async def test_dream_writes_low_salience_episode(tmp_db_path: Path):
+    """Episodes from low-salience source items carry correspondingly low salience."""
+    conn = await init_db(tmp_db_path)
+    wm = WorkingMemory()
+    pool = CandidatePool(conn)
+    loop = DreamingLoop(conn, wm, pool, IdentityEngine(conn, pool))
+
+    # observations, no emotion keyword, no punctuation — inherently low-scoring
+    for i in range(10):
+        wm.add_observation(f"database query result row {i}")
+
+    expected_salience = max(item.score for item in wm.get_undreamed())
+    assert expected_salience < 0.5, "test setup: plain observation items must score < 0.5"
+
+    mock_reflection = "Lyra processed some routine data queries."
+    mock_obs = json.dumps([])
+    with patch.object(loop, "_call_llm", new=AsyncMock(side_effect=[mock_reflection, mock_obs])):
+        await loop._dream()
+
+    episodes = await get_recent_episodes(conn, 10)
+    assert len(episodes) == 1
+    assert episodes[0]["salience"] == pytest.approx(expected_salience)
 
     await conn.close()
 
@@ -513,6 +569,48 @@ async def test_system_prompt_omits_episodes_section_when_db_empty(tmp_db_path: P
         prompt = await build_system_prompt(_FakeMemory())
         assert "## Past Reflections" not in prompt
         assert "You are Lyra." in prompt
+
+        await conn.close()
+    finally:
+        _cfg.DB_PATH = original_db_path
+        _cfg.CORE_PROMPT = original_core
+
+
+async def test_retrieval_failure_is_logged_not_raised(tmp_db_path: Path, capsys):
+    """A broken episode DB must not crash prompt assembly — failure is logged,
+    episodes section is omitted, and the core prompt still returns."""
+    import aiosqlite as _aiosqlite
+
+    original_db_path = _cfg.DB_PATH
+    original_core = _cfg.CORE_PROMPT
+    _cfg.CORE_PROMPT = "You are Lyra."
+    # Point search_episodes at a plain SQLite file with no vec_episodes table
+    bad_db_path = tmp_db_path.parent / "bad.db"
+    async with _aiosqlite.connect(bad_db_path) as _:
+        pass  # empty DB — no vec_episodes virtual table
+    _cfg.DB_PATH = bad_db_path
+    try:
+        conn = await init_db(tmp_db_path)
+
+        wm = WorkingMemory()
+        wm.add_turn("user", "some interesting message")
+
+        pool = CandidatePool(conn)
+        identity = IdentityEngine(conn, pool)
+
+        class _FakeMemory:
+            structured_state = StructuredState(conn)
+            working_memory = wm
+            identity_engine = identity
+            db = conn
+
+        prompt = await build_system_prompt(_FakeMemory())
+        assert "You are Lyra." in prompt
+        assert "## Past Reflections" not in prompt
+
+        captured = capsys.readouterr()
+        assert "[retrieval]" in captured.out
+        assert "episode retrieval failed" in captured.out
 
         await conn.close()
     finally:

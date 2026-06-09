@@ -14,7 +14,8 @@ CREATE TABLE IF NOT EXISTS episodes (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     content           TEXT NOT NULL,
     ts                REAL NOT NULL,
-    source_items_json TEXT NOT NULL
+    source_items_json TEXT NOT NULL,
+    salience          REAL DEFAULT 0.0
 );
 CREATE TABLE IF NOT EXISTS candidates (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -77,12 +78,12 @@ async def init_db(path: Path) -> aiosqlite.Connection:
 
 async def get_recent_episodes(conn: aiosqlite.Connection, limit: int) -> list[dict]:
     async with conn.execute(
-        "SELECT id, content, ts, source_items_json "
+        "SELECT id, content, ts, source_items_json, salience "
         "FROM episodes ORDER BY ts DESC LIMIT ?",
         (limit,),
     ) as cur:
         rows = await cur.fetchall()
     return [
-        {"id": r[0], "content": r[1], "ts": r[2], "source_items_json": r[3]}
+        {"id": r[0], "content": r[1], "ts": r[2], "source_items_json": r[3], "salience": r[4]}
         for r in reversed(rows)
     ]

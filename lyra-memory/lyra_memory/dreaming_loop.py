@@ -78,9 +78,10 @@ class DreamingLoop:
         )
         content = await self._call_llm(prompt)
         ts = time.time()
+        salience = max(i.score for i in items)
         cur = await self._conn.execute(
-            "INSERT INTO episodes (content, ts, source_items_json) VALUES (?, ?, ?)",
-            (content, ts, snapshot),
+            "INSERT INTO episodes (content, ts, source_items_json, salience) VALUES (?, ?, ?, ?)",
+            (content, ts, snapshot, salience),
         )
         episode_rowid = cur.lastrowid
 

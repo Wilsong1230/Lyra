@@ -32,7 +32,8 @@ async def build_context(memory: object) -> str:
         query = " ".join(i.content for i in working)
         try:
             eps = await search_episodes(query, limit=RETRIEVAL_EPISODE_LIMIT)
-        except Exception:
+        except Exception as e:
+            print(f"[{datetime.datetime.now().isoformat()}] [retrieval] episode retrieval failed: {e}")
             eps = []
         if eps:
             parts.append("## Past Reflections\n" + "\n".join(f"- {e['content']}" for e in eps))
@@ -56,7 +57,7 @@ async def search_episodes(
     async with aiosqlite.connect(path or config.DB_PATH) as conn:
         await load_vec_extension(conn)
         async with conn.execute(
-            "SELECT v.rowid, e.content, e.ts "
+            "SELECT v.rowid, e.content, e.ts, e.salience "
             "FROM vec_episodes v "
             "JOIN episodes e ON e.id = v.rowid "
             "WHERE v.embedding MATCH ? AND k = ? "
@@ -64,7 +65,7 @@ async def search_episodes(
             (query_vec, limit),
         ) as cur:
             rows = await cur.fetchall()
-    return [{"id": r[0], "content": r[1], "ts": r[2]} for r in rows]
+    return [{"id": r[0], "content": r[1], "ts": r[2], "salience": r[3]} for r in rows]
 
 
 async def get_fact(subject_key: str) -> dict | None:
