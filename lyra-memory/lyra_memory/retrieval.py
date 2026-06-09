@@ -3,7 +3,7 @@ import datetime
 from pathlib import Path
 import aiosqlite
 from lyra_memory import config
-from lyra_memory.config import SEARCH_EPISODES_DEFAULT_LIMIT
+from lyra_memory.config import SEARCH_EPISODES_DEFAULT_LIMIT, RETRIEVAL_EPISODE_LIMIT
 from lyra_memory.db import load_vec_extension
 from lyra_memory.embeddings import embed
 
@@ -28,6 +28,14 @@ async def build_context(memory: object) -> str:
             "## Current Experience\n"
             + "\n".join(f"[{i.role or i.type}]: {i.content}" for i in working)
         )
+
+        query = " ".join(i.content for i in working)
+        try:
+            eps = await search_episodes(query, limit=RETRIEVAL_EPISODE_LIMIT)
+        except Exception:
+            eps = []
+        if eps:
+            parts.append("## Past Reflections\n" + "\n".join(f"- {e['content']}" for e in eps))
 
     return "\n\n".join(parts)
 

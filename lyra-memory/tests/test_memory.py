@@ -365,61 +365,159 @@ from lyra_memory.retrieval import build_context, build_system_prompt, search_epi
 
 
 async def test_retrieval_assembles_all_layers(tmp_db_path: Path):
+    original_db_path = _cfg.DB_PATH
     _cfg.CORE_PROMPT = "You are Lyra, a continuous AI entity."
-    conn = await init_db(tmp_db_path)
+    _cfg.DB_PATH = tmp_db_path
+    try:
+        conn = await init_db(tmp_db_path)
 
-    state = StructuredState(conn)
-    wm = WorkingMemory()
-    pool = CandidatePool(conn)
-    engine = IdentityEngine(conn, pool)
+        state = StructuredState(conn)
+        wm = WorkingMemory()
+        pool = CandidatePool(conn)
+        engine = IdentityEngine(conn, pool)
 
-    await state.set_fact("user_name", "Wilson")
-    wm.add_turn("user", "What is the nature of memory?")
-    wm.add_turn("lyra", "I feel curious about that question.")
+        await state.set_fact("user_name", "Wilson")
+        wm.add_turn("user", "What is the nature of memory?")
+        wm.add_turn("lyra", "I feel curious about that question.")
 
-    # seed a trait
-    for _ in range(5):
-        await pool.add_observation("lyra_reflects_on_questions", "lyra reflects on questions", "cognitive")
-    await engine.consolidate()
+        # seed a trait
+        for _ in range(5):
+            await pool.add_observation("lyra_reflects_on_questions", "lyra reflects on questions", "cognitive")
+        await engine.consolidate()
 
-    # write an episode directly
-    import time as _time
-    await conn.execute(
-        "INSERT INTO episodes (content, ts, source_items_json) VALUES (?, ?, ?)",
-        ("I have been thinking about the nature of memory and identity.", _time.time(), "[]"),
-    )
-    await conn.commit()
+        # write an episode directly (no vec row — search_episodes returns [] for this test)
+        import time as _time
+        await conn.execute(
+            "INSERT INTO episodes (content, ts, source_items_json) VALUES (?, ?, ?)",
+            ("I have been thinking about the nature of memory and identity.", _time.time(), "[]"),
+        )
+        await conn.commit()
 
-    class _FakeMemory:
-        structured_state = state
-        working_memory = wm
-        identity_engine = engine
-        db = conn
+        class _FakeMemory:
+            structured_state = state
+            working_memory = wm
+            identity_engine = engine
+            db = conn
 
-    context = await build_context(_FakeMemory())
-    assert "lyra reflects" in context        # traits (value contains this)
-    assert "What is the nature of memory" in context   # working memory
+        context = await build_context(_FakeMemory())
+        assert "lyra reflects" in context        # traits (value contains this)
+        assert "What is the nature of memory" in context   # working memory
 
-    prompt = await build_system_prompt(_FakeMemory())
-    assert "You are Lyra" in prompt
+        prompt = await build_system_prompt(_FakeMemory())
+        assert "You are Lyra" in prompt
 
-    await conn.close()
+        await conn.close()
+    finally:
+        _cfg.DB_PATH = original_db_path
 
 
 async def test_retrieval_empty_state(tmp_db_path: Path):
+    original_db_path = _cfg.DB_PATH
     _cfg.CORE_PROMPT = "You are Lyra."
-    conn = await init_db(tmp_db_path)
+    _cfg.DB_PATH = tmp_db_path
+    try:
+        conn = await init_db(tmp_db_path)
 
-    class _FakeMemory:
-        structured_state = StructuredState(conn)
-        working_memory = WorkingMemory()
-        identity_engine = IdentityEngine(conn, CandidatePool(conn))
-        db = conn
+        class _FakeMemory:
+            structured_state = StructuredState(conn)
+            working_memory = WorkingMemory()
+            identity_engine = IdentityEngine(conn, CandidatePool(conn))
+            db = conn
 
-    prompt = await build_system_prompt(_FakeMemory())
-    assert "You are Lyra." in prompt  # core prompt always present even with no context
+        prompt = await build_system_prompt(_FakeMemory())
+        assert "You are Lyra." in prompt  # core prompt always present even with no context
 
-    await conn.close()
+        await conn.close()
+    finally:
+        _cfg.DB_PATH = original_db_path
+
+
+async def test_system_prompt_includes_relevant_episodes(tmp_db_path: Path):
+    """Dreamed episodes that are semantically relevant to current working memory
+    must surface into the system prompt under ## Past Reflections."""
+    import time as _time
+    from lyra_memory.embeddings import embed as _embed
+
+    original_db_path = _cfg.DB_PATH
+    original_core = _cfg.CORE_PROMPT
+    _cfg.CORE_PROMPT = "You are Lyra."
+    _cfg.DB_PATH = tmp_db_path
+    try:
+        conn = await init_db(tmp_db_path)
+
+        math_content = "Lyra reflected on her love of mathematics and logical reasoning."
+        weather_content = "The weather was warm and sunny outside the window today."
+
+        cur1 = await conn.execute(
+            "INSERT INTO episodes (content, ts, source_items_json) VALUES (?, ?, ?)",
+            (math_content, _time.time(), "[]"),
+        )
+        await conn.execute(
+            "INSERT INTO vec_episodes(rowid, embedding) VALUES (?, ?)",
+            (cur1.lastrowid, await _embed(math_content)),
+        )
+        cur2 = await conn.execute(
+            "INSERT INTO episodes (content, ts, source_items_json) VALUES (?, ?, ?)",
+            (weather_content, _time.time() + 1, "[]"),
+        )
+        await conn.execute(
+            "INSERT INTO vec_episodes(rowid, embedding) VALUES (?, ?)",
+            (cur2.lastrowid, await _embed(weather_content)),
+        )
+        await conn.commit()
+
+        wm = WorkingMemory()
+        wm.add_turn("user", "Tell me about analytical thinking and numbers")  # matches math_content
+
+        pool = CandidatePool(conn)
+        identity = IdentityEngine(conn, pool)
+
+        class _FakeMemory:
+            structured_state = StructuredState(conn)
+            working_memory = wm
+            identity_engine = identity
+            db = conn
+
+        prompt = await build_system_prompt(_FakeMemory())
+        assert "## Past Reflections" in prompt
+        assert "mathematics" in prompt  # relevant episode surfaced
+
+        await conn.close()
+    finally:
+        _cfg.DB_PATH = original_db_path
+        _cfg.CORE_PROMPT = original_core
+
+
+async def test_system_prompt_omits_episodes_section_when_db_empty(tmp_db_path: Path):
+    """If there are no episodes in the DB, build_system_prompt must not emit
+    an empty ## Past Reflections header."""
+    original_db_path = _cfg.DB_PATH
+    original_core = _cfg.CORE_PROMPT
+    _cfg.CORE_PROMPT = "You are Lyra."
+    _cfg.DB_PATH = tmp_db_path
+    try:
+        conn = await init_db(tmp_db_path)
+
+        wm = WorkingMemory()
+        wm.add_turn("user", "some message about any topic")
+
+        pool = CandidatePool(conn)
+        identity = IdentityEngine(conn, pool)
+
+        class _FakeMemory:
+            structured_state = StructuredState(conn)
+            working_memory = wm
+            identity_engine = identity
+            db = conn
+
+        prompt = await build_system_prompt(_FakeMemory())
+        assert "## Past Reflections" not in prompt
+        assert "You are Lyra." in prompt
+
+        await conn.close()
+    finally:
+        _cfg.DB_PATH = original_db_path
+        _cfg.CORE_PROMPT = original_core
 
 
 # ---------------------------------------------------------------------------
