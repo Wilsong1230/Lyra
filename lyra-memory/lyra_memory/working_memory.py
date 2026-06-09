@@ -5,6 +5,12 @@ from datetime import datetime
 from lyra_memory.config import TYPE_WEIGHTS, EMOTION_KEYWORDS
 from lyra_memory.models import WorkingMemoryItem
 
+# Passive background sense sources receive a lower base importance than standard
+# observations (0.6) so ambient audio doesn't dominate the dreaming queue.
+# The sink (Phase 1.3) passes obs.source when calling add_observation().
+_SENSE_SOURCES: frozenset[str] = frozenset({"ears", "wakeword"})
+_SENSE_IMPORTANCE: float = 0.15
+
 
 class WorkingMemory:
     def __init__(self) -> None:
@@ -38,10 +44,11 @@ class WorkingMemory:
             score=self._score("conversation", content), ts=self._last_turn_ts,
         ))
 
-    def add_observation(self, content: str) -> None:
+    def add_observation(self, content: str, source: str | None = None) -> None:
+        score = _SENSE_IMPORTANCE if source in _SENSE_SOURCES else self._score("observation", content)
         self._append(WorkingMemoryItem(
             type="observation", role=None, content=content,
-            score=self._score("observation", content), ts=time.time(),
+            score=score, ts=time.time(),
         ))
 
     def add_reflection(self, content: str) -> None:

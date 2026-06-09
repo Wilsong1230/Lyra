@@ -1,4 +1,5 @@
-"""Tests for lyra_core.perception — loop machinery only.
+"""Tests for lyra_core.perception (loop machinery) and lyra_core.senses
+(passive sense pollers).
 
 No real services, no memory, no core. Fake pollers + a recording sink drive
 everything. Tests are sync wrappers around asyncio.run(), matching the pattern
@@ -289,3 +290,109 @@ def test_loop_delivers_via_timer():
         assert obs in sink.batches[0]
 
     asyncio.run(_run())
+
+
+# ── sense adapters ────────────────────────────────────────────────────────────
+# All HTTP calls are mocked — no real lyra-listen service is required.
+
+from unittest.mock import AsyncMock, Mock, patch  # noqa: E402
+
+
+def test_poll_ambient_returns_observation_on_detection():
+    async def _run():
+        from lyra_core.senses import poll_ambient
+        mock_r = Mock(status_code=200)
+        mock_r.json.return_value = {
+            "sound": "keyboard typing",
+            "confidence": 0.92,
+            "timestamp": "2026-01-01T00:00:00Z",
+        }
+        with patch("lyra_core.senses._get", new=AsyncMock(return_value=mock_r)):
+            result = await poll_ambient()
+        assert len(result) == 1
+        obs = result[0]
+        assert obs.kind == ObservationKind.sensory
+        assert obs.source == "ears"
+        assert obs.content == "ambient sound: keyboard typing"
+    asyncio.run(_run())
+
+
+def test_poll_ambient_content_is_stable():
+    """Same sound with different per-poll metadata → identical content string.
+    Proves seam (a): (source, content) dedup will fire on consecutive polls."""
+    async def _run():
+        from lyra_core.senses import poll_ambient
+        r1 = Mock(status_code=200)
+        r1.json.return_value = {"sound": "keyboard typing", "confidence": 0.91, "timestamp": "T1"}
+        r2 = Mock(status_code=200)
+        r2.json.return_value = {"sound": "keyboard typing", "confidence": 0.78, "timestamp": "T2"}
+        with patch("lyra_core.senses._get", new=AsyncMock(side_effect=[r1, r2])):
+            obs_1 = await poll_ambient()
+            obs_2 = await poll_ambient()
+        assert obs_1[0].content == obs_2[0].content
+    asyncio.run(_run())
+
+
+def test_poll_ambient_returns_empty_when_no_sound():
+    async def _run():
+        from lyra_core.senses import poll_ambient
+        mock_r = Mock(status_code=200)
+        mock_r.json.return_value = {"sound": None}
+        with patch("lyra_core.senses._get", new=AsyncMock(return_value=mock_r)):
+            result = await poll_ambient()
+        assert result == []
+    asyncio.run(_run())
+
+
+def test_poll_ambient_returns_empty_on_service_error():
+    async def _run():
+        from lyra_core.senses import poll_ambient
+        with patch("lyra_core.senses._get", new=AsyncMock(side_effect=ConnectionError("refused"))):
+            result = await poll_ambient()
+        assert result == []
+    asyncio.run(_run())
+
+
+def test_poll_wakeword_emits_only_when_count_increases():
+    """Unchanged counter → no emit; increased counter → emit once."""
+    async def _run():
+        import lyra_core.senses as _s
+        _s._last_wakeword_count = 0  # reset module state
+
+        r_same = Mock(status_code=200)
+        r_same.json.return_value = {"listening": True, "detections_today": 0}
+        r_new = Mock(status_code=200)
+        r_new.json.return_value = {"listening": True, "detections_today": 1}
+
+        with patch("lyra_core.senses._get", new=AsyncMock(side_effect=[r_same, r_new])):
+            no_emit = await _s.poll_wakeword()
+            emitted = await _s.poll_wakeword()
+
+        assert no_emit == []
+        assert len(emitted) == 1
+        assert emitted[0].source == "wakeword"
+        assert emitted[0].content == "wake word detected"
+    asyncio.run(_run())
+
+
+def test_poll_wakeword_returns_empty_on_service_error():
+    async def _run():
+        import lyra_core.senses as _s
+        _s._last_wakeword_count = 0
+        with patch("lyra_core.senses._get", new=AsyncMock(side_effect=OSError("down"))):
+            result = await _s.poll_wakeword()
+        assert result == []
+    asyncio.run(_run())
+
+
+def test_sense_observation_scores_lower_than_conversation():
+    """WorkingMemory must apply a lower base importance to sense-source
+    observations so background audio doesn't dominate the dreaming queue."""
+    from lyra_memory.working_memory import WorkingMemory
+    wm = WorkingMemory()
+    wm.add_turn("user", "ambient sound: keyboard typing")
+    wm.add_observation("ambient sound: keyboard typing", source="ears")
+    items = wm.get_items()
+    conv_score = items[0].score
+    sense_score = items[1].score
+    assert sense_score < conv_score
