@@ -26,7 +26,8 @@ import httpx
 
 from lyra_core.interface import Observation, ObservationKind
 
-LISTEN_URL = os.environ.get("LISTEN_URL", "http://localhost:8002")
+AMBIENT_URL = os.environ.get("AMBIENT_URL", "http://localhost:8004")
+WAKEWORD_URL = os.environ.get("WAKEWORD_URL", "http://localhost:8005")
 
 # Edge-triggered wakeword counter: emit only when detections_today increases.
 _last_wakeword_count: int = 0
@@ -44,7 +45,7 @@ async def poll_ambient() -> list[Observation]:
     Connection errors and non-200 responses are swallowed quietly.
     """
     try:
-        r = await _get(f"{LISTEN_URL}/ambient")
+        r = await _get(f"{AMBIENT_URL}/ambient")
         if r.status_code != 200:
             return []
         sound = r.json().get("sound")
@@ -68,7 +69,7 @@ async def poll_wakeword() -> list[Observation]:
     """
     global _last_wakeword_count
     try:
-        r = await _get(f"{LISTEN_URL}/wakeword/status")
+        r = await _get(f"{WAKEWORD_URL}/wakeword/status")
         if r.status_code != 200:
             return []
         count = r.json().get("detections_today", 0)

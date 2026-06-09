@@ -385,6 +385,46 @@ def test_poll_wakeword_returns_empty_on_service_error():
     asyncio.run(_run())
 
 
+def test_poll_ambient_targets_ambient_url():
+    """poll_ambient must call AMBIENT_URL (8004), not LISTEN_URL (8002)."""
+    async def _run():
+        from lyra_core.senses import poll_ambient, AMBIENT_URL
+        mock_r = Mock(status_code=200)
+        mock_r.json.return_value = {"sound": "rain"}
+        captured: list[str] = []
+
+        async def fake_get(url: str, timeout: float = 1.0):
+            captured.append(url)
+            return mock_r
+
+        with patch("lyra_core.senses._get", new=fake_get):
+            await poll_ambient()
+        assert len(captured) == 1
+        assert captured[0].startswith(AMBIENT_URL), f"expected {AMBIENT_URL}, got {captured[0]}"
+    asyncio.run(_run())
+
+
+def test_poll_wakeword_targets_wakeword_url():
+    """poll_wakeword must call WAKEWORD_URL (8005), not LISTEN_URL (8002)."""
+    async def _run():
+        import lyra_core.senses as _s
+        from lyra_core.senses import poll_wakeword, WAKEWORD_URL
+        _s._last_wakeword_count = 0
+        mock_r = Mock(status_code=200)
+        mock_r.json.return_value = {"detections_today": 0}
+        captured: list[str] = []
+
+        async def fake_get(url: str, timeout: float = 1.0):
+            captured.append(url)
+            return mock_r
+
+        with patch("lyra_core.senses._get", new=fake_get):
+            await poll_wakeword()
+        assert len(captured) == 1
+        assert captured[0].startswith(WAKEWORD_URL), f"expected {WAKEWORD_URL}, got {captured[0]}"
+    asyncio.run(_run())
+
+
 def test_sense_observation_scores_lower_than_conversation():
     """WorkingMemory must apply a lower base importance to sense-source
     observations so background audio doesn't dominate the dreaming queue."""
