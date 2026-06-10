@@ -3,6 +3,7 @@ import asyncio
 import pytest
 from unittest.mock import MagicMock, call
 from lyra.assistant import Assistant, DEFAULT_SYSTEM, LAYER1_FACTS
+from lyra_core.affect import AffectEngine
 from lyra_core.interface import AffectState, CognitiveCore
 
 
@@ -308,6 +309,41 @@ def test_get_system_falls_back_to_layer1_when_memory_not_started():
     """No injected core — memory hasn't been start()ed, so identity_engine
     is None and build_context() raises. _get_system must degrade to Layer 1
     alone, not propagate the error."""
+    mock_backend = MagicMock()
+    mock_memory = MagicMock()
+
+    assistant = Assistant(backend=mock_backend, memory=mock_memory)
+
+    system = asyncio.run(assistant._get_system())
+
+    assert system == LAYER1_FACTS
+
+
+# ── Layer 3: prose hint ──────────────────────────────────────────────────────
+
+def _core_with_affect(emotion_v: float, emotion_a: float) -> CognitiveCore:
+    affect = AffectEngine.from_dict({
+        "accum_rate": 1.0, "emotion_decay": 2.0, "mood_drift": 0.2,
+        "emotion_v": emotion_v, "emotion_a": emotion_a,
+        "mood_v": 0.0, "mood_a": 0.0,
+    })
+    return CognitiveCore(affect=affect)
+
+
+def test_get_system_appends_prose_hint_when_affect_strongly_negative():
+    mock_backend = MagicMock()
+    mock_memory = MagicMock()
+
+    core = _core_with_affect(emotion_v=-0.6, emotion_a=0.6)
+    assistant = Assistant(backend=mock_backend, memory=mock_memory, core=core)
+
+    system = asyncio.run(assistant._get_system())
+
+    assert "Keep responses brief and direct. Don't soften or elaborate." in system
+    assert system.startswith(LAYER1_FACTS)
+
+
+def test_get_system_has_no_layer3_when_affect_neutral():
     mock_backend = MagicMock()
     mock_memory = MagicMock()
 

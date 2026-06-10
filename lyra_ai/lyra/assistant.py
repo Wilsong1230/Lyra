@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator
 
 from lyra.backends import Backend
 from lyra.memory import ConversationMemory
+from lyra_core.expression import prose_hint
 from lyra_core.interface import CognitiveCore, AffectState, Observation, ObservationKind
 from lyra_memory import retrieval
 
@@ -52,11 +53,20 @@ class Assistant:
         return self._core.introspect()
 
     async def _get_system(self) -> str:
+        parts = [self.system]
+
         try:
             context = await retrieval.build_context(self._core.memory)
         except Exception:
-            return self.system
-        return f"{self.system}\n\n{context}".strip() if context else self.system
+            context = ""
+        if context:
+            parts.append(context)
+
+        hint = prose_hint(self._core.introspect())
+        if hint:
+            parts.append(hint)
+
+        return "\n\n".join(parts)
 
     async def _log_turn(self, role: str, content: str) -> None:
         source = "conversation" if role == "user" else "lyra"
