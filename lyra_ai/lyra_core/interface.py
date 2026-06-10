@@ -122,24 +122,138 @@ class AffectState:
 
 # ── Core ──────────────────────────────────────────────────────────────────────
 
-class CognitiveCore:
-    """Phase 0 stub.  Contract only — no behavior yet.
+# Recurrence id used to route action_outcome failures into RelationalDrive —
+# "the recurring problem" framing for repeated action failures (Phase 3.6).
+_FAILURE_PROBLEM_ID = "action_outcome_failure"
 
-    tick() is the single entry point.  Later phases will route observations
-    through drives, update affect, and produce intents here.
+
+class CognitiveCore:
+    """The live cognitive loop.
+
+    tick() is the single entry point: ingest observations into memory and the
+    drives, advance affect, select intents (biased by promoted traits), and
+    gate them. introspect() reads the live affect without advancing anything.
+
+    Every component is constructed with real defaults but is injectable — the
+    test harness can build a fully-faked core by passing fakes for any of
+    affect / competence / boredom / relational / selector / consolidator /
+    memory / gate.
     """
 
-    def __init__(self, gate=None) -> None:
+    def __init__(
+        self,
+        gate=None,
+        affect=None,
+        competence=None,
+        boredom=None,
+        relational=None,
+        selector=None,
+        consolidator=None,
+        memory=None,
+    ) -> None:
         from lyra_core.gate import HarmGate
+        from lyra_core.affect import AffectEngine
+        from lyra_core.drives import BoredomDrive, CompetenceTracker, RelationalDrive
+        from lyra_core.action_selection import ActionSelector
+        from lyra_core.development import OutcomeConsolidator
+        from lyra_memory import MemorySystem
+
         self._gate = gate if gate is not None else HarmGate()
+        self._affect = affect if affect is not None else AffectEngine()
+        self._competence = competence if competence is not None else CompetenceTracker()
+        self._boredom = boredom if boredom is not None else BoredomDrive(self._competence)
+        self._relational = relational if relational is not None else RelationalDrive()
+        self._selector = selector if selector is not None else ActionSelector()
+        self._memory = memory if memory is not None else MemorySystem()
+
+        self._consolidator_injected = consolidator is not None
+        self._consolidator = consolidator if consolidator is not None else OutcomeConsolidator(
+            pool=getattr(self._memory, "candidate_pool", None),
+            working_memory=getattr(self._memory, "working_memory", None),
+        )
+
+    @property
+    def memory(self):
+        """The MemorySystem this core owns (or was given)."""
+        return self._memory
+
+    # ── Lifecycle ────────────────────────────────────────────────────────────
+
+    async def start(self) -> None:
+        """Start the owned memory system and restore persisted affect, if any."""
+        await self._memory.start()
+
+        structured_state = getattr(self._memory, "structured_state", None)
+        if structured_state is not None:
+            saved = await structured_state.get_fact("affect_state")
+            if saved is not None:
+                from lyra_core.affect import AffectEngine
+                self._affect = AffectEngine.from_dict(saved)
+
+        if not self._consolidator_injected:
+            from lyra_core.development import OutcomeConsolidator
+            self._consolidator = OutcomeConsolidator(
+                pool=getattr(self._memory, "candidate_pool", None),
+                working_memory=getattr(self._memory, "working_memory", None),
+            )
+
+    async def stop(self) -> None:
+        """Persist current affect state and stop the owned memory system."""
+        structured_state = getattr(self._memory, "structured_state", None)
+        if structured_state is not None:
+            await structured_state.set_fact("affect_state", self._affect.to_dict())
+
+        await self._memory.stop()
+
+    # ── Ingest ───────────────────────────────────────────────────────────────
+
+    async def _ingest_sensory(self, obs: Observation) -> None:
+        try:
+            if obs.source == "conversation":
+                await self._memory.add_turn("user", obs.content)
+            elif obs.source == "lyra":
+                await self._memory.add_turn("lyra", obs.content)
+            else:
+                await self._memory.add_observation(obs.content, source=obs.source)
+        except RuntimeError:
+            pass
+
+    async def _ingest_outcome(self, obs: Observation) -> None:
+        if obs.predicted is None or obs.actual is None:
+            return
+
+        from lyra_core.development import Outcome
+
+        success = obs.predicted == obs.actual
+        self._competence.observe_error(0.0 if success else 1.0)
+
+        if not success:
+            self._relational.observe_recurrence(_FAILURE_PROBLEM_ID)
+
+        outcome = Outcome(
+            intent=Intent(kind=IntentKind.noop, payload={}),
+            success=success,
+            affect=self._affect.state,
+            drive="boredom" if success else "relational",
+        )
+        if getattr(self._memory, "candidate_pool", None) is not None:
+            await self._consolidator.record_outcome(outcome)
+
+    async def _get_promoted_traits(self) -> list:
+        identity_engine = getattr(self._memory, "identity_engine", None)
+        if identity_engine is None:
+            return []
+        return await identity_engine.get_top_traits()
+
+    # ── Tick ─────────────────────────────────────────────────────────────────
 
     def _gate_intents(self, intents: list[Intent]) -> list[Intent]:
         """Run intents through the harm gate; drop blocked ones and log each block.
 
         This is the single chokepoint all intents must pass before leaving the
-        core.  Phase 3's action-selection will produce intents that flow into
-        tick() and therefore through here automatically — nothing bypasses it.
-        A blocked intent must never vanish silently; the log line is the trace.
+        core.  Action-selection produces intents that flow into tick() and
+        therefore through here automatically — nothing bypasses it.  A blocked
+        intent must never vanish silently; the log line is the trace.
         """
         allowed = []
         for intent in intents:
@@ -153,30 +267,53 @@ class CognitiveCore:
                 )
         return allowed
 
-    def tick(self, observations: list[Observation]) -> tuple[list[Intent], AffectState]:
-        """Ingest observations, return (intents, affect).
+    async def tick(self, observations: list[Observation], dt: float = 0.1) -> tuple[list[Intent], AffectState]:
+        """Ingest observations, advance affect and drives, return (intents, affect).
 
-        Phase 0: ignores all input, returns empty intent list and neutral affect.
-        All intents pass through _gate_intents before returning — the chokepoint
-        exists now so Phase 3 action-selection inherits it automatically.
+        a. Sensory observations go to memory (add_turn for conversation/lyra
+           sources, add_observation otherwise); action_outcome observations
+           with predicted/actual feed CompetenceTracker, RelationalDrive (on
+           failure), and the OutcomeConsolidator — all using the affect-at-
+           the-time of this tick (before this tick's affect update).
+        b. Drives advance by dt; "engaged" means at least one observation
+           arrived this tick.
+        c. AffectEngine advances by dt using the summed drive AffectPushes.
+        d. Promoted traits bias ActionSelector; intents pass through the gate.
         """
-        intents: list[Intent] = []
-        affect = AffectState()
+        from lyra_core.development import bias_from_traits
+
+        for obs in observations:
+            if obs.kind == ObservationKind.sensory:
+                await self._ingest_sensory(obs)
+            elif obs.kind == ObservationKind.action_outcome:
+                await self._ingest_outcome(obs)
+
+        engaged = len(observations) > 0
+        self._boredom.update(dt, engaged=engaged)
+        self._relational.update(dt)
+
+        boredom_push = self._boredom.affect_push
+        relational_push = self._relational.affect_push
+        self._affect.update(
+            dt,
+            valence_input=boredom_push.valence_delta + relational_push.valence_delta,
+            arousal_input=boredom_push.arousal_delta + relational_push.arousal_delta,
+        )
+
+        traits = await self._get_promoted_traits()
+        bias = bias_from_traits(traits)
+
+        pressures = {"boredom": self._boredom.pressure, "relational": self._relational.pressure}
+        intents = self._selector.select(pressures, self._affect.state, bias=bias)
         intents = self._gate_intents(intents)
-        return intents, affect
+
+        return intents, self._affect.state
 
     def introspect(self) -> AffectState:
         """Read current affect WITHOUT advancing the core (read-only port).
 
-        Phase 0 stub: returns neutral AffectState().
-
-        This is deliberately separate from tick() so that observing the
-        box never mutates it. Later phases:
-          - returns the core's actually-held current AffectState
-          - will likely also expose recent affect history (metacognitive
-            seam) — reserve that as a future addition, do NOT add a history
-            param now.
-        introspect() must NEVER mutate state or advance a tick. It is the
-        port the telemetry/dashboard and Lyra's own self-reading use.
+        Deliberately separate from tick() so that observing the box never
+        mutates it. This is the port the telemetry/dashboard and Lyra's own
+        self-reading use.
         """
-        return AffectState()
+        return self._affect.state

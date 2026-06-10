@@ -1,11 +1,8 @@
 """lyra_core.harness — test rig for driving CognitiveCore in isolation.
 
-No services, no HTTP, no memory daemon. Feed scripted observation sequences
-across multiple ticks, collect outputs into an inspectable trace.
-
-Designed to outlive Phase 0: Phase 3 injects a real core via Harness(core=...),
-the builder helpers (sensory, outcome, failures) stay honest to the stub now
-and fill in with real semantics later.
+No services, no HTTP, no memory daemon (unless injected). Feed scripted
+observation sequences across multiple ticks, collect outputs into an
+inspectable trace. Inject a real or partially-faked core via Harness(core=...).
 """
 from __future__ import annotations
 
@@ -42,24 +39,24 @@ class Harness:
 
     Usage:
         h = Harness()
-        trace = h.run([
+        trace = await h.run([
             [sensory("screen shows code")],
             [outcome("command ran", predicted="exit 0", actual="exit 1")],
         ])
-        assert trace[0].affect.valence == 0.0  # Phase 0 stub
+        assert isinstance(trace[0].affect.valence, float)
 
-    Phase 3: inject a real core to assert emergent affect changes.
+    Inject a real (or partially-faked) core to assert emergent affect changes.
         h = Harness(core=real_core)
     """
 
     def __init__(self, core: CognitiveCore | None = None) -> None:
         self._core = core if core is not None else CognitiveCore()
 
-    def run(self, script: Script) -> list[TickRecord]:
+    async def run(self, script: Script, dt: float = 0.1) -> list[TickRecord]:
         """Execute each batch in script through the core, return the full trace."""
         trace: list[TickRecord] = []
         for index, batch in enumerate(script):
-            intents, affect = self._core.tick(batch)
+            intents, affect = await self._core.tick(batch, dt)
             trace.append(TickRecord(
                 observations=list(batch),
                 intents=intents,
@@ -102,14 +99,12 @@ def outcome(
 
 
 def failures(n: int) -> Script:
-    """RESERVED SCAFFOLD — Phase 3 frustration test sequence.
+    """Frustration test sequence.
 
     Returns a Script of n single-observation ticks, each an action_outcome
-    representing a failed action. Inert now (the stub ignores it), but this
-    is the exact sequence Phase 3 will use to assert frustration accumulates
-    and overrides a drive.
-
-    # Phase 3: assert affect degrades here.
+    representing a failed action. Against a live core, repeated failures
+    route into RelationalDrive and accumulate negative affect, eventually
+    flipping ActionSelector from persist to abandon.
     """
     return [
         [outcome(f"action failed (attempt {i + 1})", predicted="success", actual="failure")]

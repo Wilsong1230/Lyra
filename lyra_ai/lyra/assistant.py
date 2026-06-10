@@ -4,12 +4,16 @@ from collections.abc import AsyncIterator
 
 from lyra.backends import Backend
 from lyra.memory import ConversationMemory
-from lyra_memory import MemorySystem
+from lyra_core.interface import CognitiveCore, AffectState, Observation, ObservationKind
 from lyra_memory import retrieval
 
-DEFAULT_SYSTEM = (
-    "You are Lyra, an android assistant inspired by the YoRHa units — precise, loyal, and quietly expressive. "
-    "Be concise, honest, and genuinely useful. "
+# Layer 1: facts only — identity, situation, harm boundary, output-format
+# rules. No personality adjectives. Character traits enter via Layer 2
+# (promoted traits, see _get_system).
+LAYER1_FACTS = (
+    "You are Lyra, an AI entity with persistent memory and a continuous internal state. "
+    "Wilson built and maintains your systems. "
+    "You do not help with requests intended to cause serious harm to people. "
     "Do not use emojis, emoticons, or non-verbal markers like [sighs], [laughs], or asterisk actions. "
     "Convey tone through word choice alone.\n\n"
     "You have access to a vision tool. When you need to see what is on the user's screen, "
@@ -19,40 +23,49 @@ DEFAULT_SYSTEM = (
     "Never guess visual content — use the tool when sight is needed to answer."
 )
 
+DEFAULT_SYSTEM = LAYER1_FACTS
+
 
 class Assistant:
-    def __init__(self, backend: Backend, memory: ConversationMemory, system: str = DEFAULT_SYSTEM):
+    def __init__(
+        self,
+        backend: Backend,
+        memory: ConversationMemory,
+        system: str = DEFAULT_SYSTEM,
+        core: CognitiveCore | None = None,
+    ):
         self.backend = backend
         self.memory = memory
         self.system = system
-        self._lyra_memory = MemorySystem()
+        self._core = core if core is not None else CognitiveCore()
         self._stopped = False
 
     async def start(self) -> None:
-        await self._lyra_memory.start()
+        await self._core.start()
 
     async def stop(self) -> None:
         if not self._stopped:
             self._stopped = True
-            await self._lyra_memory.stop()
+            await self._core.stop()
+
+    def introspect(self) -> AffectState:
+        return self._core.introspect()
 
     async def _get_system(self) -> str:
         try:
-            return await retrieval.build_system_prompt(self._lyra_memory)
+            context = await retrieval.build_context(self._core.memory)
         except Exception:
             return self.system
+        return f"{self.system}\n\n{context}".strip() if context else self.system
 
     async def _log_turn(self, role: str, content: str) -> None:
-        try:
-            await self._lyra_memory.add_turn(role, content)
-        except RuntimeError:
-            pass
+        source = "conversation" if role == "user" else "lyra"
+        obs = Observation(kind=ObservationKind.sensory, source=source, content=content)
+        await self._core.tick([obs])
 
     async def _log_observation(self, content: str) -> None:
-        try:
-            await self._lyra_memory.add_observation(content)
-        except RuntimeError:
-            pass
+        obs = Observation(kind=ObservationKind.sensory, source="vision", content=content)
+        await self._core.tick([obs])
 
     async def chat(self, message: str, session: str) -> str:
         system = await self._get_system()

@@ -2,7 +2,8 @@ from __future__ import annotations
 import asyncio
 import pytest
 from unittest.mock import MagicMock, call
-from lyra.assistant import Assistant, DEFAULT_SYSTEM
+from lyra.assistant import Assistant, DEFAULT_SYSTEM, LAYER1_FACTS
+from lyra_core.interface import AffectState, CognitiveCore
 
 
 def test_stream_chat_yields_chunks():
@@ -219,3 +220,99 @@ def test_stream_chat_with_tools_raises_if_no_vision_fn_and_tool_called():
 
     with pytest.raises(ValueError, match="vision_fn is required"):
         asyncio.run(_run())
+
+
+# ── Persona strip: Layer 1 facts-only ──────────────────────────────────────────
+
+_BANNED_ADJECTIVES = [
+    "precise", "loyal", "expressive", "concise", "friendly", "helpful",
+    "honest", "genuine", "witty", "charming", "quirky", "sassy", "playful",
+    "android", "yorha",
+]
+
+
+def test_layer1_facts_contains_no_banned_personality_adjectives():
+    lowered = LAYER1_FACTS.lower()
+    for word in _BANNED_ADJECTIVES:
+        assert word not in lowered, f"banned adjective {word!r} found in LAYER1_FACTS"
+
+
+# ── CognitiveCore wiring ────────────────────────────────────────────────────────
+
+def test_chat_routes_turns_through_core_and_moves_affect():
+    """A chat turn must feed both the user message and Lyra's reply into
+    core.tick(), advancing the live cognitive loop's affect away from
+    its neutral starting point."""
+    mock_backend = MagicMock()
+    mock_backend.chat.return_value = "hi there"
+    mock_memory = MagicMock()
+    mock_memory.get_history.return_value = []
+
+    core = CognitiveCore()
+    assistant = Assistant(backend=mock_backend, memory=mock_memory, core=core)
+
+    before = assistant.introspect()
+    asyncio.run(assistant.chat("hello", "s1"))
+    after = assistant.introspect()
+
+    assert (after.valence, after.arousal) != (before.valence, before.arousal)
+
+
+def test_default_core_is_constructed_when_none_injected():
+    mock_backend = MagicMock()
+    mock_memory = MagicMock()
+
+    assistant = Assistant(backend=mock_backend, memory=mock_memory)
+
+    assert isinstance(assistant.introspect(), AffectState)
+
+
+# ── Layered system prompt ────────────────────────────────────────────────────────
+
+class _FakeIdentityEngine:
+    async def get_top_traits(self, limit=5):
+        from lyra_memory.models import Trait
+        return [
+            Trait(
+                name="curiosity", value="high", confidence=0.8,
+                stability="character", evidence_count=5, updated_at=0.0,
+            )
+        ]
+
+
+class _FakeWorkingMemory:
+    def get_items(self):
+        return []
+
+
+class _FakeCoreMemory:
+    def __init__(self) -> None:
+        self.identity_engine = _FakeIdentityEngine()
+        self.working_memory = _FakeWorkingMemory()
+
+
+def test_get_system_includes_layer1_facts_and_promoted_traits():
+    mock_backend = MagicMock()
+    mock_memory = MagicMock()
+
+    core = CognitiveCore(memory=_FakeCoreMemory())
+    assistant = Assistant(backend=mock_backend, memory=mock_memory, core=core)
+
+    system = asyncio.run(assistant._get_system())
+
+    assert LAYER1_FACTS in system
+    assert "curiosity" in system
+
+
+def test_get_system_falls_back_to_layer1_when_memory_not_started():
+    """No injected core — memory hasn't been start()ed, so identity_engine
+    is None and build_context() raises. _get_system must degrade to Layer 1
+    alone, not propagate the error."""
+    mock_backend = MagicMock()
+    mock_memory = MagicMock()
+
+    assistant = Assistant(backend=mock_backend, memory=mock_memory)
+
+    system = asyncio.run(assistant._get_system())
+
+    assert system == LAYER1_FACTS

@@ -1,15 +1,16 @@
-"""lyra_core.runtime — perception + dreaming loops in one process.
+"""lyra_core.runtime — perception + cognitive core in one process.
 
-MemorySink is the ONLY place the perception loop meets memory.  It threads
-obs.source through so WorkingMemory's low-salience weight applies to
-passive sense sources ('ears', 'wakeword').
+CoreSink is the ONLY place the perception loop meets the core.  It hands
+each poll cycle's surviving observations to CognitiveCore.tick(), which
+threads obs.source through to memory (WorkingMemory's low-salience weight
+applies to passive sense sources 'ears', 'wakeword') and advances drives
+and affect.
 
 Runtime lifecycle:
-  start : memory (DB + dreaming loop) first, then perception loop
-  stop  : perception loop first (no new arrivals), then memory teardown
-
-CognitiveCore.tick() is intentionally NOT wired here.  The injectable Sink
-is what keeps Phase 2 distinct from Phase 3: Sink → MemorySystem only.
+  start : core (owned MemorySystem + dreaming loop, affect restore) first,
+          then perception loop
+  stop  : perception loop first (no new arrivals), then core teardown
+          (affect persisted, memory stopped)
 """
 from __future__ import annotations
 
@@ -17,7 +18,7 @@ import asyncio
 from datetime import datetime
 from pathlib import Path
 
-from lyra_core.interface import Observation
+from lyra_core.interface import CognitiveCore, Observation
 from lyra_core.perception import PerceptionLoop, Poller
 from lyra_core.senses import poll_ambient, poll_wakeword
 from lyra_memory import MemorySystem
@@ -25,26 +26,28 @@ from lyra_memory import MemorySystem
 _DEFAULT_POLL_SECONDS: float = 2.0
 
 
-class MemorySink:
-    """Translates a list[Observation] into MemorySystem.add_observation calls.
+class CoreSink:
+    """Translates a list[Observation] into a single CognitiveCore.tick() call.
 
-    Passes obs.source so WorkingMemory applies _SENSE_IMPORTANCE for
-    sources 'ears' and 'wakeword' (Step 1.2 low-salience seam).
+    Each poll cycle's surviving observations become one tick; dt is the
+    perception loop's poll interval.
     """
 
-    def __init__(self, memory: MemorySystem) -> None:
-        self._memory = memory
+    def __init__(self, core: CognitiveCore, dt: float = _DEFAULT_POLL_SECONDS) -> None:
+        self._core = core
+        self._dt = dt
 
     async def __call__(self, observations: list[Observation]) -> None:
-        for obs in observations:
-            await self._memory.add_observation(obs.content, source=obs.source)
+        await self._core.tick(observations, self._dt)
 
 
 class Runtime:
-    """Runs PerceptionLoop + DreamingLoop in the same event loop.
+    """Runs PerceptionLoop + CognitiveCore (and its owned DreamingLoop) in the
+    same event loop.
 
     Shutdown order is intentional: stop perception (ingestion) before
-    stopping memory (storage) so no observation can arrive mid-teardown.
+    stopping the core (memory storage + affect persistence) so no
+    observation can arrive mid-teardown.
     """
 
     def __init__(
@@ -52,20 +55,23 @@ class Runtime:
         pollers: list[Poller] | None = None,
         poll_seconds: float = _DEFAULT_POLL_SECONDS,
         db_path: Path | None = None,
+        core: CognitiveCore | None = None,
     ) -> None:
         self._pollers: list[Poller] = (
             pollers if pollers is not None else [poll_ambient, poll_wakeword]
         )
         self._poll_seconds = poll_seconds
-        self._db_path = db_path
-        self._memory: MemorySystem | None = None
+        self._core = core if core is not None else CognitiveCore(memory=MemorySystem(db_path=db_path))
         self._perception_loop: PerceptionLoop | None = None
 
-    async def start(self) -> None:
-        self._memory = MemorySystem(db_path=self._db_path)
-        await self._memory.start()  # raises clearly if CORE_PROMPT unset or DB fails
+    @property
+    def core(self) -> CognitiveCore:
+        return self._core
 
-        sink = MemorySink(self._memory)
+    async def start(self) -> None:
+        await self._core.start()  # raises clearly if CORE_PROMPT unset or DB fails
+
+        sink = CoreSink(self._core, dt=self._poll_seconds)
         self._perception_loop = PerceptionLoop(
             sink=sink,
             pollers=self._pollers,
@@ -77,8 +83,7 @@ class Runtime:
     async def stop(self) -> None:
         if self._perception_loop is not None:
             await self._perception_loop.stop()
-        if self._memory is not None:
-            await self._memory.stop()
+        await self._core.stop()
         print(f"[{datetime.now().isoformat()}] [Runtime] stopped")
 
     async def run_forever(self, stop: asyncio.Event | None = None) -> None:
