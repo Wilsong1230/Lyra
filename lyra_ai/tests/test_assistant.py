@@ -238,6 +238,18 @@ def test_layer1_facts_contains_no_banned_personality_adjectives():
         assert word not in lowered, f"banned adjective {word!r} found in LAYER1_FACTS"
 
 
+def test_layer1_facts_states_real_architecture():
+    lowered = LAYER1_FACTS.lower()
+    assert "affect" in lowered
+    assert "drives" in lowered
+    assert "persistent memory" in lowered
+    assert "cannot know" in lowered
+
+
+def test_layer1_facts_prohibits_self_denial():
+    assert "do not deny" in LAYER1_FACTS.lower()
+
+
 # ── CognitiveCore wiring ────────────────────────────────────────────────────────
 
 def test_chat_routes_turns_through_core_and_moves_affect():
