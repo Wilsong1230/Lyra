@@ -196,3 +196,116 @@ def test_state_returns_affect_state_with_all_timescales_populated():
     assert isinstance(state.emotion, AffectVector)
     assert isinstance(state.mood, AffectVector)
     assert state.temperament is not None
+
+
+# ── Encouragement channel ──────────────────────────────────────────────────────
+#
+# encourage() temporarily slows the ACCUMULATION of negative valence input.
+# It is not a reward: it never injects valence, never touches mood directly,
+# and never alters temperament. It only shallows the downward slope while
+# active, then expires.
+
+def test_encourage_alone_does_not_raise_valence():
+    """NO REWARD: encourage() + zero-input updates → valence stays ~0."""
+    engine = AffectEngine()
+    engine.encourage(strength=0.8, duration=30.0)
+    for _ in range(20):
+        engine.update(0.1)
+    assert engine.state.emotion.valence == pytest.approx(0.0)
+    assert engine.state.mood.valence == pytest.approx(0.0)
+
+
+def test_encouragement_slows_negative_accumulation():
+    """SLOWED ACCUMULATION: same negative-input sequence, encouraged engine ends
+    LESS negative than baseline, and is never boosted upward at any step."""
+    dt = 0.1
+    encouraged = AffectEngine()
+    encouraged.encourage(strength=0.5, duration=30.0)
+    baseline = AffectEngine()
+
+    prev_encouraged_v = encouraged.state.emotion.valence
+    for _ in range(20):
+        encouraged.update(dt, valence_input=-1.0)
+        baseline.update(dt, valence_input=-1.0)
+
+        encouraged_v = encouraged.state.emotion.valence
+        baseline_v = baseline.state.emotion.valence
+
+        # Never boosted upward: encouragement only shallows the downward slope.
+        assert encouraged_v <= prev_encouraged_v, \
+            f"Encouraged valence rose at this step: {prev_encouraged_v} -> {encouraged_v}"
+        prev_encouraged_v = encouraged_v
+
+        # Encouraged engine is less negative (or equal) than baseline at every step.
+        assert encouraged_v >= baseline_v
+
+    # And strictly less negative by the end.
+    assert encouraged.state.emotion.valence > baseline.state.emotion.valence
+
+
+def test_encouragement_expires_after_duration_then_full_rate_resumes():
+    """EXPIRY: once `duration` of update() dt has elapsed, accumulation
+    returns to the engine's normal (un-encouraged) rate."""
+    dt = 0.1
+    engine = AffectEngine()  # default accum_rate=1.0, emotion_decay=2.0
+    engine.encourage(strength=0.5, duration=1.0)
+
+    # Consume exactly `duration` of dt at the reduced rate.
+    for _ in range(10):
+        engine.update(dt, valence_input=-1.0)
+
+    ev, mv = engine.state.emotion.valence, engine.state.mood.valence
+
+    engine.update(dt, valence_input=-1.0)
+    ev_after = engine.state.emotion.valence
+
+    full_rate_expected = ev + 1.0 * (-1.0) * dt + 2.0 * (mv - ev) * dt
+    half_rate_expected = ev + 0.5 * (-1.0) * dt + 2.0 * (mv - ev) * dt
+
+    assert ev_after == pytest.approx(full_rate_expected)
+    assert ev_after != pytest.approx(half_rate_expected)
+
+
+def test_encouragement_no_effect_with_positive_or_neutral_input():
+    """NO EFFECT ABSENT PRESSURE: encourage() then positive/neutral inputs
+    produce a trajectory identical to an unencouraged engine."""
+    dt = 0.1
+    encouraged = AffectEngine()
+    encouraged.encourage(strength=0.5, duration=30.0)
+    baseline = AffectEngine()
+
+    for v in [0.0, 0.5, 0.0, 1.0, 0.0]:
+        encouraged.update(dt, valence_input=v)
+        baseline.update(dt, valence_input=v)
+
+    assert encouraged.state.emotion.valence == pytest.approx(baseline.state.emotion.valence)
+    assert encouraged.state.mood.valence == pytest.approx(baseline.state.mood.valence)
+
+
+def test_encourage_strength_above_one_floors_multiplier_at_zero():
+    """strength > 1.0 → multiplier floors at 0, never reverses the sign of input."""
+    dt = 0.1
+    engine = AffectEngine()
+    engine.encourage(strength=1.5, duration=30.0)
+    engine.update(dt, valence_input=-1.0)
+    # multiplier = max(0, 1 - 1.5) = 0 → no contribution from valence_input
+    assert engine.state.emotion.valence == pytest.approx(0.0)
+
+
+def test_serialize_restore_preserves_active_encouragement():
+    """Persistence: an in-progress encouragement survives to_dict()/from_dict()
+    and continues to apply identically on the restored engine."""
+    dt = 0.1
+    engine = AffectEngine()
+    engine.encourage(strength=0.5, duration=30.0)
+    for _ in range(3):
+        engine.update(dt, valence_input=-1.0)
+
+    restored = AffectEngine.from_dict(engine.to_dict())
+
+    for _ in range(3):
+        engine.update(dt, valence_input=-1.0)
+        restored.update(dt, valence_input=-1.0)
+
+    assert engine.state.emotion.valence == pytest.approx(restored.state.emotion.valence)
+    assert engine.state.mood.valence == pytest.approx(restored.state.mood.valence)

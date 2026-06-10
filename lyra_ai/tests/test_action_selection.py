@@ -149,6 +149,51 @@ def test_fast_accumulate_temperament_flips_to_abandon_earlier():
     # else: easygoing never flipped within 30 steps → short-fused definitively earlier ✓
 
 
+# ── Encouragement delays the give-up flip ─────────────────────────────────────
+
+def test_encouragement_delays_abandon_flip():
+    """The encouragement channel shallows frustration accumulation, so an
+    encouraged engine tolerates more failures before the selector flips to
+    abandon than an identical, unencouraged engine fed the same inputs."""
+    from lyra_core.affect import AffectEngine
+
+    encouraged = AffectEngine()
+    encouraged.encourage(strength=0.5, duration=30.0)
+    baseline = AffectEngine()
+
+    selector = ActionSelector(affect_weight=1.0)
+    steady_pressure = {"boredom": 0.3}
+
+    encouraged_flip_step: int | None = None
+    baseline_flip_step:   int | None = None
+
+    for step in range(30):
+        encouraged.update(0.1, valence_input=-1.0)
+        baseline.update(0.1, valence_input=-1.0)
+
+        if baseline_flip_step is None and _is_abandoning(
+            selector.select(steady_pressure, baseline.state)
+        ):
+            baseline_flip_step = step
+
+        if encouraged_flip_step is None and _is_abandoning(
+            selector.select(steady_pressure, encouraged.state)
+        ):
+            encouraged_flip_step = step
+
+    # Baseline MUST have flipped within the run.
+    assert baseline_flip_step is not None, \
+        "Baseline engine never flipped — check affect_weight or drive_pressure"
+
+    # Encouraged either never flipped, or flipped strictly later.
+    if encouraged_flip_step is not None:
+        assert encouraged_flip_step > baseline_flip_step, (
+            f"Encouraged flipped at step {encouraged_flip_step} but "
+            f"baseline flipped at step {baseline_flip_step} — expected encouraged later"
+        )
+    # else: encouraged never flipped within 30 steps → definitively later ✓
+
+
 # ── Gate boundary: affect override can never produce a blocked intent ─────────
 
 def test_extreme_affect_only_produces_allowed_intent_kinds():

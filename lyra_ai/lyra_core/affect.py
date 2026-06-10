@@ -15,6 +15,9 @@ from __future__ import annotations
 
 from lyra_core.interface import AffectState, AffectVector
 
+# Floating-point tolerance for encouragement-timer expiry checks.
+_ENCOURAGE_EPS = 1e-9
+
 
 class AffectEngine:
     """Live affect substrate with three-timescale dynamics."""
@@ -34,6 +37,25 @@ class AffectEngine:
         self._mood_v: float = 0.0
         self._mood_a: float = 0.0
 
+        # Encouragement channel: temporarily slows accumulation of NEGATIVE
+        # valence input only. Never injects valence, never touches mood or
+        # temperament directly. Decays over `duration` of update() dt.
+        self._encourage_strength: float = 0.0
+        self._encourage_remaining: float = 0.0
+
+    # ── Encouragement ─────────────────────────────────────────────────────────
+
+    def encourage(self, strength: float = 0.5, duration: float = 30.0) -> None:
+        """Temporarily shallow the accumulation of negative valence input.
+
+        Applies a multiplier of max(0, 1 - strength) to the accumulation rate
+        for negative valence_input only, for the next `duration` of update()
+        dt. Positive valence input and arousal are unaffected. This is not a
+        reward: it never raises valence directly.
+        """
+        self._encourage_strength = strength
+        self._encourage_remaining = duration
+
     # ── Public update ─────────────────────────────────────────────────────────
 
     def update(
@@ -49,8 +71,12 @@ class AffectEngine:
         ev, ea = self._emotion_v, self._emotion_a
         mv, ma = self._mood_v, self._mood_a
 
+        valence_accum_rate = self._accum_rate
+        if self._encourage_remaining > _ENCOURAGE_EPS and valence_input < 0.0:
+            valence_accum_rate *= max(0.0, 1.0 - self._encourage_strength)
+
         # Emotion: accumulate input, then decay toward mood
-        self._emotion_v = ev + self._accum_rate * valence_input * dt \
+        self._emotion_v = ev + valence_accum_rate * valence_input * dt \
                              + self._emotion_decay * (mv - ev) * dt
         self._emotion_a = ea + self._accum_rate * arousal_input * dt \
                              + self._emotion_decay * (ma - ea) * dt
@@ -58,6 +84,8 @@ class AffectEngine:
         # Mood: drift toward emotion (uses old emotion values)
         self._mood_v = mv + self._mood_drift * (ev - mv) * dt
         self._mood_a = ma + self._mood_drift * (ea - ma) * dt
+
+        self._encourage_remaining = max(0.0, self._encourage_remaining - dt)
 
     # ── State introspection ───────────────────────────────────────────────────
 
@@ -86,6 +114,8 @@ class AffectEngine:
             "emotion_a":     self._emotion_a,
             "mood_v":        self._mood_v,
             "mood_a":        self._mood_a,
+            "encourage_strength":  self._encourage_strength,
+            "encourage_remaining": self._encourage_remaining,
         }
 
     @classmethod
@@ -99,4 +129,6 @@ class AffectEngine:
         engine._emotion_a = d["emotion_a"]
         engine._mood_v = d["mood_v"]
         engine._mood_a = d["mood_a"]
+        engine._encourage_strength = d.get("encourage_strength", 0.0)
+        engine._encourage_remaining = d.get("encourage_remaining", 0.0)
         return engine
