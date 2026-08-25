@@ -28,10 +28,20 @@ Three things that will bite otherwise:
 2. **Homebrew/python.org Python only.** macOS system Python disables SQLite
    extension loading and `sqlite-vec` will not load. `db.py` raises a clear
    error if you get this wrong.
-3. **`~/.lyra/memory.db` does not travel with the repo.** Copy it if you want
-   the existing corpus (29 episodes → 260 atoms, 68 candidates). Two migrations
-   run automatically on first `init_db()` and are irreversible — **back it up
-   before first run on the new machine.**
+3. **Start with an empty memory. This is deliberate — do not copy the old DB.**
+   `~/.lyra/memory.db` lives outside the repo and stays on the old machine.
+   A fresh one is created on first run and the two migrations become no-ops.
+
+   Decided 2026-08-25. The old corpus predates all five steps: its atoms were
+   decomposed out of essays written under the old salience scheme, and how
+   memory is stored changed underneath them. A clean corpus under the current
+   architecture is worth more than a migrated one.
+
+   What is being given up, stated plainly: `communication_style` was the only
+   trait Lyra ever promoted in three months, and promotion needs 5 sightings
+   of one candidate, so that counter resets to zero. The other 67 candidates
+   were mostly seen exactly once and are closer to noise than history. The old
+   file still exists on the old machine if this turns out to be the wrong call.
 
 Test commands:
 
@@ -130,6 +140,12 @@ Episodes were one ~3,000-char essay per dream cycle. Now:
 - Migration decomposed all 29 episodes into **260 atoms**, losslessly — the
   per-item scores were already in `source_items_json`.
 
+> The migration figures in this section (70 → 68 candidates, 29 → 260 atoms) are
+> from verification runs against a copy of the OLD database, and are recorded to
+> show the migration code works. They are not the state of your database — the
+> old corpus was deliberately left behind, so you start empty. The migration
+> code still runs on first `init_db()`; it just has nothing to do.
+
 Measured:
 
 | | before | after |
@@ -186,10 +202,12 @@ Suggested order — (1) is small and immediate, then it is a real fork:
    answerable — a continuously running unified process can use wall-clock time,
    at which point the three-timescale design starts to mean something.
 
-   **(c) Accumulate corpus.** Steps 1–5 changed what gets stored and how. The
-   old 29 episodes are migrated but pre-date all of it. Original build-order
-   step 3 — run continuously for days, then read the atom table — is now
-   actually worth doing, and cannot be compressed by spending money.
+   **(c) Accumulate corpus.** Steps 1–5 changed what gets stored and how, and
+   the old corpus was deliberately left behind, so the atom table starts empty.
+   Original build-order step 3 — run continuously for days, then read the atom
+   table and check whether dedup holds and whether salience spreads or clumps —
+   is now both unavoidable and genuinely informative, since every row will have
+   been written by the current code. It cannot be compressed by spending money.
 
 I would do (1), then (b), then (c), and treat (a) as the reward for finishing
 (b). (b) is the one that unblocks the most downstream design.
