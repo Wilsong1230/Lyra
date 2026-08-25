@@ -109,7 +109,13 @@ class OutcomeConsolidator:
             )
             self._working_memory.add_observation(summary)
 
-        await self._pool.add_observation(trait_name, trait_value, "behavioral")
+        # closed_vocabulary: trait_name_from_outcome emits one of exactly four
+        # names, all built from the same template. Semantic dedup merges them
+        # into each other (persists/abandons under frustration sit at L2 0.746),
+        # which would silently count persistence as evidence of abandonment.
+        await self._pool.add_observation(
+            trait_name, trait_value, "behavioral", closed_vocabulary=True
+        )
 
 
 # ── Bias computation ──────────────────────────────────────────────────────────

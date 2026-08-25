@@ -210,10 +210,14 @@ async def test_candidate_pool_min_evidence_filter(tmp_db_path: Path):
     conn = await init_db(tmp_db_path)
     pool = CandidatePool(conn)
 
-    # Use semantically distinct names so KNN dedup doesn't merge them
-    await pool.add_observation("emotional_sensitivity", "alpha trait value", "behavioral")
-    await pool.add_observation("analytical_reasoning", "beta trait value", "behavioral")
-    await pool.add_observation("analytical_reasoning", "beta trait value", "behavioral")  # beta now has 2
+    # Dedup matches on the DESCRIPTION, so these must be semantically distinct
+    # descriptions — distinct names are not enough.
+    await pool.add_observation(
+        "emotional_sensitivity", "responds warmly to distress in others", "behavioral")
+    await pool.add_observation(
+        "analytical_reasoning", "decomposes problems into numbered sub-steps", "behavioral")
+    await pool.add_observation(
+        "analytical_reasoning", "decomposes problems into numbered sub-steps", "behavioral")
 
     one_plus = await pool.get_candidates(min_evidence=1)
     two_plus = await pool.get_candidates(min_evidence=2)
@@ -250,11 +254,12 @@ async def test_dreaming_loop_count_trigger(tmp_db_path: Path):
     assert mock_reflection in episodes[0]["content"]
     assert wm.count_since_last_dream() == 0  # mark_dreamed() was called
 
-    # vec_episodes must have one row linked to the episode's rowid
+    # The essay must NOT be embedded into a retrieval index. It is a
+    # consolidation layer over its atoms, not a competitor to them — a single
+    # 3,000-character essay outranks and drowns out everything it summarises.
     async with conn.execute("SELECT rowid FROM vec_episodes") as cur:
         vec_rows = await cur.fetchall()
-    assert len(vec_rows) == 1
-    assert vec_rows[0][0] == episodes[0]["id"]
+    assert vec_rows == [], "dream essays must stay out of KNN retrieval"
 
     await conn.close()
 
@@ -504,20 +509,22 @@ async def test_system_prompt_includes_relevant_episodes(tmp_db_path: Path):
         math_content = "Lyra reflected on her love of mathematics and logical reasoning."
         weather_content = "The weather was warm and sunny outside the window today."
 
+        # Retrieval searches ATOMS. Dream essays live in `episodes` and are
+        # deliberately excluded from KNN, so fixture data goes in as atoms.
         cur1 = await conn.execute(
-            "INSERT INTO episodes (content, ts, source_items_json) VALUES (?, ?, ?)",
-            (math_content, _time.time(), "[]"),
+            "INSERT INTO atoms (content, ts, type, role, salience) VALUES (?, ?, ?, ?, ?)",
+            (math_content, _time.time(), "conversation", "lyra", 0.5),
         )
         await conn.execute(
-            "INSERT INTO vec_episodes(rowid, embedding) VALUES (?, ?)",
+            "INSERT INTO vec_atoms(rowid, embedding) VALUES (?, ?)",
             (cur1.lastrowid, await _embed(math_content)),
         )
         cur2 = await conn.execute(
-            "INSERT INTO episodes (content, ts, source_items_json) VALUES (?, ?, ?)",
-            (weather_content, _time.time() + 1, "[]"),
+            "INSERT INTO atoms (content, ts, type, role, salience) VALUES (?, ?, ?, ?, ?)",
+            (weather_content, _time.time() + 1, "conversation", "lyra", 0.5),
         )
         await conn.execute(
-            "INSERT INTO vec_episodes(rowid, embedding) VALUES (?, ?)",
+            "INSERT INTO vec_atoms(rowid, embedding) VALUES (?, ?)",
             (cur2.lastrowid, await _embed(weather_content)),
         )
         await conn.commit()
@@ -825,21 +832,22 @@ async def test_semantic_episode_search(tmp_db_path: Path):
     ep1_content = "Lyra reflected on her love of mathematics and logical reasoning."
     ep2_content = "The weather was warm and sunny outside the window today."
 
+    # search_episodes() is KNN over atoms — the retrieval unit.
     cur1 = await conn.execute(
-        "INSERT INTO episodes (content, ts, source_items_json) VALUES (?, ?, ?)",
-        (ep1_content, _time.time(), "[]"),
+        "INSERT INTO atoms (content, ts, type, role, salience) VALUES (?, ?, ?, ?, ?)",
+        (ep1_content, _time.time(), "conversation", "lyra", 0.5),
     )
     await conn.execute(
-        "INSERT INTO vec_episodes(rowid, embedding) VALUES (?, ?)",
+        "INSERT INTO vec_atoms(rowid, embedding) VALUES (?, ?)",
         (cur1.lastrowid, await _embed(ep1_content)),
     )
 
     cur2 = await conn.execute(
-        "INSERT INTO episodes (content, ts, source_items_json) VALUES (?, ?, ?)",
-        (ep2_content, _time.time() + 1, "[]"),
+        "INSERT INTO atoms (content, ts, type, role, salience) VALUES (?, ?, ?, ?, ?)",
+        (ep2_content, _time.time() + 1, "conversation", "lyra", 0.5),
     )
     await conn.execute(
-        "INSERT INTO vec_episodes(rowid, embedding) VALUES (?, ?)",
+        "INSERT INTO vec_atoms(rowid, embedding) VALUES (?, ?)",
         (cur2.lastrowid, await _embed(ep2_content)),
     )
     await conn.commit()
@@ -904,4 +912,57 @@ async def test_init_db_migrates_missing_salience_column(tmp_db_path: Path):
     assert rows[0][1] == "an old episode from before the migration"
     assert rows[0][2] == 0.0  # DEFAULT 0.0 applied to pre-existing row
 
+    await conn.close()
+
+
+# ── atoms: the retrieval unit (Step 4) ────────────────────────────────────────
+
+async def test_memory_system_writes_an_atom_per_turn_with_its_own_salience(tmp_db_path: Path):
+    """Salience is computed per atom at WRITE time, not as max() over a dream
+    batch — max-over-batch saturates and cannot rank or segment anything."""
+    import lyra_memory.config as _cfg
+    original = _cfg.CORE_PROMPT
+    _cfg.CORE_PROMPT = "You are Lyra."
+    try:
+        mem = MemorySystem(db_path=tmp_db_path)
+        await mem.start()
+        await mem.add_turn("user", "what happens when you consolidate a memory?")
+        await mem.add_turn("lyra", "the dream cycle writes an essay over the atoms")
+        await mem.add_observation("ambient sound: typing", source="ears")
+
+        rows = await mem.db.execute_fetchall(
+            "SELECT content, type, role, salience FROM atoms ORDER BY id"
+        )
+        assert len(rows) == 3
+        assert [r[1] for r in rows] == ["conversation", "conversation", "observation"]
+        assert [r[2] for r in rows] == ["user", "lyra", None]
+        # Passive sense sources carry the low-salience weight, distinctly.
+        assert rows[2][3] < rows[0][3]
+
+        vec = await mem.db.execute_fetchall("SELECT COUNT(*) FROM vec_atoms")
+        assert vec[0][0] == 3, "every atom must be embedded for KNN"
+
+        await mem.stop()
+    finally:
+        _cfg.CORE_PROMPT = original
+
+
+async def test_atoms_are_linked_to_the_episode_that_consolidated_them(tmp_db_path: Path):
+    conn = await init_db(tmp_db_path)
+    wm = WorkingMemory()
+    pool = CandidatePool(conn)
+    loop = DreamingLoop(conn, wm, pool, IdentityEngine(conn, pool))
+
+    from lyra_memory.atoms import AtomStore
+    store = AtomStore(conn)
+    for i in range(3):
+        await store.write(wm.add_turn("user", f"message {i} about consolidation"))
+
+    obs = json.dumps([{"trait_name": "x", "trait_value": "y", "category": "cognitive"}])
+    with patch.object(loop, "_call_llm", new=AsyncMock(side_effect=["an essay", obs])):
+        await loop._dream()
+
+    rows = await conn.execute_fetchall("SELECT episode_id FROM atoms")
+    assert all(r[0] is not None for r in rows), "dreamed atoms must link to their episode"
+    assert len({r[0] for r in rows}) == 1
     await conn.close()

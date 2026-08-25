@@ -11,7 +11,7 @@ from lyra_memory.embeddings import embed
 _log = logging.getLogger(__name__)
 
 
-async def build_context(memory: object) -> str:
+async def build_context(memory: object, query: str | None = None) -> str:
     traits = await memory.identity_engine.get_top_traits()
     working = memory.working_memory.get_items()
 
@@ -32,18 +32,23 @@ async def build_context(memory: object) -> str:
             + "\n".join(f"[{i.role or i.type}]: {i.content}" for i in working)
         )
 
-        # Use the most recent user turn as the focused search query.
-        # Skip retrieval entirely if there is no user-role item.
+    # Episode retrieval deliberately sits OUTSIDE the `if working:` block. The
+    # caller's query is authoritative; the most recent user turn is only a
+    # fallback. Nesting this under `if working:` meant the first turn of a
+    # process — when working memory is still empty — retrieved nothing at all.
+    if query is None:
         last_user = next((i for i in reversed(working) if i.role == "user"), None)
-        if last_user:
-            db_path = getattr(memory, "_db_path", None)
-            try:
-                eps = await search_episodes(last_user.content, limit=RETRIEVAL_EPISODE_LIMIT, path=db_path)
-            except Exception as e:
-                print(f"[{datetime.datetime.now().isoformat()}] [retrieval] episode retrieval failed: {e}")
-                eps = []
-            if eps:
-                parts.append("## Past Reflections\n" + "\n".join(f"- {e['content']}" for e in eps))
+        query = last_user.content if last_user else None
+
+    if query:
+        db_path = getattr(memory, "_db_path", None)
+        try:
+            eps = await search_episodes(query, limit=RETRIEVAL_EPISODE_LIMIT, path=db_path)
+        except Exception as e:
+            print(f"[{datetime.datetime.now().isoformat()}] [retrieval] episode retrieval failed: {e}")
+            eps = []
+        if eps:
+            parts.append("## Past Reflections\n" + "\n".join(f"- {e['content']}" for e in eps))
 
     return "\n\n".join(parts)
 
@@ -58,20 +63,30 @@ async def search_episodes(
     limit: int = SEARCH_EPISODES_DEFAULT_LIMIT,
     path: Path | None = None,
 ) -> list[dict]:
-    _log.debug("search_episodes query=%r limit=%d", query, limit)
+    """KNN over ATOMS — one turn/observation/reflection each.
+
+    Dream essays live in `episodes` and are deliberately excluded: a single
+    3,000-character essay outranks and drowns out every atom it was
+    summarised from, and ten of them made the assembled prompt 44KB.
+    """
+    _log.debug("search_atoms query=%r limit=%d", query, limit)
     query_vec = await embed(query)
     async with aiosqlite.connect(path or config.DB_PATH) as conn:
         await load_vec_extension(conn)
         async with conn.execute(
-            "SELECT v.rowid, e.content, e.ts, e.salience "
-            "FROM vec_episodes v "
-            "JOIN episodes e ON e.id = v.rowid "
+            "SELECT v.rowid, a.content, a.ts, a.salience, a.role, a.type "
+            "FROM vec_atoms v "
+            "JOIN atoms a ON a.id = v.rowid "
             "WHERE v.embedding MATCH ? AND k = ? "
             "ORDER BY v.distance",
             (query_vec, limit),
         ) as cur:
             rows = await cur.fetchall()
-    return [{"id": r[0], "content": r[1], "ts": r[2], "salience": r[3]} for r in rows]
+    return [
+        {"id": r[0], "content": r[1], "ts": r[2], "salience": r[3],
+         "role": r[4], "type": r[5]}
+        for r in rows
+    ]
 
 
 async def get_fact(subject_key: str) -> dict | None:

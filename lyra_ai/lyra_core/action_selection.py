@@ -31,8 +31,24 @@ temperaments flip earlier than slow/fast ones (see test_action_selection.py).
 
 Drive → intent mapping (within ALLOWED_KINDS only):
   "boredom"    → IntentKind.look  (engage / pursue curiosity)
+  "boredom" ≥ speak_threshold
+               → IntentKind.speak (reach out — unprompted speech)
   "relational" → IntentKind.speak (address recurring friction)
   (nothing)    → IntentKind.noop  (abandon / wait)
+
+WHY BOREDOM ALSO SPEAKS
+───────────────────────
+Relational was the only producer of IntentKind.speak, and relational pressure
+is zero until observe_recurrence() fires — which only happens on an
+action_outcome failure, which only exists once actions execute. Speech was
+therefore unreachable, and unreachable by a cycle: speaking needed an outcome,
+and the outcome needed speech.
+
+Boredom breaks the cycle because it accumulates unconditionally against an
+idle world. Sustained boredom escalating from looking to reaching out is also
+the honest reading of the drive: the world offers nothing to engage with, so
+Lyra opens a channel herself. Relational→speak is unchanged and remains a
+distinct signal (addressing recurring friction, not filling emptiness).
 """
 from __future__ import annotations
 
@@ -49,8 +65,9 @@ class ActionSelector:
         Default 1.0 means frustration magnitude == drive pressure → flip.
     """
 
-    def __init__(self, affect_weight: float = 1.0) -> None:
+    def __init__(self, affect_weight: float = 1.0, speak_threshold: float = 1.0) -> None:
         self._affect_weight = affect_weight
+        self._speak_threshold = speak_threshold
 
     def select(
         self,
@@ -79,6 +96,9 @@ class ActionSelector:
         if boredom > 0.0 and boredom > frustration:
             # Drive wins: pursue curiosity / engage with task
             chosen.append(Intent(kind=IntentKind.look, payload={"reason": "curiosity"}))
+            # Sustained boredom escalates from looking to reaching out.
+            if boredom >= self._speak_threshold:
+                chosen.append(Intent(kind=IntentKind.speak, payload={"reason": "boredom"}))
 
         relational = drive_pressures.get("relational", 0.0)
         if relational > 0.0 and relational > frustration:

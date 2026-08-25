@@ -5,6 +5,8 @@ No wall-clock, no I/O, no randomness.
 """
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from lyra_core.affect import AffectEngine
@@ -259,8 +261,13 @@ def test_encouragement_expires_after_duration_then_full_rate_resumes():
     engine.update(dt, valence_input=-1.0)
     ev_after = engine.state.emotion.valence
 
-    full_rate_expected = ev + 1.0 * (-1.0) * dt + 2.0 * (mv - ev) * dt
-    half_rate_expected = ev + 0.5 * (-1.0) * dt + 2.0 * (mv - ev) * dt
+    # Decay is integrated exactly, not by an explicit Euler step: the state
+    # moves a fraction (1 - e^(-decay·dt)) of the way toward mood. The
+    # discrimination this test exists for — full rate vs half rate — is
+    # unaffected; only the decay term's form changed.
+    relax = 1.0 - math.exp(-2.0 * dt)
+    full_rate_expected = ev + 1.0 * (-1.0) * dt + (mv - ev) * relax
+    half_rate_expected = ev + 0.5 * (-1.0) * dt + (mv - ev) * relax
 
     assert ev_after == pytest.approx(full_rate_expected)
     assert ev_after != pytest.approx(half_rate_expected)

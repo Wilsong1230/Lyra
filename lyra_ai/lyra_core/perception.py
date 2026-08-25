@@ -95,5 +95,12 @@ class PerceptionLoop:
                 current_seen.add(key)
                 self._seen.append(key)  # bounded deque may evict the oldest key
 
-        if survivors:
-            await self._sink(survivors)
+        # The sink is called EVERY cycle, including with an empty list. A cycle
+        # is "time passed", not "something was perceived" — drives advance on
+        # elapsed time, and boredom in particular only accumulates while
+        # nothing arrives. Gating this on `if survivors:` meant an idle runtime
+        # never ticked the core at all, so boredom stayed at zero forever and
+        # no drive could ever produce an intent. CognitiveCore.tick() is built
+        # for this: it derives `engaged = len(observations) > 0`, a value that
+        # was otherwise unreachable.
+        await self._sink(survivors)

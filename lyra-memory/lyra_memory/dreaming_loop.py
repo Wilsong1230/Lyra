@@ -78,6 +78,9 @@ class DreamingLoop:
         )
         content = await self._call_llm(prompt)
         ts = time.time()
+        # Retained for provenance only. Episode salience no longer drives
+        # retrieval — atoms carry their own, computed per item at write time.
+        # max() over a batch saturates: it put 13 of 29 episodes at 0.933.
         salience = max(i.score for i in items)
         cur = await self._conn.execute(
             "INSERT INTO episodes (content, ts, source_items_json, salience) VALUES (?, ?, ?, ?)",
@@ -85,10 +88,12 @@ class DreamingLoop:
         )
         episode_rowid = cur.lastrowid
 
-        vec_bytes = await embed(content)
+        # The essay is NOT embedded into a retrieval index. It is a
+        # consolidation layer over its atoms, not a competitor to them.
+        # Link the atoms this dream consolidated.
         await self._conn.execute(
-            "INSERT INTO vec_episodes(rowid, embedding) VALUES (?, ?)",
-            (episode_rowid, vec_bytes),
+            "UPDATE atoms SET episode_id = ? WHERE episode_id IS NULL AND ts <= ?",
+            (episode_rowid, ts),
         )
         await self._conn.commit()
         print(f"\r\033[K[{datetime.now().isoformat()}] [DreamingLoop] episode written ({len(content)} chars)")

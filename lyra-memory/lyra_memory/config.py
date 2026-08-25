@@ -33,7 +33,24 @@ EMOTION_KEYWORDS: set[str] = {
 
 EMBED_MODEL = "all-MiniLM-L6-v2"
 EMBED_DIM = 384
-CANDIDATE_DEDUP_THRESHOLD = 0.3  # cosine distance; lower = stricter match
+
+# Cosine distance for candidate dedup; lower = stricter match. Applies ONLY to
+# the open (dream-generated) vocabulary, and matches on the trait DESCRIPTION
+# rather than the label — labels are short, model-invented, and carry almost no
+# signal ('analytical_orientation' and 'analytical_approach' name two different
+# behaviours; their descriptions are 1.22 apart).
+#
+# Tuned against the real 70-candidate pool: 0.37 merges the genuine duplicates
+# (self_reflection/self_awareness at L2 0.858, open_ended_follow_up/
+# scripted_closing_aversion) and merges nothing else. Raising it further starts
+# collapsing distinct traits.
+#
+# The closed developmental vocabulary does NOT use this — see
+# CandidatePool.add_observation(closed_vocabulary=True). Its four names are
+# lexically near-identical by construction ('abandons under frustration' vs
+# 'abandons under neutral affect' sit at L2 0.54), so no semantic threshold can
+# both separate them and merge real duplicates. They dedup by exact name.
+CANDIDATE_DEDUP_THRESHOLD = 0.37
 
 CORE_PROMPT = """You are Lyra. You are a continuous autonomous AI entity with persistent memory.
 You assist Wilson when called. Between tasks you pursue your own goals.

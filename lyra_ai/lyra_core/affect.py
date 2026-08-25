@@ -13,6 +13,8 @@ Public valence/arousal delegate to emotion (Phase 0 surface preserved).
 """
 from __future__ import annotations
 
+import math
+
 from lyra_core.interface import AffectState, AffectVector
 
 # Floating-point tolerance for encouragement-timer expiry checks.
@@ -75,15 +77,31 @@ class AffectEngine:
         if self._encourage_remaining > _ENCOURAGE_EPS and valence_input < 0.0:
             valence_accum_rate *= max(0.0, 1.0 - self._encourage_strength)
 
-        # Emotion: accumulate input, then decay toward mood
-        self._emotion_v = ev + valence_accum_rate * valence_input * dt \
-                             + self._emotion_decay * (mv - ev) * dt
-        self._emotion_a = ea + self._accum_rate * arousal_input * dt \
-                             + self._emotion_decay * (ma - ea) * dt
+        # Relaxation fractions. The decay terms are integrated EXACTLY rather
+        # than by an explicit Euler step: for dx/dt = -k(x - target) the closed
+        # form over an interval dt moves x a fraction (1 - e^(-k·dt)) of the
+        # way to target. That fraction is in [0, 1) for every dt > 0, so the
+        # step can never overshoot and the engine is stable at ANY dt.
+        #
+        # Explicit Euler used a fraction of k·dt, which exceeds 1 once
+        # dt > 1/k and exceeds 2 once dt > 2/k — at which point the state
+        # oscillates with growing amplitude. With emotion_decay=2.0 the limit
+        # is dt < 1.0, and the standalone runtime polls at dt=2.0: idle
+        # valence diverged past 3e14 within thirty ticks. For small dt the two
+        # forms agree to first order (1 - e^(-k·dt) ≈ k·dt), so tuned
+        # behaviour at the conversational dt=0.1 is essentially unchanged.
+        emotion_relax = 1.0 - math.exp(-self._emotion_decay * dt)
+        mood_relax    = 1.0 - math.exp(-self._mood_drift * dt)
 
-        # Mood: drift toward emotion (uses old emotion values)
-        self._mood_v = mv + self._mood_drift * (ev - mv) * dt
-        self._mood_a = ma + self._mood_drift * (ea - ma) * dt
+        # Emotion: accumulate input, then relax toward mood
+        self._emotion_v = ev + valence_accum_rate * valence_input * dt \
+                             + (mv - ev) * emotion_relax
+        self._emotion_a = ea + self._accum_rate * arousal_input * dt \
+                             + (ma - ea) * emotion_relax
+
+        # Mood: relax toward emotion (uses old emotion values)
+        self._mood_v = mv + (ev - mv) * mood_relax
+        self._mood_a = ma + (ea - ma) * mood_relax
 
         self._encourage_remaining = max(0.0, self._encourage_remaining - dt)
 

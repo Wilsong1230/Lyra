@@ -49,6 +49,10 @@ class Assistant:
         self.system = system
         self._core = core if core is not None else CognitiveCore()
         self._stopped = False
+        # Gate-approved intents from the most recent tick. Bound but NOT
+        # executed on this path: unprompted speech mid-exchange would talk
+        # over the reply the CLI is about to speak. The runtime executes.
+        self.last_intents: list = []
 
     async def start(self) -> None:
         await self._core.start()
@@ -61,11 +65,11 @@ class Assistant:
     def introspect(self) -> AffectState:
         return self._core.introspect()
 
-    async def _get_system(self) -> str:
+    async def _get_system(self, query: str | None = None) -> str:
         parts = [self.system]
 
         try:
-            context = await retrieval.build_context(self._core.memory)
+            context = await retrieval.build_context(self._core.memory, query=query)
         except Exception:
             context = ""
         if context:
@@ -80,24 +84,28 @@ class Assistant:
     async def _log_turn(self, role: str, content: str) -> None:
         source = "conversation" if role == "user" else "lyra"
         obs = Observation(kind=ObservationKind.sensory, source=source, content=content)
-        await self._core.tick([obs])
+        self.last_intents, _affect = await self._core.tick([obs])
 
     async def _log_observation(self, content: str) -> None:
         obs = Observation(kind=ObservationKind.sensory, source="vision", content=content)
-        await self._core.tick([obs])
+        self.last_intents, _affect = await self._core.tick([obs])
 
     async def chat(self, message: str, session: str) -> str:
-        system = await self._get_system()
+        # The user turn is logged BEFORE the prompt is assembled so that
+        # retrieval keys off this message rather than the previous one, and
+        # so affect reflects the message just received.
         self.memory.add(session, "user", message)
+        await self._log_turn("user", message)
+        system = await self._get_system(message)
         response = self.backend.chat(self.memory.get_history(session), system=system)
         self.memory.add(session, "assistant", response)
-        await self._log_turn("user", message)
         await self._log_turn("lyra", response)
         return response
 
     async def stream_chat(self, message: str, session: str) -> AsyncIterator[str]:
-        system = await self._get_system()
         self.memory.add(session, "user", message)
+        await self._log_turn("user", message)
+        system = await self._get_system(message)
         history = self.memory.get_history(session)
         chunks: list[str] = []
         for chunk in self.backend.stream_chat(history, system=system):
@@ -105,18 +113,17 @@ class Assistant:
             yield chunk
         response = "".join(chunks)
         self.memory.add(session, "assistant", response)
-        await self._log_turn("user", message)
         await self._log_turn("lyra", response)
 
     async def chat_with_tools(self, message: str, session: str, vision_fn=None) -> str:
-        system = await self._get_system()
         self.memory.add(session, "user", message)
+        await self._log_turn("user", message)
+        system = await self._get_system(message)
         for _ in range(3):
             response = self.backend.chat(self.memory.get_history(session), system=system)
             source = self._parse_tool_call(response)
             if source is None:
                 self.memory.add(session, "assistant", response)
-                await self._log_turn("user", message)
                 await self._log_turn("lyra", response)
                 return response
             self.memory.add(session, "assistant", response)
@@ -127,14 +134,14 @@ class Assistant:
             self.memory.add(session, "user", f"[Vision result: {description}]")
         fallback = "I was unable to determine what you're looking at after several attempts."
         self.memory.add(session, "assistant", fallback)
-        await self._log_turn("user", message)
         await self._log_turn("lyra", fallback)
         return fallback
 
     async def stream_chat_with_tools(self, message: str, session: str, vision_fn=None) -> AsyncIterator[str]:
         # Tool-call turns are buffered and not yielded — callers only receive the final answer.
-        system = await self._get_system()
         self.memory.add(session, "user", message)
+        await self._log_turn("user", message)
+        system = await self._get_system(message)
         chunks: list[str] = []
         for _ in range(3):
             chunks = []
@@ -144,7 +151,6 @@ class Assistant:
             source = self._parse_tool_call(buffered)
             if source is None:
                 self.memory.add(session, "assistant", buffered)
-                await self._log_turn("user", message)
                 try:
                     for chunk in chunks:
                         yield chunk
@@ -159,7 +165,6 @@ class Assistant:
             self.memory.add(session, "user", f"[Vision result: {description}]")
         fallback = "I was unable to determine what you're looking at after several attempts."
         self.memory.add(session, "assistant", fallback)
-        await self._log_turn("user", message)
         await self._log_turn("lyra", fallback)
         yield fallback
 

@@ -119,7 +119,12 @@ def test_failing_poller_does_not_prevent_other_pollers():
 
 # ── empty cycle ───────────────────────────────────────────────────────────────
 
-def test_empty_cycle_does_not_call_sink():
+def test_empty_cycle_still_calls_sink_with_empty_batch():
+    """CONTRACT CHANGE: a cycle means "time passed", not "something was
+    perceived". The sink is called every cycle, with an empty list when
+    nothing survived, because drives advance on elapsed time — boredom only
+    accumulates while nothing arrives. The previous contract (skip the sink on
+    empty cycles) meant an idle runtime never ticked the core at all."""
     async def _run():
         sink = _RecordingSink()
 
@@ -129,17 +134,19 @@ def test_empty_cycle_does_not_call_sink():
         lp = PerceptionLoop(sink=sink, pollers=[empty_poller])
         await lp._poll_once()
 
-        assert sink.batches == []
+        assert sink.batches == [[]]
 
     asyncio.run(_run())
 
 
-def test_no_pollers_does_not_call_sink():
+def test_no_pollers_still_calls_sink_with_empty_batch():
+    """With no pollers at all — the configuration an ambient-disabled runtime
+    boots in — the core must still receive its per-cycle tick."""
     async def _run():
         sink = _RecordingSink()
         lp = PerceptionLoop(sink=sink, pollers=[])
         await lp._poll_once()
-        assert sink.batches == []
+        assert sink.batches == [[]]
 
     asyncio.run(_run())
 
@@ -158,8 +165,11 @@ def test_duplicate_obs_on_consecutive_polls_delivered_once():
         await lp._poll_once()
         await lp._poll_once()
 
-        assert len(sink.batches) == 1
-        assert obs in sink.batches[0]
+        # The sink is called every cycle now, so "delivered once" is measured
+        # by non-empty batches rather than by the raw call count.
+        delivered = [b for b in sink.batches if b]
+        assert len(delivered) == 1
+        assert obs in delivered[0]
 
     asyncio.run(_run())
 
@@ -273,7 +283,7 @@ def test_start_twice_is_noop():
 
 def test_loop_delivers_via_timer():
     """The timed loop fires poll_once, which delivers the first detection.
-    Subsequent fires dedup — so sink is called exactly once."""
+    Subsequent fires dedup — so exactly one non-empty batch is delivered."""
     async def _run():
         sink = _RecordingSink()
         obs = _obs("timed observation")
@@ -286,8 +296,9 @@ def test_loop_delivers_via_timer():
         await asyncio.sleep(0.2)  # room for ~3 polls
         await lp.stop()
 
-        assert len(sink.batches) == 1  # first fires; rest deduped
-        assert obs in sink.batches[0]
+        delivered = [b for b in sink.batches if b]
+        assert len(delivered) == 1  # first fires; rest deduped
+        assert obs in delivered[0]
 
     asyncio.run(_run())
 

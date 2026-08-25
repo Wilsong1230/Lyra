@@ -31,28 +31,33 @@ class WorkingMemory:
         emotion = 1.0 if any(w in content.lower() for w in EMOTION_KEYWORDS) else 0.0
         return (importance + surprise + emotion) / 3
 
-    def _append(self, item: WorkingMemoryItem) -> None:
+    def _append(self, item: WorkingMemoryItem) -> WorkingMemoryItem:
         self._deque.append(item)
         self._undreamed.append(item)
         self._items_since_dream += 1
         print(f"[{datetime.now().isoformat()}] [WorkingMemory] +{item.type} score={item.score:.2f} role={item.role!r}")
+        return item
 
-    def add_turn(self, role: str, content: str) -> None:
+    # The add_* methods return the item they created so the caller can persist
+    # it as an atom carrying the salience computed HERE, at write time. Callers
+    # that only want the in-memory buffer can ignore the return value.
+
+    def add_turn(self, role: str, content: str) -> WorkingMemoryItem:
         self._last_turn_ts = time.time()
-        self._append(WorkingMemoryItem(
+        return self._append(WorkingMemoryItem(
             type="conversation", role=role, content=content,
             score=self._score("conversation", content), ts=self._last_turn_ts,
         ))
 
-    def add_observation(self, content: str, source: str | None = None) -> None:
+    def add_observation(self, content: str, source: str | None = None) -> WorkingMemoryItem:
         score = _SENSE_IMPORTANCE if source in _SENSE_SOURCES else self._score("observation", content)
-        self._append(WorkingMemoryItem(
+        return self._append(WorkingMemoryItem(
             type="observation", role=None, content=content,
             score=score, ts=time.time(),
         ))
 
-    def add_reflection(self, content: str) -> None:
-        self._append(WorkingMemoryItem(
+    def add_reflection(self, content: str) -> WorkingMemoryItem:
+        return self._append(WorkingMemoryItem(
             type="reflection", role=None, content=content,
             score=self._score("reflection", content), ts=time.time(),
         ))

@@ -7,6 +7,7 @@ import aiosqlite
 
 from lyra_memory import config
 from lyra_memory.config import DB_PATH, DREAM_IDLE_SECONDS, DREAM_POLL_SECONDS
+from lyra_memory.atoms import AtomStore
 from lyra_memory.db import init_db
 from lyra_memory.structured_state import StructuredState
 from lyra_memory.working_memory import WorkingMemory
@@ -21,6 +22,7 @@ class MemorySystem:
         self.db: aiosqlite.Connection | None = None
         self.structured_state: StructuredState | None = None
         self.working_memory: WorkingMemory | None = None
+        self.atom_store: AtomStore | None = None
         self.candidate_pool: CandidatePool | None = None
         self.dreaming_loop: DreamingLoop | None = None
         self.identity_engine: IdentityEngine | None = None
@@ -40,6 +42,7 @@ class MemorySystem:
 
             self.structured_state = StructuredState(self.db)
             self.working_memory = WorkingMemory()
+            self.atom_store = AtomStore(self.db)
             self.candidate_pool = CandidatePool(self.db)
             self.identity_engine = IdentityEngine(self.db, self.candidate_pool)
             self.dreaming_loop = DreamingLoop(self.db, self.working_memory, self.candidate_pool, self.identity_engine)
@@ -65,17 +68,30 @@ class MemorySystem:
         if self.db is not None:
             await self.db.close()
 
+    async def _persist_atom(self, item) -> None:
+        """Write one working-memory item through as an episodic atom.
+
+        Never raises: a failed atom write must not take down the conversation
+        or the perception loop.
+        """
+        if self.atom_store is None:
+            return
+        try:
+            await self.atom_store.write(item)
+        except Exception as exc:
+            print(f"[MemorySystem] atom write failed: {exc}")
+
     async def add_turn(self, role: str, content: str) -> None:
         if self.working_memory is None:
             raise RuntimeError("MemorySystem has not been started — call await mem.start() first")
-        self.working_memory.add_turn(role, content)
+        await self._persist_atom(self.working_memory.add_turn(role, content))
 
     async def add_observation(self, content: str, source: str | None = None) -> None:
         if self.working_memory is None:
             raise RuntimeError("MemorySystem has not been started — call await mem.start() first")
-        self.working_memory.add_observation(content, source=source)
+        await self._persist_atom(self.working_memory.add_observation(content, source=source))
 
     async def add_reflection(self, content: str) -> None:
         if self.working_memory is None:
             raise RuntimeError("MemorySystem has not been started — call await mem.start() first")
-        self.working_memory.add_reflection(content)
+        await self._persist_atom(self.working_memory.add_reflection(content))

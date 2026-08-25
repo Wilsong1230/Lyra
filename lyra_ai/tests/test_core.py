@@ -434,7 +434,8 @@ class _RecordingPool:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, str]] = []
 
-    async def add_observation(self, trait_name: str, trait_value: str, category: str) -> None:
+    async def add_observation(self, trait_name: str, trait_value: str, category: str,
+                              closed_vocabulary: bool = False) -> None:
         self.calls.append((trait_name, trait_value, category))
 
 
