@@ -1,0 +1,4 @@
+# Optional: only needed for TTS_ENGINE=coqui.
+# Coqui TTS supports Python <3.13 only — the default kokoro engine has no such limit.
+#   lyra-voice/venv/bin/pip install -r lyra-voice/requirements-coqui.txt
+TTS>=0.22.0

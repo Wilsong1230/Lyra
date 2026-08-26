@@ -1,0 +1,6 @@
+# Optional: YAMNet environmental-audio detection in ambient_service.py (:8004).
+# Without these the service still starts and serves its endpoints, but reports
+# no detections.
+#   lyra-listen/venv/bin/pip install -r lyra-listen/requirements-ambient.txt
+tensorflow>=2.16
+tensorflow-hub>=0.16

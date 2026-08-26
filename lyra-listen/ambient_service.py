@@ -7,10 +7,14 @@ from datetime import datetime, timezone
 import httpx
 import numpy as np
 import sounddevice as sd
-import tensorflow_hub as hub
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
+try:  # optional — only needed for YAMNet detection, see requirements-ambient.txt
+    import tensorflow_hub as hub
+except ModuleNotFoundError:
+    hub = None
 
 load_dotenv()
 
@@ -39,6 +43,10 @@ _lock = threading.Lock()
 async def lifespan(app: FastAPI):
     global _yamnet, _class_names
     try:
+        if hub is None:
+            raise ModuleNotFoundError(
+                "tensorflow_hub not installed (pip install -r requirements-ambient.txt)"
+            )
         _yamnet = hub.load("https://tfhub.dev/google/yamnet/1")
         raw = urllib.request.urlopen(
             "https://raw.githubusercontent.com/tensorflow/models/master/"
