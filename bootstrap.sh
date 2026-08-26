@@ -22,6 +22,20 @@ fi
 command -v "$PY" >/dev/null || { echo "error: $PY not found"; exit 1; }
 echo "==> Using $("$PY" --version)"
 
+# lyra-voice's TTS engines (kokoro, and Coqui) both cap at Python <3.13.
+# Find an older interpreter for that service only; everything else uses $PY.
+pick_python() {
+  local svc="$1"
+  if [[ "$svc" != "lyra-voice" ]]; then echo "$PY"; return; fi
+  local v
+  v=$("$PY" -c 'import sys; print(sys.version_info[:2] < (3,13))')
+  if [[ "$v" == "True" ]]; then echo "$PY"; return; fi
+  for cand in "${VOICE_PYTHON:-}" python3.12 python3.11 python3.10; do
+    [[ -n "$cand" ]] && command -v "$cand" >/dev/null && { echo "$cand"; return; }
+  done
+  echo ""
+}
+
 # .env from template on first run
 if [[ ! -f .env && -f .env.example ]]; then
   cp .env.example .env
@@ -47,8 +61,15 @@ fi
 
 for svc in ${TARGETS[@]+"${TARGETS[@]}"}; do
   [[ -d "$svc" ]] || { echo "!! no such service: $svc"; continue; }
-  echo "==> $svc"
-  "$PY" -m venv "$svc/venv"
+  svc_py="$(pick_python "$svc")"
+  if [[ -z "$svc_py" ]]; then
+    echo "!! skipping $svc: needs Python <3.13 (kokoro/Coqui do not support $("$PY" -V 2>&1 | cut -d' ' -f2))."
+    echo "   Install one, then re-run:  brew install python@3.12 && ./bootstrap.sh $svc"
+    echo "   Or point at an existing one:  VOICE_PYTHON=/path/to/python3.12 ./bootstrap.sh $svc"
+    continue
+  fi
+  echo "==> $svc ($("$svc_py" -V 2>&1))"
+  "$svc_py" -m venv "$svc/venv"
   "$svc/venv/bin/pip" install -q --upgrade pip
   if [[ -f "$svc/requirements.txt" ]]; then
     # Relative-path deps (lyra-memory) resolve from the repo root, not the
