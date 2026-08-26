@@ -8,47 +8,123 @@ it cost, and what is worth doing next.
 
 ---
 
-## Machine move — do this first
+## Running on Windows — the move is done
 
-The work is committed. The environment is not.
+The Mac is no longer the machine. The environment is built on Windows, both
+suites pass here, and the two POSIX-only crashes the port exposed are fixed.
+Nothing below needs redoing unless you are starting from a bare checkout.
 
-```bash
-cd black-box/lyra_ai
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]" -e ../lyra-memory
+Already built, at `black-box/lyra_ai/.venv` (Python 3.13.14):
+
+```
+python -m venv .venv
+.venv\Scripts\python.exe -m pip install -e ../lyra-memory -e ".[dev]" httpx
 ```
 
-Three things that will bite otherwise:
+The old instructions in this file were POSIX throughout. The translation:
 
-1. **`pytest-asyncio` must actually install.** It is declared in all three
-   dependency files but was missing from the old venv, and its absence is
-   silent — `asyncio_mode = "auto"` becomes an "unknown config option" warning
-   and every async test no-ops. Sanity check: `lyra-memory` must report **54
-   passed**, not 21. If you see 21, async tests are not running.
-2. **Homebrew/python.org Python only.** macOS system Python disables SQLite
-   extension loading and `sqlite-vec` will not load. `db.py` raises a clear
-   error if you get this wrong.
-3. **Start with an empty memory. This is deliberate — do not copy the old DB.**
-   `~/.lyra/memory.db` lives outside the repo and stays on the old machine.
-   A fresh one is created on first run and the two migrations become no-ops.
+| macOS | Windows |
+|---|---|
+| `.venv/bin/python` | `.venv\Scripts\python.exe` |
+| `source .venv/bin/activate` | `.\.venv\Scripts\Activate.ps1` |
+| `~/.lyra/memory.db` | `C:\Users\<you>\.lyra\memory.db` — `Path.home()` resolves correctly, no code change needed |
+| `venv/bin/uvicorn` in each service `start.sh` | `venv\Scripts\uvicorn.exe`; the `.sh` scripts themselves do not run |
 
-   Decided 2026-08-25. The old corpus predates all five steps: its atoms were
-   decomposed out of essays written under the old salience scheme, and how
-   memory is stored changed underneath them. A clean corpus under the current
-   architecture is worth more than a migrated one.
+### Two fixes the port required
 
-   What is being given up, stated plainly: `communication_style` was the only
-   trait Lyra ever promoted in three months, and promotion needs 5 sightings
-   of one candidate, so that counter resets to zero. The other 67 candidates
-   were mostly seen exactly once and are closer to noise than history. The old
-   file still exists on the old machine if this turns out to be the wrong call.
+Both were the same defect in two places: `loop.add_signal_handler()` raises
+`NotImplementedError` on Windows' `ProactorEventLoop`, and both entrypoints
+called it unguarded, so both died on the first line of startup.
 
-Test commands:
+- `lyra/cli.py` — guarded with `try/except NotImplementedError`. Ctrl-C on
+  Windows is already covered by the `KeyboardInterrupt` branch around
+  `_read_input`, so the fallback is simply to skip registration. This was
+  7 failing tests in `test_cli_stream.py`; the suite went 222 → **229**.
+- `lyra_core/__main__.py` — same guard, but the runtime has no other shutdown
+  path, so the fallback registers `signal.signal(sig, ...)` and hops back onto
+  the loop with `call_soon_threadsafe(stop.set)`. Verified on this platform.
+
+POSIX behaviour is unchanged in both: `add_signal_handler` is still tried first
+and still used wherever it exists.
+
+### What no longer applies
+
+**The macOS `sqlite-vec` warning is dead.** It was about macOS system Python
+disabling extension loading. This Python (3.13.14, SQLite 3.50.4) supports
+`enable_load_extension`, and the 54 `lyra-memory` tests exercise the real
+sqlite-vec + `all-MiniLM-L6-v2` path rather than a mock — the model landed in
+the HF cache during the run — so the vector layer is verified here, not assumed.
+
+### What still applies
+
+**`pytest-asyncio` must actually install.** Unchanged, and still the sharpest
+trap in this repo: its absence is silent, `asyncio_mode = "auto"` degrades to an
+"unknown config option" warning, and every async test no-ops. Sanity check:
+`lyra-memory` must report **54 passed**, not 21.
+
+**Start with an empty memory. This is deliberate — do not copy the old DB.**
+`~/.lyra/memory.db` lives outside the repo and stays on the old machine.
+A fresh one is created on first run and the two migrations become no-ops.
+
+Decided 2026-08-25. The old corpus predates all five steps: its atoms were
+decomposed out of essays written under the old salience scheme, and how
+memory is stored changed underneath them. A clean corpus under the current
+architecture is worth more than a migrated one.
+
+What is being given up, stated plainly: `communication_style` was the only
+trait Lyra ever promoted in three months, and promotion needs 5 sightings
+of one candidate, so that counter resets to zero. The other 67 candidates
+were mostly seen exactly once and are closer to noise than history. The old
+file still exists on the old machine if this turns out to be the wrong call.
+
+### Commands
 
 ```bash
-cd black-box/lyra_ai && .venv/bin/python -m pytest -q        # expect 229 passed
-cd black-box/lyra-memory && ../lyra_ai/.venv/bin/python -m pytest -q   # expect 54 passed
+cd /d/development/Lyra/black-box/lyra_ai && .venv/Scripts/python.exe -m pytest -q
 ```
+
+```bash
+cd /d/development/Lyra/black-box/lyra-memory && ../lyra_ai/.venv/Scripts/python.exe -m pytest -q
+```
+
+Expect **229 passed** and **54 passed** respectively.
+
+Talk to her — the CLI:
+
+```bash
+cd /d/development/Lyra/black-box/lyra_ai && .venv/Scripts/lyra.exe --backend ollama --model llama3.2:3b
+```
+
+The mind process — perception loop, boredom, unprompted speech:
+
+```bash
+cd /d/development/Lyra/black-box/lyra_ai && .venv/Scripts/python.exe -m lyra_core
+```
+
+### Backend
+
+No API key is set on this machine, and `ANTHROPIC_BASE_URL` is exported but
+ignored — the Anthropic backend hardcodes `api.anthropic.com` (`backends.py`).
+Ollama is installed locally with `llama3.2:3b` and `llama3:latest` pulled, needs
+no credential, and is what the commands above use. **Pass the tag explicitly.**
+`OllamaBackend.default_model` is `"llama3.2"`, which Ollama resolves to
+`llama3.2:latest` — not installed — so the bare default fails the first turn
+with `model 'llama3.2' not found`.
+
+### The services are not on this machine
+
+Only `black-box` is cloned here. `lyra-voice` (8001), `lyra-listen` (8002 +
+ambient 8004 + wakeword 8005) and `lyra-vision` (8003) are separate repos and
+are not running, so `SpeechActuator` POSTs into nothing: `send_fn` returns
+False, `execute()` never marks the intent spoken, and `OutcomeTracker` never
+records it. The runtime will accumulate boredom, select `speak`, pass the gate,
+and silently do nothing. Nothing is broken — the loop simply cannot close
+without lyra-voice up.
+
+**`lyra-embodiment` has no repo on GitHub at all**, public or private, yet the
+CLI, `lyra-mcp`, `lyra-voice` and `lyra-listen` all POST to it on :8000. If it
+exists only on the Mac, get it off that machine before it goes away.
+
 
 ---
 
@@ -179,6 +255,69 @@ Measured:
 6. **CLI and runtime are separate processes with separate cores.** They share
    only the DB file. Wilson's reply to an unprompted utterance reaches a
    different mind than the one that spoke.
+7. **`httpx` is imported but declared in no dependency file.** `senses.py` and
+   `actuators.py` import it directly; it is absent from both `pyproject.toml`
+   files and from `requirements.txt`. It currently arrives only as a transitive
+   dependency of `huggingface-hub` 1.x, which switched from `requests` to
+   `httpx` — so the install works today by someone else's packaging choice.
+8. **Ollama's default model tag is wrong.** `OllamaBackend.default_model =
+   "llama3.2"` resolves to `llama3.2:latest`. A pull that produced a tagged
+   model (`llama3.2:3b`) fails the first turn with no obvious cause.
+
+
+---
+
+## Cross-repo drift — surveyed 2026-08-25
+
+`black-box` was read against the four service repos on GitHub. In severity order:
+
+1. **The wakeword counter resets daily; the poller assumes it is monotonic.**
+   This silently kills the exact signal Step 3 calls load-bearing.
+   `wakeword_service.py` (lyra-listen) resets `_detections_today = 0` at
+   midnight before incrementing. `senses.poll_wakeword` emits only when
+   `count > _last_wakeword_count`, a module global that never resets. At
+   midnight the service goes 7 → 1, the comparison fails, and the poller stays
+   mute until the new day exceeds the old day's total. Same failure on any
+   restart of the listen service. The result is `actual = "silence"` forever and
+   a first trait of "abandons under frustration" — precisely the outcome Step 3
+   was designed to prevent, arriving through a different door. This will fire
+   during the multi-day run that option (c) prescribes. Consumer-side fix:
+   treat a decrease as a reset. Service-side fix: expose a monotonic
+   `detections_total` plus a boot id.
+
+2. **Nothing ever starts wakeword detection.** The service's lifespan only
+   loads the model; `_loop()` runs only after `POST /wakeword/start`. Detection
+   is disabled outright unless `WAKEWORD_MODEL_PATH` points at an existing model
+   and `openwakeword` is installed. No repo carries the model and the variable
+   appears in no black-box doc. "The wakeword poller is ON" is true of the
+   poller, not of the thing it polls.
+
+3. **`lyra-mcp` is stale against Step 4.** Its `search_episodes` tool runs
+   `SELECT ... FROM episodes WHERE content LIKE ?`, with a docstring telling the
+   caller to use keyword phrasing and avoid semantic phrasing. In-process
+   retrieval is now KNN over `vec_atoms`. Same name, opposite semantics, and on
+   a fresh DB the MCP tool returns nothing until the first dream cycle while
+   in-process retrieval works from the first turn. Its `get_fact` is still
+   correct against the `facts` schema.
+
+4. **`MEMORY_SPEC.md` documents the pre-Step-4 architecture.** Zero occurrences
+   of "atom". It describes `vec_episodes` as the retrieval index, asserts there
+   are no episodes without a vector, and shows `search_episodes` as KNN over
+   `vec_episodes` — all three now false. `vec_episodes` is still created in
+   `db.py` and is never written or read: a dead table that reads as live.
+
+5. **No CI in any of the five repos.** The Step 1 failure — 36 async tests
+   silently no-op'ing for months because an unknown ini key is only a warning —
+   has no guard against recurrence. Two cheap fixes: `--strict-config` in
+   `addopts` in both `pyproject.toml` files, which turns that specific warning
+   into an error, and a minimal GitHub Actions workflow per repo.
+
+Also: the black-box README env table omits `AMBIENT_URL`, `WAKEWORD_URL`,
+`WAKEWORD_MODEL_PATH` and `OLLAMA_BASE_URL`, all of which the code reads. And
+the empty-memory decision covers `~/.lyra/memory.db` but not
+`~/.lyra/history.db` — `lyra/memory.py` keeps CLI conversation turns in a second
+file whose fate nobody has decided. That also sharpens defect 6: the CLI and the
+runtime are split across two databases as well as two processes.
 
 ---
 
