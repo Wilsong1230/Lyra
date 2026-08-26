@@ -9,7 +9,7 @@
 #   .\start-lyra.ps1 -Chat      # run the conversational CLI instead
 param(
     [switch]$Chat,
-    [string]$Model = "llama3.2:3b"
+    [string]$Model = "llama3:latest"
 )
 
 $ErrorActionPreference = "Stop"
@@ -50,7 +50,9 @@ if (-not $ollamaUp) {
 
 if ($Chat) {
     # Pass the tag explicitly: OllamaBackend.default_model is "llama3.2", which
-    # resolves to llama3.2:latest and is not pulled here.
+    # resolves to llama3.2:latest and is not pulled here. llama3:latest rather
+    # than llama3.2:3b because the 3B cannot hold LAYER1_FACTS - it denies being
+    # Lyra and denies having internal states, both of which the prompt forbids.
     & (Join-Path $PSScriptRoot "lyra_ai\.venv\Scripts\lyra.exe") --backend ollama --model $Model
 } else {
     Set-Location (Join-Path $PSScriptRoot "lyra_ai")
