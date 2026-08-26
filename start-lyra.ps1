@@ -15,6 +15,22 @@ param(
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
+# A shell started before OPENROUTER_API_KEY was set carries a stale environment
+# block, and so does every process it launches - including a new TAB of an
+# already-running terminal. Dreaming then posts "Bearer " and OpenRouter answers
+# "missing authentication header", which reads like a Lyra bug and is not one.
+# Read the persisted value straight from the user environment when the session
+# does not have it. Nothing is printed and nothing is written to disk.
+foreach ($name in @("OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "CEREBRAS_API_KEY")) {
+    if (-not [Environment]::GetEnvironmentVariable($name)) {
+        $persisted = [Environment]::GetEnvironmentVariable($name, "User")
+        if ($persisted) {
+            Set-Item -Path "env:$name" -Value $persisted
+            Write-Host "[start-lyra] $name loaded from user environment"
+        }
+    }
+}
+
 $python = Join-Path $PSScriptRoot "lyra_ai\.venv\Scripts\python.exe"
 if (-not (Test-Path $python)) {
     Write-Error "No venv at lyra_ai\.venv. Build it first:`n  cd lyra_ai`n  python -m venv .venv`n  .venv\Scripts\python.exe -m pip install -e ../lyra-memory -e `".[dev]`" httpx"

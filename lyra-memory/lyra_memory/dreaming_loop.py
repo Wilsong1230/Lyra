@@ -121,6 +121,19 @@ class DreamingLoop:
         import http.client
         import urllib.parse
         key = os.environ.get("OPENROUTER_API_KEY", "")
+        if not key:
+            # Without this the request goes out as "Bearer " and OpenRouter
+            # answers "missing authentication header" - an upstream API error
+            # for what is purely a local configuration problem. On Windows the
+            # usual cause is a process launched from a shell whose environment
+            # predates the variable being set.
+            raise RuntimeError(
+                "OPENROUTER_API_KEY is not set in this process's environment. "
+                "Dreaming cannot run. If you set it recently, this process was "
+                "started from a shell that predates the change - relaunch from "
+                "a new terminal instance (a new tab of an already-running "
+                "terminal inherits the old environment)."
+            )
         parsed = urllib.parse.urlparse(OPENROUTER_BASE)
         conn = http.client.HTTPSConnection(parsed.netloc)
         body = json.dumps({"model": DREAM_MODEL, "messages": [{"role": "user", "content": prompt}]})
