@@ -45,7 +45,7 @@ lyra_ai/venv/bin/pip install -q --upgrade pip
 lyra_ai/venv/bin/pip install -q -e "lyra_ai[dev]" -e lyra-memory
 fi
 
-for svc in "${TARGETS[@]}"; do
+for svc in ${TARGETS[@]+"${TARGETS[@]}"}; do
   [[ -d "$svc" ]] || { echo "!! no such service: $svc"; continue; }
   echo "==> $svc"
   "$PY" -m venv "$svc/venv"
