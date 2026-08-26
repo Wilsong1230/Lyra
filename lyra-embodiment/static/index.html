@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Lyra</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #030308; overflow: hidden; font-family: monospace; }
+    canvas { display: block; }
+    #hud {
+      position: fixed; top: 20px; left: 20px;
+      pointer-events: none; opacity: 0.75;
+      color: #4A9EFF; transition: color 0.6s;
+    }
+    #hud h2 {
+      font-size: 13px; font-weight: normal;
+      letter-spacing: 0.18em; margin-bottom: 5px;
+    }
+    #hud-state {
+      font-size: 11px; letter-spacing: 0.12em; opacity: 0.8;
+    }
+    #controls {
+      position: fixed; bottom: 28px; left: 50%;
+      transform: translateX(-50%);
+      display: flex; gap: 8px; z-index: 10;
+    }
+    .btn {
+      padding: 7px 14px;
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.15);
+      color: rgba(255,255,255,0.7);
+      border-radius: 6px; cursor: pointer;
+      font-size: 12px; letter-spacing: 0.04em;
+      transition: background 0.2s, color 0.2s;
+    }
+    .btn:hover { background: rgba(255,255,255,0.1); }
+    .btn.active {
+      border-color: var(--c);
+      color: #fff;
+      background: rgba(255,255,255,0.12);
+      box-shadow: 0 0 10px var(--c);
+    }
+  </style>
+</head>
+<body>
+  <div id="hud">
+    <h2>LYRA CORE // ONLINE</h2>
+    <p id="hud-state">STATE: IDLE</p>
+  </div>
+  <div id="controls"></div>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script>
+  // ── Scene ──────────────────────────────────────────────────────────
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(devicePixelRatio);
+  renderer.setSize(innerWidth, innerHeight);
+  document.body.prepend(renderer.domElement);
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x030308);
+  scene.fog = new THREE.FogExp2(0x030308, 0.04);
+
+  const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.1, 200);
+  camera.position.set(1.2, 0.7, 10);
+  camera.lookAt(0, 0, 0);
+
+  // Core light bleeds outward onto rings; hemisphere gives cool rim fill
+  const coreLight = new THREE.PointLight(0x4A9EFF, 4, 30);
+  scene.add(coreLight);
+  scene.add(new THREE.HemisphereLight(0x112244, 0x000000, 0.2));
+
+  addEventListener('resize', () => {
+    camera.aspect = innerWidth / innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight);
+  });
+
+  // ── State ──────────────────────────────────────────────────────────
+  let currentAmplitude = 0;
+  let smoothAmplitude  = 0;
+
+  const STATES = {
+    idle:       '#4A9EFF',
+    thinking:   '#9B59FF',
+    speaking:   '#2ECC71',
+    curious:    '#00D4FF',
+    processing: '#F39C12',
+    confused:   '#FF4444',
+    focused:    '#F0F0F0',
+    listening:  '#FF9500',
+  };
+
+  let currentState = 'idle';
+  const targetColor  = new THREE.Color(STATES.idle);
+  const currentColor = new THREE.Color(STATES.idle);
+
+  // ── Behaviors ─────────────────────────────────────────────────────
+  // speed:   per-ring orbit speed multipliers (negative = reverse)
+  // drift:   rings wander their tilt angles
+  // lock:    rings freeze tilt at base angle
+  // tight:   orbit radius shrinks ~20%
+  // pulse:   nucleus blinks at 0.5s interval
+  // flicker: nucleus emissive flickers randomly
+  // bright:  nucleus at max steady glow
+  // dim:     nucleus at low emissive
+  const B = {
+    idle:       { speed: [1.00, 1.00,  1.00], drift: false, lock: false, tight: false, pulse: false, flicker: false, bright: false, dim: false },
+    thinking:   { speed: [0.70, 1.30,  0.90], precess: true, drift: false, lock: false, tight: false, pulse: false, flicker: false, bright: false, dim: true  },
+    speaking:   { speed: [1.40, 1.40,  1.40], drift: false, lock: false, tight: false, pulse: true,  flicker: false, bright: false, dim: false },
+    curious:    { speed: [1.00, 1.00,  1.00], drift: false, lock: false, tight: true,  pulse: false, flicker: false, bright: false, dim: false },
+    processing: { speed: [2.50, 2.50,  2.50], drift: false, lock: false, tight: false, pulse: false, flicker: true,  bright: false, dim: false },
+    confused:   { speed: [1.50, 0.80, -1.20], drift: true,  lock: false, tight: false, pulse: false, flicker: false, bright: false, dim: true  },
+    focused:    { speed: [0.05, 0.05,  0.05], drift: false, lock: true,  tight: false, pulse: false, flicker: false, bright: true,  dim: false },
+    listening:  { speed: [0.60, 0.60, 0.60], drift: false, lock: false, tight: true,  pulse: false, flicker: false, bright: false, dim: true  },
+  };
+
+  // ── Nucleus ────────────────────────────────────────────────────────
+  // Dark base + strong emissive = hologram core
+  const nucleusMat = new THREE.MeshStandardMaterial({
+    color: new THREE.Color(0x001133),
+    emissive: currentColor.clone(),
+    emissiveIntensity: 2.5,
+    transparent: true,
+    opacity: 0.92,
+    metalness: 0.9,
+    roughness: 0.05,
+  });
+  const nucleusMesh = new THREE.Mesh(new THREE.SphereGeometry(1.275, 64, 64), nucleusMat);
+  scene.add(nucleusMesh);
+
+  // Geodesic cage — slowly rotates, gives the nucleus structure and depth
+  const shellMat = new THREE.MeshBasicMaterial({
+    color: currentColor.clone(),
+    wireframe: true,
+    transparent: true,
+    opacity: 0.2,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+  });
+  const shellMesh = new THREE.Mesh(new THREE.IcosahedronGeometry(1.6, 1), shellMat);
+  scene.add(shellMesh);
+
+  // ── Rings ──────────────────────────────────────────────────────────
+  const ORBIT_R    = 3.8;
+  const TRAIL_N    = 6;
+  const BASE_TILTS = [
+    [Math.PI / 2,   0],   // Ring 1 — equatorial (flat horizontal)
+    [Math.PI / 9,   0],   // Ring 2 — polar, 70° from equatorial
+    [-Math.PI / 9,  0],   // Ring 3 — polar, 110° (symmetric to Ring 2)
+  ];
+
+  // Per-state target tilts [rx, rz] for each ring. null = random drift.
+  const STATE_TILTS = {
+    idle:       [[Math.PI/2, 0],          [Math.PI/9, 0],            [-Math.PI/9, 0]          ],
+    thinking:   null,
+    speaking:   [[Math.PI/2, 0],          [Math.PI/4, 0],            [-Math.PI/4, 0]          ],
+    curious:    [[Math.PI/3, 0],          [Math.PI/3,  Math.PI/4],   [Math.PI/3, -Math.PI/4]  ],
+    processing: [[Math.PI/2, 0],          [Math.PI/2,  Math.PI/3],   [Math.PI/2, -Math.PI/3]  ],
+    confused:   null,
+    focused:    [[Math.PI/2, 0],          [Math.PI/5.5, 0],          [-Math.PI/5.5, 0]        ],
+    listening:  [[Math.PI/2, 0],          [Math.PI/9, 0],            [-Math.PI/9, 0]          ],
+  };
+
+  const rings = BASE_TILTS.map(([bx, bz], i) => {
+    // Clean circle line — no mesh grid, just a glowing orbit trace
+    const ringMat = new THREE.LineBasicMaterial({
+      color: currentColor.clone(),
+      transparent: true,
+      opacity: 0.65,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+    });
+    const circlePts = Array.from({ length: 129 }, (_, k) => {
+      const a = (k / 128) * Math.PI * 2;
+      return new THREE.Vector3(Math.cos(a) * ORBIT_R, Math.sin(a) * ORBIT_R, 0);
+    });
+    const ring = new THREE.Line(new THREE.BufferGeometry().setFromPoints(circlePts), ringMat);
+    ring.rotation.set(bx, 0, bz);
+    scene.add(ring);
+
+    const dotMat = new THREE.MeshStandardMaterial({
+      emissive: currentColor.clone(),
+      emissiveIntensity: 3.0,
+      metalness: 0.5,
+      roughness: 0.1,
+    });
+    const dot = new THREE.Mesh(new THREE.SphereGeometry(0.2, 32, 32), dotMat);
+    scene.add(dot);
+
+    const trail = Array.from({ length: TRAIL_N }, (_, j) => {
+      const f   = 1 - (j + 1) / (TRAIL_N + 1);
+      const mat = new THREE.MeshStandardMaterial({
+        emissive: currentColor.clone(),
+        emissiveIntensity: 2.0 * f,
+        transparent: true,
+        opacity: 0.5 * f,
+        depthWrite: false,
+      });
+      const m = new THREE.Mesh(new THREE.SphereGeometry(0.15 * f, 16, 16), mat);
+      scene.add(m);
+      return { mesh: m, mat };
+    });
+
+    return {
+      ring, ringMat, dot, dotMat, trail,
+      bx, bz,
+      tiltX: bx, tiltZ: bz,
+      driftX: 0, driftZ: 0,
+      driftBiasX: 0, driftBiasZ: 0,
+      phase: (i * Math.PI * 2) / 3,
+      angle: (i * Math.PI * 2) / 3,
+      precessXBias: 0, precessZBias: 0,
+      radius: ORBIT_R,
+      speed: B.idle.speed[i],
+    };
+  });
+
+  // ── Animation ──────────────────────────────────────────────────────
+  let pulseT = 0;
+
+  function orbitPos(angle, radius, rx, rz) {
+    return new THREE.Vector3(Math.cos(angle) * radius, Math.sin(angle) * radius, 0)
+      .applyEuler(new THREE.Euler(rx, 0, rz));
+  }
+
+  function updateAtom(dt) {
+    const beh = B[currentState];
+
+    currentColor.lerp(targetColor, 1 - Math.pow(0.001, dt));
+
+    // Smooth amplitude with fast attack, slow decay
+    const target = currentState === 'speaking' ? currentAmplitude : 0;
+    const rate   = target > smoothAmplitude ? 12 : 4;
+    smoothAmplitude += (target - smoothAmplitude) * Math.min(rate * dt, 1);
+
+    let ni;
+    if (currentState === 'speaking' && smoothAmplitude > 0.01) {
+      ni = 1.2 + smoothAmplitude * 3.0;
+    } else if (beh.pulse)   { pulseT += dt; ni = 1.5 + 1.5 * Math.sin(pulseT * Math.PI / 0.5); }
+    else if (beh.flicker) { ni = 0.6 + Math.random() * 2.0; }
+    else if (beh.bright)  { ni = 3.5; }
+    else if (beh.dim)     { ni = 0.4; }
+    else                  { ni = 1.5; }
+
+    // Nucleus scale pulses with voice amplitude
+    const nucleusScale = currentState === 'speaking' ? 1 + smoothAmplitude * 0.18 : 1;
+    nucleusMat.emissive.copy(currentColor);
+    nucleusMat.emissiveIntensity = ni;
+    nucleusMesh.scale.setScalar(nucleusScale);
+    shellMat.color.copy(currentColor);
+    shellMesh.rotation.y += 0.3 * dt;
+    shellMesh.rotation.x += 0.15 * dt;
+    shellMesh.scale.setScalar(nucleusScale);
+    coreLight.color.copy(currentColor);
+    coreLight.intensity = ni * 2.5;
+
+    rings.forEach((r, i) => {
+      // Interpolate speed to avoid abrupt rhythm changes on state switch
+      r.speed += (beh.speed[i] - r.speed) * Math.min(0.06 * 60 * dt, 1);
+      r.angle += r.speed * 0.55 * dt;
+
+      const lf = 1 - Math.pow(0.001, dt);
+      if (beh.precess) {
+        // Lerp toward the precession target so entry from other states is smooth
+        const speeds = [0.40, 0.65, 0.35];
+        r.phase += speeds[i] * dt;
+        const px = r.bx + Math.sin(r.phase) * 0.45;
+        const pz = r.bz + Math.cos(r.phase * 0.7) * 0.28;
+        // Decay X/Z biases seeded on entry so neither axis jumps
+        r.precessXBias *= Math.pow(0.002, dt);
+        r.precessZBias *= Math.pow(0.002, dt);
+        r.tiltX += ((px + r.precessXBias) - r.tiltX) * lf;
+        r.tiltZ += ((pz + r.precessZBias) - r.tiltZ) * lf;
+      } else if (beh.drift) {
+        r.driftX += (Math.random() - 0.5) * 0.006;
+        r.driftZ += (Math.random() - 0.5) * 0.006;
+        r.driftX  = Math.max(-0.5, Math.min(0.5, r.driftX));
+        r.driftZ  = Math.max(-0.5, Math.min(0.5, r.driftZ));
+        // Bias decays to zero, pulling the ring back into the drift range smoothly
+        r.driftBiasX *= Math.pow(0.002, dt);
+        r.driftBiasZ *= Math.pow(0.002, dt);
+        r.tiltX = r.bx + r.driftX + r.driftBiasX;
+        r.tiltZ = r.bz + r.driftZ + r.driftBiasZ;
+      } else {
+        const [tx, tz] = STATE_TILTS[currentState][i];
+        r.tiltX += (tx - r.tiltX) * lf;
+        r.tiltZ += (tz - r.tiltZ) * lf;
+      }
+
+      r.ring.rotation.set(r.tiltX, 0, r.tiltZ);
+      // sync ring visual radius to match dot orbit radius (fixes tight-mode mismatch)
+      const rs = r.radius / ORBIT_R;
+      r.ring.scale.set(rs, rs, 1);
+
+      const tR = beh.tight ? ORBIT_R * 0.80 : ORBIT_R;
+      r.radius += (tR - r.radius) * 0.04;
+
+      const sign = r.speed < 0 ? -1 : 1;
+      r.dot.position.copy(orbitPos(r.angle, r.radius, r.tiltX, r.tiltZ));
+      r.trail.forEach(({ mesh, mat }, j) => {
+        mesh.position.copy(orbitPos(r.angle - sign * (j + 1) * 0.06, r.radius, r.tiltX, r.tiltZ));
+        mat.emissive.copy(currentColor);
+        mat.emissiveIntensity = ni * (1 - (j + 1) / (TRAIL_N + 1));
+      });
+
+      r.ringMat.color.copy(currentColor);   // MeshBasicMaterial uses .color
+      r.dotMat.emissive.copy(currentColor);
+    });
+  }
+
+  const clock = new THREE.Clock();
+  (function animate() {
+    requestAnimationFrame(animate);
+    updateAtom(Math.min(clock.getDelta(), 0.05));
+    renderer.render(scene, camera);
+  })();
+
+  // ── State polling ──────────────────────────────────────────────────
+  function applyState(data) {
+    if (data.state !== currentState) {
+      pulseT = 0;
+      const newBeh = B[data.state];
+      // Seed drift offsets from current tilt. When the ring is outside the drift
+      // range (coming from curious/processing), the clamp would snap it; instead
+      // capture the excess as a decaying bias so the transition stays smooth.
+      if (newBeh.drift) {
+        rings.forEach(r => {
+          r.driftX = Math.max(-0.5, Math.min(0.5, r.tiltX - r.bx));
+          r.driftZ = Math.max(-0.5, Math.min(0.5, r.tiltZ - r.bz));
+          r.driftBiasX = r.tiltX - (r.bx + r.driftX);
+          r.driftBiasZ = r.tiltZ - (r.bz + r.driftZ);
+        });
+      }
+      // Seed phase so the precess formula starts at the current tilt position.
+      // Also seed precessZBias so the Z axis starts at the current tiltZ and
+      // smoothly converges onto the precess orbit rather than snapping to it.
+      if (newBeh.precess) {
+        rings.forEach(r => {
+          const ratio = (r.tiltX - r.bx) / 0.45;
+          r.phase = Math.asin(Math.max(-1, Math.min(1, ratio)));
+          const px0 = r.bx + Math.sin(r.phase) * 0.45;
+          const pz0 = r.bz + Math.cos(r.phase * 0.7) * 0.28;
+          r.precessXBias = r.tiltX - px0;
+          r.precessZBias = r.tiltZ - pz0;
+        });
+      }
+    }
+    currentState = data.state;
+    targetColor.set(data.color);
+    document.getElementById('hud').style.color = data.color;
+    document.getElementById('hud-state').textContent = 'STATE: ' + data.state.toUpperCase();
+    document.querySelectorAll('.btn').forEach(b => {
+      const on = b.dataset.s === currentState;
+      b.classList.toggle('active', on);
+      if (on) b.style.setProperty('--c', data.color);
+    });
+  }
+
+  setInterval(async () => {
+    try {
+      const data = await (await fetch('/state')).json();
+      currentAmplitude = data.amplitude ?? 0;
+      applyState(data);
+    } catch { /* retry next tick */ }
+  }, 100);
+
+  // ── Controls ───────────────────────────────────────────────────────
+  const ctrl = document.getElementById('controls');
+  Object.entries(STATES).forEach(([s, color]) => {
+    const btn      = document.createElement('button');
+    btn.className  = 'btn' + (s === 'idle' ? ' active' : '');
+    btn.dataset.s  = s;
+    btn.textContent = s;
+    if (s === 'idle') btn.style.setProperty('--c', color);
+    btn.onclick = async () => {
+      try {
+        applyState(await (await fetch('/state', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ state: s }),
+        })).json());
+      } catch (e) { console.warn('state update failed', e); }
+    };
+    ctrl.appendChild(btn);
+  });
+  </script>
+</body>
+</html>
