@@ -35,6 +35,12 @@ LAYER1_FACTS = (
 
 DEFAULT_SYSTEM = LAYER1_FACTS
 
+# The exact tokens LAYER1_FACTS tells her to emit, mapped to vision sources.
+_TOOL_TOKENS = {
+    "[TOOL:see:screen]": "screen",
+    "[TOOL:see:webcam]": "webcam",
+}
+
 
 class Assistant:
     def __init__(
@@ -126,7 +132,7 @@ class Assistant:
                 self.memory.add(session, "assistant", response)
                 await self._log_turn("lyra", response)
                 return response
-            self.memory.add(session, "assistant", response)
+            self.memory.add(session, "assistant", self._truncate_at_tool_call(response))
             if vision_fn is None:
                 raise ValueError("vision_fn is required when the model emits a tool call")
             description = vision_fn(source)
@@ -157,7 +163,7 @@ class Assistant:
                 finally:
                     await self._log_turn("lyra", "".join(chunks))
                 return
-            self.memory.add(session, "assistant", buffered)
+            self.memory.add(session, "assistant", self._truncate_at_tool_call(buffered))
             if vision_fn is None:
                 raise ValueError("vision_fn is required when the model emits a tool call")
             description = vision_fn(source)
@@ -171,9 +177,27 @@ class Assistant:
     @staticmethod
     def _parse_tool_call(response: str) -> str | None:
         for line in response.splitlines():
-            line = line.strip()
-            if line == "[TOOL:see:screen]":
-                return "screen"
-            if line == "[TOOL:see:webcam]":
-                return "webcam"
+            source = _TOOL_TOKENS.get(line.strip())
+            if source is not None:
+                return source
         return None
+
+    @staticmethod
+    def _truncate_at_tool_call(response: str) -> str:
+        """Keep everything up to and including the tool-call line; drop the rest.
+
+        A model that ignores "on its own line and nothing else" will emit the
+        token and then invent the result it has not seen yet. Once that invented
+        text is in the transcript it is indistinguishable from a real
+        observation, and it is replayed to the model as her own words on every
+        later turn — she confabulates a perception and the system files it as
+        something she said.
+
+        Text BEFORE the token is kept: "Let me look." is a legitimate preamble.
+        Text after it is discarded; the real result arrives as the next turn.
+        """
+        lines = response.splitlines()
+        for i, line in enumerate(lines):
+            if line.strip() in _TOOL_TOKENS:
+                return "\n".join(lines[: i + 1]).strip()
+        return response

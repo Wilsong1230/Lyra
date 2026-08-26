@@ -364,3 +364,74 @@ def test_get_system_has_no_layer3_when_affect_neutral():
     system = asyncio.run(assistant._get_system())
 
     assert system == LAYER1_FACTS
+
+
+# --- confabulated tool results -------------------------------------------
+# A model that ignores "on its own line and nothing else" emits the token and
+# then invents the result it has not seen yet. Stored verbatim, that invention
+# is replayed to the model as her own words on every later turn.
+
+
+def test_chat_with_tools_discards_text_after_tool_call():
+    mock_backend = MagicMock()
+    confabulated = "[TOOL:see:screen]\nThe screen shows a text editor reading 'Hello Lyra'."
+    mock_backend.chat.side_effect = [confabulated, "You have a Python file open."]
+    mock_memory = MagicMock()
+    mock_memory.get_history.return_value = []
+    mock_vision = MagicMock(return_value="A terminal window.")
+
+    assistant = Assistant(backend=mock_backend, memory=mock_memory)
+    result = asyncio.run(
+        assistant.chat_with_tools("what's on my screen?", "s1", vision_fn=mock_vision)
+    )
+
+    assert result == "You have a Python file open."
+    mock_memory.add.assert_any_call("s1", "assistant", "[TOOL:see:screen]")
+    stored = [c.args[2] for c in mock_memory.add.call_args_list]
+    assert not any("Hello Lyra" in s for s in stored)
+
+
+def test_chat_with_tools_keeps_text_before_tool_call():
+    mock_backend = MagicMock()
+    mock_backend.chat.side_effect = [
+        "Let me look.\n[TOOL:see:screen]\nI see a browser window.",
+        "Done.",
+    ]
+    mock_memory = MagicMock()
+    mock_memory.get_history.return_value = []
+    mock_vision = MagicMock(return_value="A terminal window.")
+
+    assistant = Assistant(backend=mock_backend, memory=mock_memory)
+    asyncio.run(assistant.chat_with_tools("what's on my screen?", "s1", vision_fn=mock_vision))
+
+    mock_memory.add.assert_any_call("s1", "assistant", "Let me look.\n[TOOL:see:screen]")
+    stored = [c.args[2] for c in mock_memory.add.call_args_list]
+    assert not any("browser window" in s for s in stored)
+
+
+def test_stream_chat_with_tools_discards_text_after_tool_call():
+    mock_backend = MagicMock()
+    mock_backend.stream_chat.side_effect = [
+        iter(["[TOOL:see:screen]\n", "The screen shows a text editor reading 'Hello Lyra'."]),
+        iter(["You have a Python file open."]),
+    ]
+    mock_memory = MagicMock()
+    mock_memory.get_history.return_value = []
+    mock_vision = MagicMock(return_value="A terminal window.")
+
+    assistant = Assistant(backend=mock_backend, memory=mock_memory)
+
+    async def _run():
+        return [
+            chunk
+            async for chunk in assistant.stream_chat_with_tools(
+                "what's on my screen?", "s1", vision_fn=mock_vision
+            )
+        ]
+
+    chunks = asyncio.run(_run())
+
+    assert "".join(chunks) == "You have a Python file open."
+    mock_memory.add.assert_any_call("s1", "assistant", "[TOOL:see:screen]")
+    stored = [c.args[2] for c in mock_memory.add.call_args_list]
+    assert not any("Hello Lyra" in s for s in stored)
