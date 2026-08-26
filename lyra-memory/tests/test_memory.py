@@ -966,3 +966,62 @@ async def test_atoms_are_linked_to_the_episode_that_consolidated_them(tmp_db_pat
     assert all(r[0] is not None for r in rows), "dreamed atoms must link to their episode"
     assert len({r[0] for r in rows}) == 1
     await conn.close()
+
+
+async def test_past_reflections_excludes_working_memory_content(tmp_db_path: Path):
+    """The live window is not memory.
+
+    The user turn is written as an atom before the prompt is assembled, so it
+    matches itself perfectly and takes the top retrieval slot - to repeat
+    something already rendered verbatim under ## Current Experience. Genuinely
+    past atoms must still come back.
+    """
+    import time as _time
+    from lyra_memory.embeddings import embed as _embed
+
+    original_db_path = _cfg.DB_PATH
+    original_core = _cfg.CORE_PROMPT
+    _cfg.CORE_PROMPT = "You are Lyra."
+    _cfg.DB_PATH = tmp_db_path
+    try:
+        conn = await init_db(tmp_db_path)
+
+        question = "what is your name?"
+        past = "My name is Wilson."
+
+        for content in (question, past):
+            cur = await conn.execute(
+                "INSERT INTO atoms (content, ts, type, role, salience) VALUES (?, ?, ?, ?, ?)",
+                (content, _time.time(), "conversation", "user", 0.5),
+            )
+            await conn.execute(
+                "INSERT INTO vec_atoms(rowid, embedding) VALUES (?, ?)",
+                (cur.lastrowid, await _embed(content)),
+            )
+        await conn.commit()
+
+        wm = WorkingMemory()
+        wm.add_turn("user", question)
+
+        pool = CandidatePool(conn)
+        identity = IdentityEngine(conn, pool)
+
+        class _FakeMemory:
+            structured_state = StructuredState(conn)
+            working_memory = wm
+            identity_engine = identity
+            _db_path = tmp_db_path
+
+        prompt = await build_system_prompt(_FakeMemory())
+
+        # The question is in the prompt - but only as Current Experience.
+        assert question in prompt
+        reflections = prompt.split("## Past Reflections", 1)
+        assert len(reflections) == 2, "genuine past content should still retrieve"
+        assert question not in reflections[1]
+        assert "Wilson" in reflections[1]
+
+        await conn.close()
+    finally:
+        _cfg.DB_PATH = original_db_path
+        _cfg.CORE_PROMPT = original_core

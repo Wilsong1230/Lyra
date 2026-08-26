@@ -42,11 +42,27 @@ async def build_context(memory: object, query: str | None = None) -> str:
 
     if query:
         db_path = getattr(memory, "_db_path", None)
+        # Anything still inside the working-memory window is already rendered
+        # verbatim above under "## Current Experience". Retrieving it again
+        # spends a slot to say the same thing twice, and the worst case is the
+        # message she is answering RIGHT NOW: the user turn is written as an
+        # atom before the prompt is assembled, so it matches itself perfectly
+        # and takes the top slot every single turn.
+        #
+        # Measured on the first real conversation, four of five slots were the
+        # user's own questions, and the one remaining slot handed the model her
+        # previous answer to the same question - which it then reproduced
+        # verbatim, writing a second copy that made the next repetition likelier
+        # still. Past means past; the live window is not memory.
+        live = {i.content for i in working}
         try:
-            eps = await search_episodes(query, limit=RETRIEVAL_EPISODE_LIMIT, path=db_path)
+            eps = await search_episodes(
+                query, limit=RETRIEVAL_EPISODE_LIMIT + len(live), path=db_path
+            )
         except Exception as e:
             print(f"[{datetime.datetime.now().isoformat()}] [retrieval] episode retrieval failed: {e}")
             eps = []
+        eps = [e for e in eps if e["content"] not in live][:RETRIEVAL_EPISODE_LIMIT]
         if eps:
             parts.append("## Past Reflections\n" + "\n".join(f"- {e['content']}" for e in eps))
 
