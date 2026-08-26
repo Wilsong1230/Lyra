@@ -9,7 +9,15 @@ ROOT="$PWD"
 PY="${PYTHON:-python3}"
 
 SERVICES=(lyra-embodiment lyra-voice lyra-listen lyra-vision lyra-mcp)
-TARGETS=("${@:-${SERVICES[@]}}")
+# No args: full setup (core packages + every service).
+# With args: only what was named, so a single service can be rebuilt cheaply.
+if [[ $# -eq 0 ]]; then
+  TARGETS=("${SERVICES[@]}"); DO_CORE=1
+else
+  TARGETS=("$@"); DO_CORE=0
+  for t in "$@"; do [[ "$t" == lyra_ai || "$t" == lyra-memory ]] && DO_CORE=1; done
+  TARGETS=($(printf '%s\n' "${TARGETS[@]}" | grep -vE '^(lyra_ai|lyra-memory)$' || true))
+fi
 
 command -v "$PY" >/dev/null || { echo "error: $PY not found"; exit 1; }
 echo "==> Using $("$PY" --version)"
@@ -25,6 +33,7 @@ if [[ ! -f litellm_config.yaml && -f litellm_config.example.yaml ]]; then
 fi
 
 # Core packages first — services and the CLI depend on them.
+if [[ "$DO_CORE" == 1 ]]; then
 echo "==> lyra-memory (editable)"
 "$PY" -m venv lyra-memory/venv
 lyra-memory/venv/bin/pip install -q --upgrade pip
@@ -34,6 +43,7 @@ echo "==> lyra_ai (editable, with lyra-memory)"
 "$PY" -m venv lyra_ai/venv
 lyra_ai/venv/bin/pip install -q --upgrade pip
 lyra_ai/venv/bin/pip install -q -e "lyra_ai[dev]" -e lyra-memory
+fi
 
 for svc in "${TARGETS[@]}"; do
   [[ -d "$svc" ]] || { echo "!! no such service: $svc"; continue; }
@@ -41,11 +51,14 @@ for svc in "${TARGETS[@]}"; do
   "$PY" -m venv "$svc/venv"
   "$svc/venv/bin/pip" install -q --upgrade pip
   if [[ -f "$svc/requirements.txt" ]]; then
-    # lyra-mcp depends on lyra-memory by relative path; install it explicitly.
-    "$svc/venv/bin/pip" install -q -e "$ROOT/lyra-memory"
-    grep -v '^lyra-memory' "$svc/requirements.txt" > /tmp/req-$$.txt || true
-    "$svc/venv/bin/pip" install -q -r /tmp/req-$$.txt
-    rm -f /tmp/req-$$.txt
+    # Relative-path deps (lyra-memory) resolve from the repo root, not the
+    # service dir, so install them explicitly and filter them from the file.
+    if grep -q '^lyra-memory' "$svc/requirements.txt"; then
+      "$svc/venv/bin/pip" install -q -e "$ROOT/lyra-memory"
+    fi
+    grep -v '^lyra-memory' "$svc/requirements.txt" > "$svc/.req.tmp"
+    "$svc/venv/bin/pip" install -q -r "$svc/.req.tmp"
+    rm -f "$svc/.req.tmp"
   fi
 done
 
