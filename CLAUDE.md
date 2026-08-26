@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-Lyra is a multi-service AI assistant with a physical presence. It is composed of five independent microservices plus a core CLI, each in its own directory with its own Python venv.
+Lyra is a multi-service AI assistant with a physical presence. It is a **monorepo**: five microservices plus two core Python packages, each in its own directory with its own Python venv (their dependency trees conflict, so a shared venv is not possible).
+
+Run `./bootstrap.sh` from the repo root to create every venv on a fresh machine.
 
 | Service | Port | Directory | Purpose |
 |---|---|---|---|
@@ -14,13 +16,20 @@ Lyra is a multi-service AI assistant with a physical presence. It is composed of
 | lyra-vision | 8003 | `lyra-vision/` | Screen/webcam capture → Gemini or OpenRouter multimodal API |
 | lyra-mcp | stdio | `lyra-mcp/` | MCP server aggregating all four services for Claude Desktop |
 | lyra_ai | — | `lyra_ai/` | Core CLI (`lyra`); talks to all services; installable Python package |
+| lyra-memory | — | `lyra-memory/` | Four-layer memory: working, episodic, structured state, identity |
 
 ## Commands
+
+### First-time setup (any machine)
+```bash
+./bootstrap.sh                # creates every venv, seeds .env from .env.example
+$EDITOR .env                  # paste in API keys
+```
 
 ### lyra_ai (core CLI)
 ```bash
 cd lyra_ai
-pip install -e ".[dev]"       # install with dev deps
+pip install -e ".[dev]" -e ../lyra-memory   # install with dev deps
 python -m pytest              # run tests
 python -m pytest tests/test_assistant.py  # run a single test file
 lyra                          # run the assistant (auto-selects backend)
@@ -72,3 +81,6 @@ Wraps all four services as MCP tools: `set_emotion`, `get_state`, `speak`, `tran
 | `EMBODIMENT_URL` | `http://localhost:8000` | lyra-voice, lyra-listen, lyra-mcp, lyra_ai |
 
 The CLI loads `.env` from the working directory or `~/.env` before importing anything.
+
+`.env` and `litellm_config.yaml` are gitignored; `.env.example` and
+`litellm_config.example.yaml` are the committed templates.
