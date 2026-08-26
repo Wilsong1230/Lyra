@@ -1,0 +1,6 @@
+aiosqlite>=0.19
+pydantic>=2.0
+sentence-transformers>=3.0
+sqlite-vec>=0.1.0
+pytest>=8,<9
+pytest-asyncio>=0.23
