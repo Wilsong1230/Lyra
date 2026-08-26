@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import datetime
 import os
 import sqlite3
 from pathlib import Path
 import httpx
 from mcp.server.fastmcp import FastMCP
+from lyra_memory.retrieval import search_episodes as _search_episodes_async
 
 _DB_PATH = Path.home() / ".lyra" / "memory.db"
 
@@ -107,17 +109,11 @@ def lyra_see(source: str = "screen", prompt: str = "Describe what you see.") -> 
 
 @mcp.tool()
 def search_episodes(query: str, limit: int = 5) -> list[dict]:
-    """Search Lyra's long-term episodic memory for past experiences. Use this when you need to recall something that happened previously but is not in your current working memory. Search is keyword-based against SQLite — use specific nouns or phrases that would appear verbatim in episode text. Do not use fuzzy or semantic phrasing."""
+    """Search Lyra's long-term episodic memory using semantic similarity. Use natural language — paraphrased or conceptually related queries will find relevant episodes even without exact keyword overlap."""
     _log(f"search_episodes query={query!r} limit={limit}")
     try:
-        with sqlite3.connect(_DB_PATH) as conn:
-            rows = conn.execute(
-                "SELECT id, content, ts FROM episodes "
-                "WHERE content LIKE ? ORDER BY ts DESC LIMIT ?",
-                (f"%{query}%", limit),
-            ).fetchall()
-        return [{"id": r[0], "content": r[1], "ts": r[2]} for r in rows]
-    except sqlite3.Error as e:
+        return asyncio.run(_search_episodes_async(query, limit=limit))
+    except Exception as e:
         return [{"error": str(e)}]
 
 
