@@ -1,0 +1,9 @@
+fastapi>=0.111.0
+uvicorn>=0.30.0
+openai-whisper>=20240930
+sounddevice>=0.4.7
+soundfile>=0.12.1
+numpy>=1.26.0
+httpx>=0.27.0
+python-multipart>=0.0.9
+pytest>=8.0.0
