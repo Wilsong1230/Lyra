@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+dist/
+build/
+
+# Virtualenvs (each service has its own)
+venv/
+.venv/
+
+# Secrets
+.env
+
+# Models & caches
+*.pt
+*.onnx
+models/
+
+# macOS
+.DS_Store
