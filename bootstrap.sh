@@ -37,7 +37,7 @@ if [[ "$DO_CORE" == 1 ]]; then
 echo "==> lyra-memory (editable)"
 "$PY" -m venv lyra-memory/venv
 lyra-memory/venv/bin/pip install -q --upgrade pip
-lyra-memory/venv/bin/pip install -q -e lyra-memory
+lyra-memory/venv/bin/pip install -q -e "lyra-memory[dev]"
 
 echo "==> lyra_ai (editable, with lyra-memory)"
 "$PY" -m venv lyra_ai/venv
