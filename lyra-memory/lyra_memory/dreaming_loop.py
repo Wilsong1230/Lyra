@@ -98,13 +98,21 @@ class DreamingLoop:
         await self._conn.commit()
         print(f"\r\033[K[{datetime.now().isoformat()}] [DreamingLoop] episode written ({len(content)} chars)")
 
-        obs_json = await self._call_llm(_OBS_PROMPT + content)
+        # The episode is already written and committed. Everything below is a
+        # best-effort extra, so nothing here may propagate: an exception would
+        # skip mark_dreamed(), and the next poll would dream over the same
+        # items again and write a DUPLICATE episode. The parse errors were
+        # already guarded; the LLM call itself was not, which is exactly the
+        # one that fails on a rate-limited free model.
         try:
+            obs_json = await self._call_llm(_OBS_PROMPT + content)
             observations = json.loads(obs_json)
             for obs in observations[:3]:
                 await self._pool.add_observation(obs["trait_name"], obs["trait_value"], obs["category"])
         except (json.JSONDecodeError, KeyError, TypeError) as e:
             print(f"\r\033[K[{datetime.now().isoformat()}] [DreamingLoop] structured obs parse error: {e}")
+        except Exception as e:
+            print(f"\r\033[K[{datetime.now().isoformat()}] [DreamingLoop] trait extraction failed: {e}")
 
         try:
             await self._identity.consolidate()

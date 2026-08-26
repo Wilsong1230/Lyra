@@ -3,7 +3,12 @@ from pathlib import Path
 
 DB_PATH = Path.home() / ".lyra" / "memory.db"
 
-DREAM_MODEL = "openai/gpt-oss-120b:free"
+# Free tier: rate-limited, so cycles fail intermittently. That is tolerable
+# because a failed dream retries with its items intact (mark_dreamed runs only
+# on success), but it does mean consolidation timing is partly set by someone
+# else's quota rather than by what happened to her.
+# openai/gpt-oss-120b:free was withdrawn 2026-08; the paid id still exists.
+DREAM_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 
 DREAM_TRIGGER_ITEMS = 10
