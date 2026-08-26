@@ -1,4 +1,4 @@
-mcp>=1.0.0
+mcp>=1.0.0,<2  # 2.x renamed FastMCP -> MCPServer; see migration note in docs/
 httpx>=0.27.0
 pytest>=8.0.0
 lyra-memory @ file://../lyra-memory
