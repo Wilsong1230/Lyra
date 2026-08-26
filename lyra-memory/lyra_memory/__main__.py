@@ -9,8 +9,14 @@ async def main() -> None:
     await memory.start()
     loop = asyncio.get_running_loop()
     stop = asyncio.Event()
-    loop.add_signal_handler(signal.SIGINT, stop.set)
-    loop.add_signal_handler(signal.SIGTERM, stop.set)
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except NotImplementedError:
+            # Windows: ProactorEventLoop has no add_signal_handler. signal.signal
+            # still delivers SIGINT (Ctrl-C) on the main thread; hop back onto the
+            # loop to set the event so the dreaming loop shuts down cleanly.
+            signal.signal(sig, lambda *_: loop.call_soon_threadsafe(stop.set))
     await stop.wait()
     await memory.stop()
 

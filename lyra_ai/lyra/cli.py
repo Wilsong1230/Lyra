@@ -177,7 +177,12 @@ async def _main() -> None:
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda: asyncio.create_task(assistant.stop()))
+        try:
+            loop.add_signal_handler(sig, lambda: asyncio.create_task(assistant.stop()))
+        except NotImplementedError:
+            # Windows: ProactorEventLoop has no add_signal_handler. Ctrl-C is already
+            # handled by the KeyboardInterrupt branch around _read_input below.
+            pass
 
     prior = memory.get_history(session)
     print(f"Lyra  [{backend.name} / {backend.default_model}]")
