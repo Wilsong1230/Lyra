@@ -1,5 +1,26 @@
 # MANUAL.md — steps to run by hand
 
+## What is not built, on purpose
+
+Three things are gated in the build sheet and were left alone:
+
+- **Introspection** (`query_memory` as a read API she can call) — gated on
+  step 8, which is now done, so it is unblocked but out of scope here. Note
+  the sheet's own warning when it is built: name it neutrally, and add no
+  prompt language telling her when to use it. Whether she reaches for it is
+  the measurement.
+- **Embodiment** — gated on step 11 *and* on the `~/.lyra` filesystem
+  boundary, which does not exist yet. The `environment` column and the
+  separate `runs.db` are in place so the schema will not have to change.
+- **Supersession resolution** — gated on ~50 accumulated flagged conflicts.
+  v1 flags and does not resolve; `review_facts --conflicts` is how you read
+  the accumulating set when it is time to write the rule.
+
+Two operator tools ship (`review_facts`, `review_forgetting`). They are for
+Wilson, in the same category as the existing `inspect_state.py` — they are not
+her introspection API and expose nothing to her.
+
+
 Nothing in this build runs destructive commands against `~/.lyra`, and nothing
 here has been run for you. Anything that would touch the live store, or that
 could not be done in the build container, lands here.
