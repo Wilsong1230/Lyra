@@ -176,6 +176,25 @@ async def assert_schema(conn: aiosqlite.Connection) -> None:
             "There is no migration path; restore a backup or rebuild the store."
         )
 
+    from lyra_memory.embeddings import backend_id
+
+    async with conn.execute(
+        "SELECT value FROM schema_meta WHERE key = 'embedder'"
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        raise SchemaMismatch(
+            "store does not record which embedder built its vectors. Its "
+            "embedding space is unknown, so no distance in it can be trusted."
+        )
+    if row[0] != backend_id():
+        raise SchemaMismatch(
+            f"store's vectors were built by {row[0]!r}, this process embeds "
+            f"with {backend_id()!r}. Distances across two embedding spaces are "
+            "noise. Either set LYRA_EMBED_BACKEND to match, or rebuild the "
+            "store's vectors with the embedder you want."
+        )
+
     problems = _diff(await reference_structure(), await _structure(conn))
     if problems:
         raise SchemaMismatch(

@@ -226,3 +226,38 @@ def test_store_module_has_no_bare_except_around_ingest():
         "no try/except is permitted around ingest — fail-open makes a broken "
         "store and an empty store behaviourally identical"
     )
+
+
+# ── embedding space ──────────────────────────────────────────────────────────
+
+async def test_store_records_which_embedder_built_its_vectors(tmp_path: Path):
+    from lyra_memory.embeddings import backend_id
+
+    store = await Store.open(tmp_path / "store.db")
+    async with store.db.execute(
+        "SELECT value FROM schema_meta WHERE key = 'embedder'"
+    ) as cur:
+        (recorded,) = await cur.fetchone()
+    await store.close()
+    assert recorded == backend_id()
+
+
+async def test_a_different_embedder_refuses_to_open(tmp_path: Path):
+    """A vec table holding vectors from two embedding spaces is silently and
+    unfixably wrong: every distance across the boundary is noise."""
+    path = tmp_path / "store.db"
+    await _make_store(path)
+    _corrupt(path, "UPDATE schema_meta SET value = 'some-other-embedder'"
+                   " WHERE key = 'embedder'")
+
+    with pytest.raises(SchemaMismatch, match="embedding space|some-other-embedder"):
+        await Store.open(path)
+
+
+async def test_missing_embedder_row_refuses_to_open(tmp_path: Path):
+    path = tmp_path / "store.db"
+    await _make_store(path)
+    _corrupt(path, "DELETE FROM schema_meta WHERE key = 'embedder'")
+
+    with pytest.raises(SchemaMismatch):
+        await Store.open(path)

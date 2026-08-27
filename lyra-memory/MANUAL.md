@@ -110,7 +110,34 @@ It runs as a **dry run** as written. Read the merge list first and confirm the
 four `self_*` labels are among them and that nothing distinct got collapsed,
 then change `apply=False` to `apply=True`.
 
-## 4. Backup before every cold pass
+## 4. Record the real retrieval baseline (step 3)
+
+`eval/BASELINE.md` holds a baseline against an **authored** corpus, measured
+with the **offline stand-in** embedder. It is a regression check. It is not
+the step 3 verification, and it should not be treated as one.
+
+The sheet asks for something specific and it has to happen in this order:
+
+> Label first, build second. Hand-label a small set from existing `history.db`
+> (653 CLI turns) *before* writing the pass that operates on it.
+
+To do it properly, on a machine with `~/.lyra` and the model cached:
+
+1. Pick 20 turns from the real history. For each, write down — **before**
+   running anything — what you would expect recall to surface, and whether the
+   store can answer it at all.
+2. Put them in the same shape as `eval/retrieval_baseline.json`: `corpus` (or
+   point the harness at the real store), and `turns` with `relevant`,
+   `irrelevant`, `expect_miss`.
+3. Run `python -m lyra_memory.store.evaluate <your-file>.json` and record the
+   four numbers **before** changing any constant.
+4. Re-run the same 20 after every retrieval change.
+
+Do not adjust a label because the output disagreed with it. One case in the
+shipped set already disagrees (see BASELINE.md) and was deliberately left
+alone.
+
+## 5. Backup before every cold pass
 
 Hard rule: back up before each cold pass, 30-day retention. Not automated
 here, and deliberately not run against `~/.lyra` from the build:

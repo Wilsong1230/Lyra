@@ -79,6 +79,116 @@ constant chosen in later steps is verified for *mechanism* here but is
 provisional and must be re-measured on a machine with the model before the
 retrieval-quality baseline in step 3 means anything.
 
+## Step 3 — synthesis is the one guarded call in context assembly
+
+**Ambiguous:** two rules collide. The hard rule says "no try/except around
+ingest or context build". The spec says synthesis "falls back to concatenation
+if the synthesis call fails. Never blocks a turn."
+
+**Chosen:** the specific instruction wins over the general one, and the guard
+is drawn as narrowly as possible — it wraps the `synthesize(...)` call and
+nothing else. Every other path in `build_context` is unguarded.
+
+**Why this is not a violation:** the two failures are different in kind. A
+store failure means the memory is silently wrong, and hiding it makes a broken
+store look like an empty one. A synthesis failure means an external model is
+unreachable; the retrieved material is intact and correct, and only its
+*prose* is unavailable. Falling back to concatenation loses formatting, not
+memory. The fallback also records a miss, so it is visible in `context_log`
+rather than inferred from her tone.
+
+**Reversal:** delete the try/except and a synthesis outage takes down every
+turn.
+
+## Step 3 — reciprocal rank fusion to merge the three paths
+
+**Ambiguous:** "merge three paths, dedupe, synthesize" does not say how to
+combine a cosine similarity, a BM25 score, and a recency ordering.
+
+**Chosen:** reciprocal rank fusion. Each path contributes `1/(60 + rank)`, and
+the speaker weight multiplies the fused score.
+
+**Why:** the three scores do not share a scale and cannot be added. Any
+weighting that made them commensurable would be a tuning constant pretending
+to be a fact, invented with no data to fit it to. Rank is the one thing all
+three produce honestly.
+
+**Alternative:** normalize each score to [0,1] and take a weighted sum.
+
+**Reversal:** `_fuse()` is one function; swap it and re-run the baseline.
+
+## Step 3 — the temporal pool is a companion, not a source
+
+**Ambiguous:** the sheet says temporal is a "separate pool, doesn't compete in
+KNN" but does not say whether it contributes when nothing else matched.
+
+**Chosen:** temporal contributes only when the semantic or lexical path found
+something; otherwise recall is empty and a miss is recorded.
+
+**Found by measurement, not by reading.** With it ungated, both unanswerable
+turns in the baseline set returned the last ten unrelated atoms under a
+`## Recall` heading — spurious injection 1.00. Presenting arbitrary recent
+turns as recalled memory is worse than presenting nothing, because it reads as
+remembering.
+
+**Alternative:** always include recency in recall.
+
+**Reversal:** drop the `if semantic or lexical` gate. Note what returns: recall
+is never empty, so `misses` stops meaning anything.
+
+## Step 3 — a stopword list on the lexical path only
+
+**Ambiguous:** how to turn a natural-language question into an FTS5 MATCH.
+
+**Chosen:** OR the query's tokens, minus a standard English stopword list.
+
+**Why:** BM25 is there for selective tokens — repo names, filenames, proper
+nouns. OR-ing every token matched the whole corpus on "the / did / we /
+about", and BM25 then ranked it at random; coverage rose from 0.96 to 1.00
+when selective tokens were required. The list is about term selectivity, never
+about meaning: it does not touch the semantic path and decides nothing about
+relevance.
+
+**Alternative, and the better one:** a document-frequency cutoff measured from
+the index itself, which needs no authored list. Deferred rather than guessed
+at — it needs a store large enough to measure, and computing df per token per
+turn is a hot-path cost that should be measured before it is paid.
+
+**Reversal:** replace `_STOPWORDS` with the df cutoff once the store is large.
+
+## Step 3 — token budgets are estimated at 4 characters per token
+
+**Ambiguous:** the sheet says "byte budgets, not k" but the table is in tokens.
+
+**Chosen:** budgets are declared in tokens and enforced with
+`ceil(len(text)/4)`. Truncation is by whole lines — half a fact is worse than
+no fact.
+
+**Why no tokenizer:** budgeting in bytes is precisely what lets the hot path
+avoid one. The estimate only has to be stable and slightly conservative; it
+bounds a budget, it does not price a call.
+
+**Reversal:** swap `estimate_tokens` for a real tokenizer and re-check the
+hot-path budget.
+
+## Step 3 — the store records which embedder built its vectors
+
+**Ambiguous:** not in the sheet at all. It surfaced when the offline stand-in
+made it possible to write vectors from two different embedding spaces into one
+`vec_atoms` table.
+
+**Chosen:** the embedder id is stamped into `schema_meta` at creation, and the
+boot assertion refuses to open a store whose vectors were built by a different
+one.
+
+**Why:** distances across two embedding spaces are noise, and nothing about
+the failure is visible — every query still returns something. It is the same
+class of silent wrongness as the dropped FTS trigger, so it gets the same
+treatment.
+
+**Reversal:** drop the check. Then a single `LYRA_EMBED_BACKEND` typo silently
+corrupts a store in a way no query will reveal.
+
 ## Step 2 — the assertion compares structure, not a version stamp
 
 **Ambiguous:** "schema version assertion at boot" could mean only comparing a

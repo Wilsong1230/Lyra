@@ -105,9 +105,19 @@ class Store:
             await self.db.executescript(VEC_SQL)
             await self.db.executescript(COLD_SQL)
             await self.db.executescript(FTS_SQL)
+            from lyra_memory.embeddings import backend_id
+
             await self.db.execute(
                 "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
+            )
+            # Which embedding space this store's vectors live in. A vec table
+            # holding vectors from two different embedders is silently and
+            # unfixably wrong — every distance across the boundary is noise —
+            # so the store records its own and refuses to open under another.
+            await self.db.execute(
+                "INSERT INTO schema_meta (key, value) VALUES ('embedder', ?)",
+                (backend_id(),),
             )
             await self.db.commit()
 
