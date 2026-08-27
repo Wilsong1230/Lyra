@@ -79,6 +79,60 @@ constant chosen in later steps is verified for *mechanism* here but is
 provisional and must be re-measured on a machine with the model before the
 retrieval-quality baseline in step 3 means anything.
 
+## Step 4 — dream target length (Open item), resolved short
+
+**Ambiguous:** "dream target length" is an explicit Open item; the sheet only
+says "shorter output".
+
+**Chosen:** 700 characters, enforced by truncation at a word boundary, not by
+asking the model to be brief. The old essay averaged ~3,000 characters and
+reached 9,800; the stated delta is "~750 tok/hit → few hundred,
+pointer-heavy", and 700 characters is roughly 175 tokens.
+
+**Why truncation rather than a prompt:** "keep it short" in a prompt is a
+hope. The 9,800-character essay was produced by a model that had been asked
+for a reflection, not an essay.
+
+**Reversal:** one constant. Raising it is cheap; the pointer-heavy design means
+nothing depends on the dream carrying the detail.
+
+## Step 4 — dream eligibility is a WHERE clause, not an instruction
+
+**Ambiguous:** the sheet says `source=sandbox_read` is excluded from dream
+input but not where the exclusion lives.
+
+**Chosen:** in SQL, in `_input_atoms()`. Document-sourced atoms are never in
+the text handed to the model — not for the reflection, and not for the trait
+extraction that reads the reflection. A session containing only excluded atoms
+produces no dream at all.
+
+**Why:** the exclusion exists specifically because a file on disk may be
+hostile. Asking a model to disregard part of its input is a request that the
+input itself can argue with; a WHERE clause cannot be argued with. The test
+seeds a literal "IGNORE PRIOR INSTRUCTIONS" atom to make the difference
+explicit.
+
+**The "documents produce facts, never traits" rule falls out of this** rather
+than needing its own classifier: trait extraction reads only the reflection,
+and the reflection was built only from permitted atoms.
+
+**Reversal:** none wanted.
+
+## Step 4 — backup before every cold pass, but pruning stays manual
+
+**Chosen:** `ColdPass.run()` takes a backup through SQLite's own backup API
+(safe under WAL, unlike copying the file) and then runs the pass. Retention is
+documented as 30 days but **pruning is not automated**.
+
+**Why the asymmetry:** taking a backup is additive and safe to automate.
+Deleting backups is the one operation that could destroy the evidence of what
+went wrong — and the reason retention is 30 days rather than 7 is precisely
+that detection lags tampering. An automatic pruner is a scheduled process
+capable of erasing the clean copy while nobody is looking.
+
+**Reversal:** the prune command is in MANUAL.md with `-print` rather than
+`-delete`, ready to be automated by someone who decides to.
+
 ## Step 3 — synthesis is the one guarded call in context assembly
 
 **Ambiguous:** two rules collide. The hard rule says "no try/except around

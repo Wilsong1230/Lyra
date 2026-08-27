@@ -61,6 +61,14 @@ EMBED_DIM = 384
 # both separate them and merge real duplicates. They dedup by exact name.
 CANDIDATE_DEDUP_THRESHOLD = 0.37
 
+# ── dream (step 4) ───────────────────────────────────────────────────────────
+# Dream target length is an Open item on the sheet. Chosen conservatively:
+# short. The old essay averaged ~3,000 characters and reached 9,800, and the
+# delta the rebuild is chasing is "~750 tok/hit -> few hundred, pointer-heavy".
+# Enforced by truncation, not by asking the model nicely.
+DREAM_TARGET_CHARS = 700
+DREAM_MAX_ATOMS = 60
+
 # ── context assembly (step 3) ────────────────────────────────────────────────
 # Budget is in tokens, allocated per block with hard truncation — not "top k".
 # k-based assembly is how a single retrieved essay came to be 43,000 characters
