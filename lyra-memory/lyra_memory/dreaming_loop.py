@@ -17,6 +17,9 @@ _OBS_PROMPT = (
     '  "trait_name"  — short stable key, e.g. "communication_style"\n'
     '  "trait_value" — the specific observation, e.g. "engineering-focused, concise"\n'
     '  "category"    — one of: behavioral, emotional, relational, cognitive\n'
+    '  "evidence"    — the concrete thing in the reflection that supports it,\n'
+    "                  in one short phrase. Quote or paraphrase what happened,\n"
+    "                  not the pattern itself.\n"
     "Return only JSON, no other text.\n\nReflection:\n"
 )
 
@@ -102,7 +105,14 @@ class DreamingLoop:
         try:
             observations = json.loads(obs_json)
             for obs in observations[:3]:
-                await self._pool.add_observation(obs["trait_name"], obs["trait_value"], obs["category"])
+                # `evidence` is optional: when the model omits it, dedup falls
+                # back to the description alone rather than substituting the
+                # dream text, which is identical across every observation in
+                # the batch and would pull unrelated candidates together.
+                await self._pool.add_observation(
+                    obs["trait_name"], obs["trait_value"], obs["category"],
+                    evidence=obs.get("evidence"),
+                )
         except (json.JSONDecodeError, KeyError, TypeError) as e:
             print(f"\r\033[K[{datetime.now().isoformat()}] [DreamingLoop] structured obs parse error: {e}")
 

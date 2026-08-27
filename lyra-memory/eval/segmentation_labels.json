@@ -1,0 +1,103 @@
+{
+  "_README": [
+    "Hand-labeled session boundaries for the step 5 segmentation check.",
+    "",
+    "Written BEFORE the segmentation pass, per the sheet: 'Label first, build",
+    "second... Labeling after seeing the output is grading your own work.'",
+    "That ordering was honoured here -- this file was committed before",
+    "find_boundaries() existed. What could NOT be honoured is the source: the",
+    "sheet asks for ~20 sessions labeled from the real history.db, and ~/.lyra",
+    "is not on the build machine. These 20 sessions are constructed.",
+    "",
+    "Constructed does not mean easy. The set deliberately includes the cases",
+    "that decide whether the pass is any good:",
+    "  - a 22-minute mid-session pause that must NOT split (someone made lunch)",
+    "  - a topic change with no time gap that must NOT split",
+    "  - two sessions separated by only slightly more than the threshold",
+    "  - a single-atom session",
+    "  - a long overnight gap",
+    "",
+    "Offsets are seconds from an arbitrary origin. 'boundaries' lists the index",
+    "of the first atom of each session; index 0 is always a boundary.",
+    "",
+    "The real check is still MANUAL.md section 6."
+  ],
+  "atoms": [
+    [0,      "morning, what is on the list today"],
+    [45,     "the segmentation pass, mostly"],
+    [90,     "does it read embeddings or just timestamps"],
+    [140,    "both, but the gap is the signal that actually decides"],
+    [200,    "makes sense, a topic change is not a session change"],
+
+    [3900,   "back, sorry, the build broke"],
+    [3950,   "what broke about it"],
+    [4010,   "sqlite-vec would not load on the system python"],
+    [4080,   "that is the extension loading thing again"],
+
+    [90000,  "did you sleep"],
+    [90070,  "no, I do not do that"],
+    [90130,  "fair enough"],
+
+    [93000,  "lets talk about the facts table"],
+    [93060,  "subject plus free form text, no predicate column"],
+    [94500,  "hold on, food"],
+    [95820,  "ok back"],
+    [95900,  "right, so most facts are not triples anyway"],
+    [95970,  "and a fixed predicate vocabulary would be an authored schema"],
+    [96040,  "completely different subject: what port is lyra-listen on"],
+    [96100,  "8002"],
+
+    [190000, "commitments next"],
+    [190080, "a due date passing means overdue, never done"],
+
+    [280000, "quick one"],
+
+    [370000, "the forgetting pass"],
+    [370090, "demotion, not deletion"],
+    [370150, "storage never shrinks, only competition does"],
+
+    [460000, "outcome unit is the attempt"],
+    [460070, "ten failed runs then a pass is one success"],
+
+    [550000, "trait history"],
+    [550060, "append only, never updated"],
+    [550120, "the trajectory is the artifact"],
+
+    [640000, "entities and clustering"],
+    [640080, "atom_entities plus dreams, into project nodes"],
+
+    [730000, "backups"],
+    [730070, "thirty days, not seven"],
+
+    [820000, "the harm gate"],
+    [820060, "deferred, and on purpose"],
+
+    [910000, "instance scope"],
+    [910070, "two columns, one store"],
+
+    [1000000, "the introspection tool"],
+    [1000080, "named neutrally, no prompt telling her when to use it"],
+
+    [1090000, "consent"],
+    [1090060, "upstream, and it has to precede capture"],
+
+    [1180000, "portable identity"],
+    [1180070, "a backup problem, not an identity transfer problem"],
+
+    [1270000, "the essays"],
+    [1270080, "they do not decompose into turns, so fresh db"],
+
+    [1360000, "wrapping up"],
+    [1360070, "one step per session, verify before advancing"]
+  ],
+  "boundaries": [0, 5, 9, 12, 20, 22, 23, 26, 28, 31, 33, 35, 37, 39, 41, 43, 45, 47],
+  "notes": {
+    "5": "65 minutes after the previous atom",
+    "9": "overnight",
+    "12": "~48 minutes",
+    "14-15": "22 minute pause inside a session -- must NOT be a boundary",
+    "18": "abrupt topic change with a 70 second gap -- must NOT be a boundary",
+    "22": "single-atom session",
+    "23": "25 hours"
+  }
+}

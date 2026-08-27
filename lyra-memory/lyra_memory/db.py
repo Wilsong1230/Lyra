@@ -39,7 +39,11 @@ CREATE TABLE IF NOT EXISTS candidates (
     trait_value    TEXT NOT NULL,
     evidence_count INTEGER NOT NULL DEFAULT 1,
     last_seen      REAL NOT NULL,
-    category       TEXT NOT NULL
+    category       TEXT NOT NULL,
+    -- Most recent concrete observation behind this candidate. Embedded
+    -- alongside the description for dedup (see CandidatePool._embedding_text)
+    -- and kept so the pool can be re-embedded without re-running dream.
+    evidence_text  TEXT
 );
 CREATE TABLE IF NOT EXISTS traits (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -50,6 +54,24 @@ CREATE TABLE IF NOT EXISTS traits (
     evidence_count INTEGER NOT NULL,
     updated_at     REAL NOT NULL
 );
+-- Append-only. Rows are never updated or deleted. `traits` is a materialized
+-- view of the latest state; this table is the source of truth, and a trait
+-- whose current value has no matching history row means something wrote
+-- outside IdentityEngine (see assert_trait_history_integrity).
+CREATE TABLE IF NOT EXISTS trait_history (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts             REAL NOT NULL,
+    trait_id       INTEGER NOT NULL REFERENCES traits(id),
+    trait_label    TEXT NOT NULL,
+    event          TEXT NOT NULL,       -- promoted | confidence_change | tier_change | decayed | retired
+    conf_before    REAL,
+    conf_after     REAL,
+    tier_before    TEXT,
+    tier_after     TEXT,
+    evidence_count INTEGER NOT NULL,
+    dream_id       INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_trait_history_trait ON trait_history(trait_id);
 """
 
 _CREATE_VEC_SQL = f"""
@@ -101,6 +123,16 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
         columns = {row[1] for row in await cur.fetchall()}
     if "salience" not in columns:
         await conn.execute("ALTER TABLE episodes ADD COLUMN salience REAL DEFAULT 0.0")
+        await conn.commit()
+
+    # Additive only: existing candidates keep their rows and their vectors, and
+    # simply have no recorded evidence until the next observation supplies one.
+    # Re-clustering the existing pool under the new centroid logic would delete
+    # and rewrite every row, so it is a manual step — see MANUAL.md.
+    async with conn.execute("PRAGMA table_info(candidates)") as cur:
+        candidate_columns = {row[1] for row in await cur.fetchall()}
+    if "evidence_text" not in candidate_columns:
+        await conn.execute("ALTER TABLE candidates ADD COLUMN evidence_text TEXT")
         await conn.commit()
 
     await _migrate_candidate_vectors(conn)
