@@ -49,13 +49,12 @@ class MemorySystem:
 
             self.dreaming_loop.start(idle_seconds=idle_seconds, poll_seconds=poll_seconds)
 
-            # Pre-warm the embedding model so the first build_system_prompt() call
-            # doesn't pay the model-loading penalty inside a tight caller timeout.
+            # Pre-warm the embedding model so the first build_system_prompt()
+            # call doesn't pay the model-loading penalty inside a tight caller
+            # timeout — and so a broken embedder is a startup crash rather
+            # than a store that quietly retrieves nothing forever.
             from lyra_memory.embeddings import embed
-            try:
-                await embed("warmup")
-            except Exception:
-                pass
+            await embed("warmup")
         except Exception:
             if self.db is not None:
                 await self.db.close()
@@ -71,15 +70,14 @@ class MemorySystem:
     async def _persist_atom(self, item) -> None:
         """Write one working-memory item through as an episodic atom.
 
-        Never raises: a failed atom write must not take down the conversation
-        or the perception loop.
+        Raises. A failed atom write is a turn that did not happen as far as
+        the store is concerned, and a conversation that continues over a store
+        that is silently dropping it is worse than one that stops: the first
+        is indistinguishable from working, and only the second gets fixed.
         """
         if self.atom_store is None:
             return
-        try:
-            await self.atom_store.write(item)
-        except Exception as exc:
-            print(f"[MemorySystem] atom write failed: {exc}")
+        await self.atom_store.write(item)
 
     async def add_turn(self, role: str, content: str) -> None:
         if self.working_memory is None:

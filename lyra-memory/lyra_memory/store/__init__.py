@@ -89,15 +89,27 @@ class Store:
         # and a crash mid-cold-pass must not corrupt the substrate.
         await self.db.execute("PRAGMA journal_mode=WAL")
         await self.db.execute("PRAGMA foreign_keys=ON")
-        await self.db.executescript(HOT_SQL)
-        await self.db.executescript(VEC_SQL)
-        await self.db.executescript(COLD_SQL)
-        await self.db.executescript(FTS_SQL)
-        await self.db.execute(
-            "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
-            (str(SCHEMA_VERSION),),
-        )
-        await self.db.commit()
+
+        # The DDL runs for a NEW store only. Re-running `CREATE TABLE IF NOT
+        # EXISTS` against an existing one would quietly re-create whatever had
+        # been dropped — healing the corruption a moment before asserting there
+        # is none, which is precisely the fail-open behaviour this step exists
+        # to remove. An existing store is asserted, never repaired.
+        async with self.db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_meta'"
+        ) as cur:
+            is_new = await cur.fetchone() is None
+
+        if is_new:
+            await self.db.executescript(HOT_SQL)
+            await self.db.executescript(VEC_SQL)
+            await self.db.executescript(COLD_SQL)
+            await self.db.executescript(FTS_SQL)
+            await self.db.execute(
+                "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?)",
+                (str(SCHEMA_VERSION),),
+            )
+            await self.db.commit()
 
         self.runs = await aiosqlite.connect(self.runs_path)
         await self.runs.execute("PRAGMA journal_mode=WAL")
@@ -106,7 +118,14 @@ class Store:
 
         from lyra_memory.store.integrity import assert_schema
 
-        await assert_schema(self.db)
+        # Close the handles before propagating. This re-raises rather than
+        # swallowing — the store still refuses to open — it just does not
+        # leak two connections on the way out.
+        try:
+            await assert_schema(self.db)
+        except BaseException:
+            await self.close()
+            raise
 
     async def close(self) -> None:
         if self.db is not None:

@@ -638,9 +638,14 @@ async def test_system_prompt_omits_episodes_section_when_db_empty(tmp_db_path: P
         _cfg.CORE_PROMPT = original_core
 
 
-async def test_retrieval_failure_is_logged_not_raised(tmp_db_path: Path, capsys):
-    """A broken episode DB must not crash prompt assembly — failure is logged,
-    episodes section is omitted, and the core prompt still returns."""
+async def test_retrieval_failure_raises(tmp_db_path: Path):
+    """A broken store must crash prompt assembly, not degrade quietly.
+
+    This test previously asserted the opposite. The policy changed
+    deliberately: fail-open makes a broken store and an empty store
+    behaviourally identical, which is undetectable from transcripts and was
+    measured here — 653 turns, 0 episodes, no symptom. See DECISIONS.md.
+    """
     import aiosqlite as _aiosqlite
 
     original_db_path = _cfg.DB_PATH
@@ -666,13 +671,8 @@ async def test_retrieval_failure_is_logged_not_raised(tmp_db_path: Path, capsys)
             identity_engine = identity
             db = conn
 
-        prompt = await build_system_prompt(_FakeMemory())
-        assert "You are Lyra." in prompt
-        assert "## Past Reflections" not in prompt
-
-        captured = capsys.readouterr()
-        assert "[retrieval]" in captured.out
-        assert "episode retrieval failed" in captured.out
+        with pytest.raises(Exception):
+            await build_system_prompt(_FakeMemory())
 
         await conn.close()
     finally:

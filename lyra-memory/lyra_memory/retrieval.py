@@ -42,11 +42,10 @@ async def build_context(memory: object, query: str | None = None) -> str:
 
     if query:
         db_path = getattr(memory, "_db_path", None)
-        try:
-            eps = await search_episodes(query, limit=RETRIEVAL_EPISODE_LIMIT, path=db_path)
-        except Exception as e:
-            print(f"[{datetime.datetime.now().isoformat()}] [retrieval] episode retrieval failed: {e}")
-            eps = []
+        # Deliberately unguarded. A broken store and an empty store must not
+        # look the same from a transcript: swallowing this is how 653 turns
+        # produced 0 episodes with no symptom at all.
+        eps = await search_episodes(query, limit=RETRIEVAL_EPISODE_LIMIT, path=db_path)
         if eps:
             parts.append("## Past Reflections\n" + "\n".join(f"- {e['content']}" for e in eps))
 

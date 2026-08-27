@@ -79,6 +79,76 @@ constant chosen in later steps is verified for *mechanism* here but is
 provisional and must be re-measured on a machine with the model before the
 retrieval-quality baseline in step 3 means anything.
 
+## Step 2 — the assertion compares structure, not a version stamp
+
+**Ambiguous:** "schema version assertion at boot" could mean only comparing a
+stored integer.
+
+**Chosen:** the version is checked *and* the structure is compared — tables,
+columns (name, type, nullability, primary key), indexes, and trigger
+definitions. The expected structure is derived by building the schema in an
+in-memory database from the same DDL constants, so there is no hand-written
+second copy to drift.
+
+**Why:** a version check alone misses the case that matters most. Drop the
+`atoms_fts_insert` trigger and the store still answers every query, still
+reports schema v1, and silently indexes nothing — which is the exact shape of
+the failure this whole policy exists to catch. Comparison is on normalized
+SQL (comments stripped, whitespace collapsed) because SQLite stores CREATE
+text verbatim, and an assertion that fires when someone edits a comment is one
+that gets disabled.
+
+**Alternative:** version-only, or a hash of the DDL text.
+
+**Reversal:** the structural comparison is one function; deleting it leaves
+the version check intact.
+
+## Step 2 — an existing store is asserted, never repaired
+
+**Ambiguous:** not stated, and it was a live bug — the first implementation
+ran `CREATE TABLE IF NOT EXISTS` on every open, which re-created whatever had
+been dropped moments before asserting nothing was wrong. The corruption tests
+failed to fail.
+
+**Chosen:** the DDL runs only for a store that does not exist yet. An existing
+store is asserted and never touched.
+
+**Why:** silently healing drift destroys the only question worth asking, which
+is *when* it drifted, and therefore which backup predates it. The error
+message says so explicitly rather than suggesting a repair.
+
+**Reversal:** none wanted. If a migration path is ever needed it should be an
+explicit, reviewed, backed-up operation, not a side effect of opening a file.
+
+## Step 2 — fail-open removed from the existing system too
+
+**Ambiguous:** step 2 sits in the new store's build order, but the spec's
+failure policy names `build_context`, and the fail-open code was in the
+*existing* system.
+
+**Chosen:** removed all three swallowing handlers: the `try/except` around
+episode retrieval in `retrieval.build_context`, the one around the atom write
+in `MemorySystem._persist_atom`, and the one around the embedder warm-up in
+`MemorySystem.start`. The new store has none by construction, and a test reads
+its source to keep it that way.
+
+**This inverts an existing test.** `test_retrieval_failure_is_logged_not_raised`
+asserted the old policy by name; it is now `test_retrieval_failure_raises`.
+That is a deliberate behaviour change, justified by the spec's failure policy
+and by the measurement it cites — 653 turns, 0 episodes, no symptom, in this
+codebase.
+
+**Alternative:** leaving the old system fail-open and applying the rule only
+to new code. Rejected: the old system is the one running today, so the rule
+would protect nothing that is currently at risk.
+
+**Reversal:** restore the handlers and re-invert the test. Note what you lose:
+a broken store becomes indistinguishable from an empty one again.
+
+**Accepted cost:** a transient embedder failure now stops startup instead of
+degrading. That is the intended trade — a memory system that cannot embed
+cannot retrieve, and should say so loudly rather than run empty.
+
 ## Step 1 (blocking) — instance scope: two columns, one store
 
 **Ambiguous:** the sheet marks this "Unresolved and blocking… resolve before
