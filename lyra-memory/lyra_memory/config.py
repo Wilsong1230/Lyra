@@ -61,6 +61,14 @@ EMBED_DIM = 384
 # both separate them and merge real duplicates. They dedup by exact name.
 CANDIDATE_DEDUP_THRESHOLD = 0.37
 
+# ── salience (step 6) ────────────────────────────────────────────────────────
+# Nonzero: atoms with no measured outcome must still be rankable against each
+# other, or the forgetting pass has nothing to order them by.
+SALIENCE_BASELINE = 0.1
+# The turns around an attempt carry some of its weight — what made an outcome
+# make sense is usually the exchange before it, not the line that triggered it.
+SALIENCE_SESSION_SPILLOVER = 0.4        # PROVISIONAL
+
 # ── segmentation (step 5) ────────────────────────────────────────────────────
 # Time is the decisive signal. 30 minutes: long enough that a mid-conversation
 # pause (a meal, a meeting) does not shred one session into three, short enough

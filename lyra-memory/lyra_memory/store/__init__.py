@@ -274,6 +274,38 @@ class Store:
         await self.runs.commit()
         return cur.lastrowid
 
+    # ── outcomes ─────────────────────────────────────────────────────────────
+
+    async def record_outcome(
+        self,
+        intent_atom_id: int,
+        valence: float,
+        actual: str | None = None,
+        predicted: str | None = None,
+        environment: str | None = None,
+        ts: float | None = None,
+    ) -> int:
+        """Record the result of one **attempt**.
+
+        Hard rule: the unit is the attempt, not the command. Ten failed test
+        runs followed by a pass is *one* success — not ten failures and a win.
+        Scoring per command floors her mood through any normal debugging
+        session and rebuilds the "abandons under frustration" topology that
+        this design exists to avoid. Abandoning the attempt is the failure.
+
+        So the caller decides when an attempt is over and calls this once.
+        Nothing here can enforce that, which is exactly why it is written down
+        at the only place an outcome can enter the store.
+        """
+        cur = await self.db.execute(
+            "INSERT INTO outcomes (intent_atom_id, predicted, actual, valence, ts, environment)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (intent_atom_id, predicted, actual, valence,
+             ts if ts is not None else time.time(), environment),
+        )
+        await self.db.commit()
+        return cur.lastrowid
+
     # ── integrity ────────────────────────────────────────────────────────────
 
     async def find_index_gaps(self) -> dict[str, list[int]]:
