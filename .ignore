@@ -1,0 +1,13 @@
+# Search-tool ignore (ripgrep, fd, ag). Does NOT affect git tracking —
+# these directories are still committed and still clone normally.
+#
+# Components not built on this machine: TTS (lyra-voice), STT + ambient
+# audio (lyra-listen). Skipping them keeps grep/fd results clean.
+lyra-voice/
+lyra-listen/
+
+# Build output and caches
+venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
