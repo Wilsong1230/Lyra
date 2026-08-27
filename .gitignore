@@ -18,6 +18,14 @@ venv/
 *.onnx
 models/
 
+# Local databases (Lyra writes ~/.lyra/*.db; these catch stray local copies)
+*.db
+*.sqlite3
+
+# Editors
+.vscode/
+.idea/
+
 # macOS
 .DS_Store
 
