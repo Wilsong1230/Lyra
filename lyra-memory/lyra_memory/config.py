@@ -61,6 +61,23 @@ EMBED_DIM = 384
 # both separate them and merge real duplicates. They dedup by exact name.
 CANDIDATE_DEDUP_THRESHOLD = 0.37
 
+# ── forgetting (step 11) ─────────────────────────────────────────────────────
+# ALL PROVISIONAL, and knowingly so: the sheet puts this step last precisely
+# because it needs a large store to tune against. There is roughly a year of
+# continuous runtime before any of it bites. Tune by READING what got demoted
+# (python -m lyra_memory.store.review_forgetting), not by adjusting numbers
+# until the histogram looks right.
+#
+# Half-life of a baseline-salience atom that is never retrieved again.
+FORGET_BASE_STABILITY_DAYS = 120.0      # PROVISIONAL
+# Salience and access buy stability, not score: a memorable thing does not
+# start out more retrievable, it decays more slowly.
+FORGET_SALIENCE_WEIGHT = 3.0            # PROVISIONAL
+FORGET_ACCESS_WEIGHT = 1.5              # PROVISIONAL
+# Below this an atom leaves the KNN pool. It stays queryable by time, session,
+# entity, and exact id, and it is never deleted.
+FORGET_THRESHOLD = 0.2                  # PROVISIONAL
+
 # ── clustering (step 10) ─────────────────────────────────────────────────────
 # How many times two entities must appear in the same atom before that counts
 # as a relationship rather than a coincidence.

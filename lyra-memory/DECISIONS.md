@@ -79,6 +79,57 @@ constant chosen in later steps is verified for *mechanism* here but is
 provisional and must be re-measured on a machine with the model before the
 retrieval-quality baseline in step 3 means anything.
 
+## Step 11 — demotion applies to every recall path, not only KNN
+
+**Ambiguous:** the sheet says "below threshold → excluded from KNN. Still
+queryable by time, session, entity, or exact id." It does not say what happens
+on the BM25 path.
+
+**Chosen:** a demoted atom is excluded from all three paths that feed the
+recall block — semantic, lexical, and temporal. Structural access is
+untouched: by exact id, by time, by session, by entity, it is all still there,
+and nothing is deleted.
+
+**Found by a failing test, not by reading.** With only KNN filtered, a demoted
+atom was excluded from the semantic path and came straight back through BM25.
+In a small store most of recall arrives that way, so forgetting was very
+nearly inert.
+
+The stated intent settles it: *storage never shrinks; only competition does*.
+BM25 is competition for the same budget as KNN. "Queryable by time, session,
+entity, or exact id" describes structural lookups a caller performs directly,
+not a relevance search that spends the recall budget.
+
+**Reversal:** drop the `retrievability` predicate from `_lexical_hits` and
+`_temporal_hits`. Note what returns: forgetting stops having much effect.
+
+## Step 11 — a finding from the manual read, deliberately not tuned away
+
+**The verification is a manual read**, and it immediately produced something:
+
+```
+[2] r=0.092  age=1100d  salience=0.95  retrieved=0x
+    "the day the vec extension finally loaded"
+```
+
+A first success — precisely the discontinuity the spec says should survive —
+demotes after about three years without retrieval. Salience 0.95 lifts it only
+from 0.00 to 0.09 against a 0.2 threshold, because `FORGET_BASE_STABILITY_DAYS`
+is 120 and the salience multiplier tops out at ~3.9×.
+
+**Chosen: record it, do not tune it.** The sheet is explicit that
+retrievability constants are untunable until the store is large, and fitting
+them to a four-row fixture is the "adjust numbers until the histogram looks
+nice" failure the review tool exists to avoid. The structure looks right —
+salience buys stability multiplicatively — and only the base horizon looks
+short.
+
+**This is the first question to ask when tuning** (MANUAL.md section 8). The
+likely fix is a longer base stability rather than a bigger salience weight,
+since the ratio between vivid and dull is already 3.3×.
+
+**Reversal:** it is one constant, and nothing depends on its current value.
+
 ## Step 5 — the embedding signal is wired and disabled, because it measured worse
 
 **Ambiguous:** the sheet lists segmentation's inputs as "atoms.ts, embeddings"

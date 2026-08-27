@@ -185,7 +185,41 @@ cd lyra-memory
 over-splitting — which is the signal to re-measure and reconsider the default,
 not to delete the test.
 
-## 7. Backup before every cold pass
+## 7. Read what forgetting demoted (step 11 verification)
+
+Step 11's check is "demoted atoms are ones you'd expect". That is a judgement
+about her history, not a property of the arithmetic.
+
+```bash
+cd lyra-memory
+./venv/bin/python -m lyra_memory.store.review_forgetting
+./venv/bin/python -m lyra_memory.store.review_forgetting --survivors
+```
+
+Each row shows age, salience and retrieval count, so a surprising demotion can
+be traced to which input caused it.
+
+**A finding is already on the record, from a four-atom smoke test:**
+
+```
+[2] r=0.092  age=1100d  salience=0.95  retrieved=0x
+    "the day the vec extension finally loaded"
+```
+
+A first success — the exact kind of discontinuity the spec says should survive
+— demotes after roughly three years unretrieved. This was deliberately **not**
+tuned away, because the sheet says these constants need a large store and
+fitting them to four rows is worse than leaving them wrong and labelled.
+
+So the first tuning question is: **is `FORGET_BASE_STABILITY_DAYS` (120) too
+short?** The vivid-to-dull ratio is already 3.3×, so the salience weight is
+probably not the problem; the base horizon probably is. Decide it against real
+data, and read the list before and after.
+
+Nothing here is urgent: there is roughly a year of continuous runtime before
+any of it bites.
+
+## 8. Backup before every cold pass
 
 Hard rule: back up before each cold pass, 30-day retention. Not automated
 here, and deliberately not run against `~/.lyra` from the build:

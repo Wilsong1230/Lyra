@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 
 from lyra_memory.config import (
     COMMITMENT_INJECT_LIMIT,
+    FORGET_THRESHOLD,
     CONTEXT_BUDGETS,
     CONTEXT_TOTAL_BUDGET,
     EMBED_DIM,
@@ -233,7 +234,7 @@ async def _semantic_hits(store, query_vec: bytes, misses: list[str]) -> list[Hit
     alone, a near-empty store confidently returns its nearest garbage.
     """
     async with store.db.execute(
-        "SELECT v.rowid, v.distance, a.text, a.ts, a.speaker"
+        "SELECT v.rowid, v.distance, a.text, a.ts, a.speaker, a.retrievability"
         " FROM vec_atoms v JOIN atoms a ON a.id = v.rowid"
         " WHERE v.embedding MATCH ? AND k = ? ORDER BY v.distance",
         (query_vec, SEMANTIC_FETCH_K),
@@ -241,7 +242,15 @@ async def _semantic_hits(store, query_vec: bytes, misses: list[str]) -> list[Hit
         rows = await cur.fetchall()
 
     hits = []
-    for atom_id, distance, text, ts, speaker in rows:
+    demoted = 0
+    for atom_id, distance, text, ts, speaker, score in rows:
+        # Forgetting is demotion, not deletion: below the threshold an atom
+        # leaves the KNN pool and stays reachable by time, session, entity and
+        # exact id. NULL means the forgetting pass has not run, which is not
+        # the same as being forgotten.
+        if score is not None and score < FORGET_THRESHOLD:
+            demoted += 1
+            continue
         # normalized vectors: cos = 1 - L2²/2
         similarity = 1.0 - (distance * distance) / 2.0
         if similarity < SEMANTIC_SIMILARITY_FLOOR:
@@ -249,14 +258,23 @@ async def _semantic_hits(store, query_vec: bytes, misses: list[str]) -> list[Hit
         hits.append(Hit(atom_id, text, ts, speaker, paths={"semantic"}))
 
     if not hits:
+        detail = f" ({demoted} candidates were below the retrievability floor)" if demoted else ""
         misses.append(
-            f"semantic: nothing above similarity floor {SEMANTIC_SIMILARITY_FLOOR}")
+            f"semantic: nothing above similarity floor {SEMANTIC_SIMILARITY_FLOOR}{detail}")
     return hits
 
 
 async def _lexical_hits(store, query: str, misses: list[str]) -> list[Hit]:
     """FTS5/BM25 — catches repo names, filenames, and proper nouns that
-    embeddings blur into their neighbourhood."""
+    embeddings blur into their neighbourhood.
+
+    Demoted atoms are excluded here too. The sheet says "excluded from KNN",
+    but BM25 is relevance competition just as much as KNN is, and in a small
+    store most of recall comes through this path — so excluding only KNN would
+    make forgetting almost inert. The stated intent is that storage never
+    shrinks and only *competition* does; structural access (by time, session,
+    entity, exact id) is untouched.
+    """
     tokens = [t for t in _WORD_RE.findall(query or "")
               if len(t) > 1 and t.lower() not in _STOPWORDS]
     if not tokens:
@@ -269,8 +287,10 @@ async def _lexical_hits(store, query: str, misses: list[str]) -> list[Hit]:
     async with store.db.execute(
         "SELECT f.rowid, a.text, a.ts, a.speaker FROM atoms_fts f"
         " JOIN atoms a ON a.id = f.rowid"
-        " WHERE atoms_fts MATCH ? ORDER BY bm25(atoms_fts) LIMIT ?",
-        (match, LEXICAL_LIMIT),
+        " WHERE atoms_fts MATCH ?"
+        "   AND (a.retrievability IS NULL OR a.retrievability >= ?)"
+        " ORDER BY bm25(atoms_fts) LIMIT ?",
+        (match, FORGET_THRESHOLD, LEXICAL_LIMIT),
     ) as cur:
         rows = await cur.fetchall()
 
@@ -284,10 +304,16 @@ async def _temporal_hits(store, exclude: set[int]) -> list[Hit]:
 
     Deliberately not part of the KNN contest: recency is its own reason to
     surface, and making it compete on distance means it never wins.
+
+    Demoted atoms are excluded, for the same reason as the lexical path: this
+    feeds the recall block, which is the competition. A caller querying atoms
+    by time directly still sees everything.
     """
     async with store.db.execute(
-        "SELECT id, text, ts, speaker FROM atoms ORDER BY ts DESC LIMIT ?",
-        (TEMPORAL_LIMIT + len(exclude),),
+        "SELECT id, text, ts, speaker FROM atoms"
+        " WHERE retrievability IS NULL OR retrievability >= ?"
+        " ORDER BY ts DESC LIMIT ?",
+        (FORGET_THRESHOLD, TEMPORAL_LIMIT + len(exclude)),
     ) as cur:
         rows = await cur.fetchall()
     return [Hit(r[0], r[1], r[2], r[3], paths={"temporal"})
