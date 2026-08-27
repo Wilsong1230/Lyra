@@ -61,6 +61,14 @@ EMBED_DIM = 384
 # both separate them and merge real duplicates. They dedup by exact name.
 CANDIDATE_DEDUP_THRESHOLD = 0.37
 
+# ── clustering (step 10) ─────────────────────────────────────────────────────
+# How many times two entities must appear in the same atom before that counts
+# as a relationship rather than a coincidence.
+CLUSTER_MIN_COOCCURRENCE = 3            # PROVISIONAL
+# A pair is not a project. Three entities that keep appearing together is the
+# smallest group worth naming.
+CLUSTER_MIN_SIZE = 3                    # PROVISIONAL
+
 # ── facts (step 8) ───────────────────────────────────────────────────────────
 # Confidence by epistemic channel. She should be able to say which: "you told
 # me" and "I read it in your resume" are different states, and a document she
