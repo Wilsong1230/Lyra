@@ -79,6 +79,95 @@ constant chosen in later steps is verified for *mechanism* here but is
 provisional and must be re-measured on a machine with the model before the
 retrieval-quality baseline in step 3 means anything.
 
+## Step 1 (blocking) — instance scope: two columns, one store
+
+**Ambiguous:** the sheet marks this "Unresolved and blocking… resolve before
+step 1". Is `instance` the same column as `environment`? One store or two?
+
+**Chosen, both conservatively:**
+
+*Two columns.* `environment` is where the body was (`cli | shell | physics |
+bns`); `instance` is whose mind this is. The sheet's own read is "probably
+two", and it notes the column is nearly free now and a migration later. Both
+are nullable and land in step 1 unused.
+
+*One store, with `instance` nullable.* `NULL` means shared perception — an
+atom both instances received — and a non-NULL value scopes an atom to one
+mind. Retrieval filters `instance IS NULL OR instance = ?`. Today exactly one
+instance runs and every atom is written with the configured default, so
+behaviour is unchanged.
+
+**Alternative:** separate stores per instance.
+
+**Why this is the conservative direction:** one store splits into two later by
+filter-and-copy, losing nothing. Two stores can never be merged retroactively
+in a way that recovers which atoms were the *same* input — and comparing what
+two minds made of identical input is, per the sheet, arguably the whole point
+of running both. Shared perception also writes once rather than twice, so
+there is no duplicate-atom problem to solve.
+
+**What would need to change to reverse it:** split by `instance`, and decide
+what happens to the `NULL` (shared) atoms — copy them into both stores. The
+retrieval filter is one predicate in one place.
+
+## Step 1 — full schema created up front, not per step
+
+**Ambiguous:** step 1 names only `atoms` + `vec_atoms` + `atoms_fts`, but
+steps 4–11 each need their own tables, and the sheet forbids migration
+scripts ("schema version assertion at boot, not a migration script").
+
+**Chosen:** every table in the sheet's Schema section is created at step 1.
+Later steps fill tables that already exist. Cold columns are nullable and
+unwritten until their pass ships — which is what the sheet already asks for
+with `environment` and `retrievability` ("cheap now, expensive later").
+
+**Alternative:** create each table in the step that first writes it, which
+would mean eight schema changes against a store that has no migration path.
+
+**Reversal:** none needed; unused empty tables cost nothing.
+
+## Step 1 — new store file, old `memory.db` left running
+
+**Ambiguous:** the existing `~/.lyra/memory.db` already has an `atoms` table
+with different columns (`content/type/role/episode_id`). The sheet says
+"Migration: none. Fresh DB."
+
+**Chosen:** the new store is a separate file, `~/.lyra/store.db`, built by a
+new `lyra_memory.store` package. The old four-layer system keeps its database
+and keeps working; nothing is dropped, renamed, or rewritten.
+
+**Alternative:** reusing `memory.db` and renaming the old table.
+
+**Reversal:** point `STORE_PATH` wherever you like; the two stores share no
+tables.
+
+## Step 1 — `runs` in its own file
+
+**Chosen:** `~/.lyra/runs.db`, per "runs — separate file. bulk. prunable."
+`atoms.run_id` is a plain integer pointer with no foreign key, since SQLite
+cannot enforce one across files. Pruning `runs` therefore leaves atoms intact
+and pointing at a row that is gone, which is the intended asymmetry: the atom
+is the event, the run is the bulk.
+
+## Step 1 — vocabulary enforcement: CHECK on speaker, Python on source
+
+**Ambiguous:** the sheet gives closed vocabularies for `speaker`, `source`,
+and `environment` but does not say whether they are enforced.
+
+**Chosen:** a CHECK constraint on `speaker` (three values, stable, and both
+per-person scoping and the down-weighting rule depend on it); loud Python
+validation against named constants for `source` and `environment`.
+
+**Why the split:** `source` gates a safety boundary — `sandbox_read` is
+excluded from dream input so a file on disk cannot write to her identity — so
+a typo'd source must fail rather than quietly store. But `environment` and
+`source` are both expected to grow when embodiment lands, and a CHECK
+constraint on a growing vocabulary is exactly the migration the schema policy
+rules out. Constants are a one-line change; a CHECK is a table rebuild.
+
+**Reversal:** move the sets into CHECK constraints once embodiment has settled
+the vocabulary.
+
 ## Step 0.5 — what "evidence" is, and the missing-evidence fallback
 
 **Ambiguous:** "embed description + evidence, not the label" does not say what

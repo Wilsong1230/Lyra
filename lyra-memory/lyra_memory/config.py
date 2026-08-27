@@ -3,6 +3,15 @@ from pathlib import Path
 
 DB_PATH = Path.home() / ".lyra" / "memory.db"
 
+# The rebuilt store (turn-as-substrate). A separate file from memory.db: the
+# schemas share table names but not columns, and the sheet is explicit that
+# there is no migration — fresh DB. The old four-layer system keeps running
+# against DB_PATH untouched.
+STORE_PATH = Path.home() / ".lyra" / "store.db"
+# Bulk: stdout, telemetry, frames, file contents. Separate file because it is
+# prunable and the substrate is not.
+RUNS_PATH = Path.home() / ".lyra" / "runs.db"
+
 DREAM_MODEL = "openai/gpt-oss-120b:free"
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 
