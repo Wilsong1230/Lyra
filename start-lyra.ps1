@@ -31,10 +31,20 @@ foreach ($name in @("OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "CEREBRAS_API_KEY
     }
 }
 
-$python = Join-Path $PSScriptRoot "lyra_ai\.venv\Scripts\python.exe"
-if (-not (Test-Path $python)) {
-    Write-Error "No venv at lyra_ai\.venv. Build it first:`n  cd lyra_ai`n  python -m venv .venv`n  .venv\Scripts\python.exe -m pip install -e ../lyra-memory -e `".[dev]`" httpx"
+# bootstrap.sh builds lyra_ai\venv; the standalone black-box layout this script
+# came from built lyra_ai\.venv by hand. Accept either, and remember which one
+# so the -Chat branch below launches from the same interpreter.
+$venvDir = $null
+foreach ($candidate in @("venv", ".venv")) {
+    if (Test-Path (Join-Path $PSScriptRoot "lyra_ai\$candidate\Scripts\python.exe")) {
+        $venvDir = $candidate
+        break
+    }
 }
+if (-not $venvDir) {
+    Write-Error "No venv under lyra_ai. Build it first:`n  ./bootstrap.sh    # from Git Bash; builds every service"
+}
+$python = Join-Path $PSScriptRoot "lyra_ai\$venvDir\Scripts\python.exe"
 
 # Ollama is the only backend that needs no credential. Start it if it is down.
 $ollamaUp = $false
@@ -69,7 +79,7 @@ if ($Chat) {
     # resolves to llama3.2:latest and is not pulled here. llama3:latest rather
     # than llama3.2:3b because the 3B cannot hold LAYER1_FACTS - it denies being
     # Lyra and denies having internal states, both of which the prompt forbids.
-    & (Join-Path $PSScriptRoot "lyra_ai\.venv\Scripts\lyra.exe") --backend ollama --model $Model
+    & (Join-Path $PSScriptRoot "lyra_ai\$venvDir\Scripts\lyra.exe") --backend ollama --model $Model
 } else {
     Set-Location (Join-Path $PSScriptRoot "lyra_ai")
     & $python -m lyra_core

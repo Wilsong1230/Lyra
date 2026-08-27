@@ -4,17 +4,21 @@
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
-# Prefer the shared lyra_ai venv — that is the layout README step 2 produces and
-# the one that is actually built on this machine. Fall back to a local venv so
-# this script still works from a bare checkout, matching start.sh.
-$shared = Join-Path $PSScriptRoot "..\lyra_ai\.venv\Scripts\python.exe"
-if (Test-Path $shared) {
-    $python = $shared
-} else {
-    if (-not (Test-Path "venv")) {
-        python -m venv venv
-        & ".\venv\Scripts\python.exe" -m pip install -e ".[dev]"
+# bootstrap.sh gives this service its own venv, so prefer a local one; fall back
+# to the lyra_ai venv, which is the single shared interpreter the standalone
+# black-box layout produced. Either directory name may be in use, so probe all
+# four before building one, matching start.sh.
+$python = $null
+foreach ($dir in @("venv", ".venv", "..\lyra_ai\venv", "..\lyra_ai\.venv")) {
+    $candidate = Join-Path $PSScriptRoot "$dir\Scripts\python.exe"
+    if (Test-Path $candidate) {
+        $python = $candidate
+        break
     }
+}
+if (-not $python) {
+    python -m venv venv
+    & ".\venv\Scripts\python.exe" -m pip install -e ".[dev]"
     $python = ".\venv\Scripts\python.exe"
 }
 
