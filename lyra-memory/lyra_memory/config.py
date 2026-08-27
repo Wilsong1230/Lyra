@@ -61,6 +61,9 @@ EMBED_DIM = 384
 # both separate them and merge real duplicates. They dedup by exact name.
 CANDIDATE_DEDUP_THRESHOLD = 0.37
 
+# ── entities (step 7) ────────────────────────────────────────────────────────
+ENTITY_BATCH_SIZE = 20
+
 # ── salience (step 6) ────────────────────────────────────────────────────────
 # Nonzero: atoms with no measured outcome must still be rankable against each
 # other, or the forgetting pass has nothing to order them by.
