@@ -92,25 +92,33 @@ class MemoryBridge:
         self.loop = None
 
     def add_turn(self, role: str, content: str) -> None:
-        """Observe a conversation turn. Fire-and-forget; never blocks or raises."""
+        """Observe a conversation turn.
+
+        Dispatched to the memory loop and WAITED ON: a fire-and-forget append
+        whose exception is never retrieved is a dropped turn that reports
+        success, which is the failure the loud policy exists to prevent.
+        """
         if not self._started or self.loop is None or self.memory is None:
             return
         asyncio.run_coroutine_threadsafe(
             self.memory.add_turn(role, content), self.loop
-        )
+        ).result(timeout=10)
 
     def get_system_prompt(self) -> str:
         """Return the current system prompt with live persona context.
 
-        Falls back to DEFAULT_SYSTEM on timeout or if memory is not started.
+        Returns DEFAULT_SYSTEM only when memory was never started. Once it IS
+        started, an assembly failure propagates: spec "Failure policy" names
+        build_context, and a bridge that silently serves the bare prompt is
+        exactly the fail-open that made a broken store indistinguishable from
+        an empty one.
         """
         if not self._started or self.loop is None or self.memory is None:
             return DEFAULT_SYSTEM
         future = asyncio.run_coroutine_threadsafe(
             retrieval.build_system_prompt(self.memory), self.loop
         )
-        try:
-            return future.result(timeout=1)
-        except Exception as exc:
-            logger.debug("MemoryBridge: get_system_prompt fallback (%s)", exc)
-            return DEFAULT_SYSTEM
+        # Synthesis adds one LLM call to assembly, so the budget is no longer
+        # sub-second. It falls back to concatenation on its own rather than
+        # blocking a turn.
+        return future.result(timeout=20)

@@ -68,10 +68,11 @@ class Assistant:
     async def _get_system(self, query: str | None = None) -> str:
         parts = [self.system]
 
-        try:
-            context = await retrieval.build_context(self._core.memory, query=query)
-        except Exception:
-            context = ""
+        # NO try/except. Spec "Failure policy": memory failures are loud, and
+        # build_context is named in it. Swallowing the exception here turns a
+        # broken store into a merely terse assistant, which is the one failure
+        # mode that cannot be seen from a transcript.
+        context = await retrieval.build_context(self._core.memory, query=query)
         if context:
             parts.append(context)
 

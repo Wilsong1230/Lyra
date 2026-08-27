@@ -13,6 +13,13 @@ _SENSE_IMPORTANCE: float = 0.15
 
 
 class WorkingMemory:
+    """The hot deque. In-process, bounded, not the record.
+
+    `atoms` is the record. This buffer exists so the reply path has the last
+    few turns verbatim without a query, and so the dream trigger has something
+    to count.
+    """
+
     def __init__(self) -> None:
         self._deque: deque[WorkingMemoryItem] = deque(maxlen=20)
         self._undreamed: list[WorkingMemoryItem] = []
@@ -38,9 +45,14 @@ class WorkingMemory:
         print(f"[{datetime.now().isoformat()}] [WorkingMemory] +{item.type} score={item.score:.2f} role={item.role!r}")
         return item
 
-    # The add_* methods return the item they created so the caller can persist
-    # it as an atom carrying the salience computed HERE, at write time. Callers
-    # that only want the in-memory buffer can ignore the return value.
+    # The add_* methods return the item they created; MemorySystem appends the
+    # corresponding atom separately.
+    #
+    # The score below is NOT the atom's salience. Salience is a COLD, revisable
+    # pass (lyra_memory.outcomes.SalienceScorer) because what mattered about a
+    # moment usually is not knowable at that moment — it depends on how things
+    # turned out. This score only orders the in-process deque and decides what
+    # the dream trigger counts.
 
     def add_turn(self, role: str, content: str) -> WorkingMemoryItem:
         self._last_turn_ts = time.time()

@@ -97,18 +97,23 @@ def _seed_long_value_db(path: Path) -> None:
 
 
 def _seed_facts(path: Path, affect: dict, key: str = "affect_state") -> None:
-    """Create the facts table (matching lyra_memory.db's schema) and insert
-    a JSON-serialized row, mirroring StructuredState.set_fact()."""
+    """Create the kv_state table (matching lyra_memory.db's schema) and insert
+    a JSON-serialized row, mirroring StructuredState.set_fact().
+
+    Affect snapshots live in `kv_state`, NOT in `facts`. `facts` is the
+    subject-keyed permanent store with provenance back to an atom; using it as
+    a KV bag is what let rows exist that no experience produced.
+    """
     conn = sqlite3.connect(path)
     conn.executescript("""
-        CREATE TABLE IF NOT EXISTS facts (
+        CREATE TABLE IF NOT EXISTS kv_state (
             key        TEXT PRIMARY KEY,
             value      TEXT NOT NULL,
             updated_at REAL NOT NULL
         );
     """)
     conn.execute(
-        "INSERT INTO facts (key, value, updated_at) VALUES (?, ?, ?)",
+        "INSERT INTO kv_state (key, value, updated_at) VALUES (?, ?, ?)",
         (key, json.dumps(affect), time.time()),
     )
     conn.commit()
@@ -237,7 +242,7 @@ def test_affect_view_is_read_only(tmp_path):
 
     def _read_fact():
         conn = sqlite3.connect(db)
-        row = conn.execute("SELECT value, updated_at FROM facts WHERE key='affect_state'").fetchone()
+        row = conn.execute("SELECT value, updated_at FROM kv_state WHERE key='affect_state'").fetchone()
         conn.close()
         return row
 

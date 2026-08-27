@@ -16,7 +16,7 @@ Run `./bootstrap.sh` from the repo root to create every venv on a fresh machine.
 | lyra-vision | 8003 | `lyra-vision/` | Screen/webcam capture → Gemini or OpenRouter multimodal API |
 | lyra-mcp | stdio | `lyra-mcp/` | MCP server aggregating all four services for Claude Desktop |
 | lyra_ai | — | `lyra_ai/` | Core CLI (`lyra`); talks to all services; installable Python package |
-| lyra-memory | — | `lyra-memory/` | Four-layer memory: working, episodic, structured state, identity |
+| lyra-memory | — | `lyra-memory/` | Turn-substrate memory: atoms, cold passes, retrieval assembly, identity |
 
 ## Commands
 
@@ -63,6 +63,37 @@ The assistant uses an in-band tool protocol (no native function calling). When t
 
 ### Memory (`lyra_ai/lyra/memory.py`)
 `ConversationMemory` persists turns to SQLite at `~/.lyra/history.db`. Sessions are UUID strings. History is capped at 40 turns per retrieval.
+
+### Long-term memory (`lyra-memory/`)
+See `lyra-memory/MEMORY_SPEC.md` — it is the contract, not a description, and
+the code is organised to match its build order.
+
+**Invariant: hot path appends, cold passes enrich, nothing is ever replaced.**
+`atoms` is the substrate and is permanent; `session_id`, `salience`,
+`outcome_id`, `retrievability` are all nullable, batch-written, and
+re-derivable, so a crashed cold pass leaves the store correct.
+
+- **Hot path** (`atoms.py`): embed, then three inserts in one transaction —
+  `atoms`, `vec_atoms`, `atoms_fts`. No enrichment. Budget <50ms.
+- **Cold passes**: `sessions.py` (segmentation + `gap_since_prev`),
+  `entities.py`, `outcomes.py` (salience, revisable), `dreaming_loop.py`
+  (dream + facts + commitments). Each independently testable against a frozen
+  `atoms` table. Backed up before every run; 30-day retention.
+- **Retrieval** (`retrieval.py`): pinned block order — facts, traits,
+  commitments, recall, recent — with BYTE budgets, not `k`. Three paths
+  (vec KNN with a similarity floor, FTS5/BM25, plain recency in a separate
+  pool), merged and deduped, with her own turns down-weighted. `context_log`
+  records what was injected and, equally important, the **misses**.
+- **Failure policy is LOUD.** No `try/except` around ingest or `build_context`;
+  the schema version is asserted at startup. Fail-open makes a broken store and
+  an empty store behaviourally identical.
+- **`facts` is not a KV store.** It is subject-keyed, permanent and
+  correctable, with provenance back to an atom. Scratch state (affect
+  snapshots) lives in `kv_state`.
+- **`query_memory`** (`introspect.py`) exposes content, never mechanism — no
+  thresholds, evidence counts, or distance-to-promotion. Do not add prompt
+  language telling her when to use it; whether she reaches for it is the
+  measurement.
 
 ### MCP server (`lyra-mcp/mcp_server.py`)
 Wraps all four services as MCP tools: `set_emotion`, `get_state`, `speak`, `transcribe`, `list_voices`, `lyra_see`. Connect to Claude Desktop via stdio transport.

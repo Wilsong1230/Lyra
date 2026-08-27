@@ -166,6 +166,11 @@ class CognitiveCore:
         self._selector = selector if selector is not None else ActionSelector()
         self._memory = memory if memory is not None else MemorySystem()
 
+        # Set when she acts; read when the attempt resolves. Competence is
+        # per-environment — "reaching works" transfers between none of them.
+        self._last_intent_atom_id: int | None = None
+        self._environment: str = "cli"
+
         self._consolidator_injected = consolidator is not None
         self._consolidator = consolidator if consolidator is not None else OutcomeConsolidator(
             pool=getattr(self._memory, "candidate_pool", None),
@@ -207,16 +212,22 @@ class CognitiveCore:
 
     # ── Ingest ───────────────────────────────────────────────────────────────
 
-    async def _ingest_sensory(self, obs: Observation) -> None:
-        try:
-            if obs.source == "conversation":
-                await self._memory.add_turn("user", obs.content)
-            elif obs.source == "lyra":
-                await self._memory.add_turn("lyra", obs.content)
-            else:
-                await self._memory.add_observation(obs.content, source=obs.source)
-        except RuntimeError:
-            pass
+    async def _ingest_sensory(self, obs: Observation) -> int | None:
+        """Write one perceived event to the substrate. Returns the atom id.
+
+        NO try/except. A swallowed ingest failure makes a broken store and an
+        empty store behaviourally identical — the exact condition that hid 653
+        turns writing 0 episodes with no symptom anywhere in the transcripts.
+        If this raises, the run is wrong and should say so.
+
+        Returns None when the observation is telemetry rather than an event
+        (ambient, wakeword): those reach working memory but not `atoms`.
+        """
+        if obs.source == "conversation":
+            return await self._memory.add_turn("user", obs.content)
+        if obs.source == "lyra":
+            return await self._memory.add_turn("lyra", obs.content)
+        return await self._memory.add_observation(obs.content, source=obs.source)
 
     async def _ingest_outcome(self, obs: Observation) -> None:
         if obs.predicted is None or obs.actual is None:
@@ -236,6 +247,19 @@ class CognitiveCore:
             affect=self._affect.state,
             drive="boredom" if success else "relational",
         )
+        # Persist the outcome itself, pointing at the atom whose action produced
+        # it. Previously only the derived trait evidence survived: the store
+        # could say a trait had fifteen units of evidence and not which fifteen
+        # moments they were, which leaves salience nothing to score against and
+        # the trajectory unreconstructable.
+        if getattr(self._memory, "outcomes", None) is not None:
+            await self._memory.record_outcome(
+                obs.predicted,
+                obs.actual,
+                intent_atom_id=self._last_intent_atom_id,
+                valence=self._affect.state.valence,
+                environment=self._environment,
+            )
         if getattr(self._memory, "candidate_pool", None) is not None:
             await self._consolidator.record_outcome(outcome)
 
@@ -284,7 +308,13 @@ class CognitiveCore:
 
         for obs in observations:
             if obs.kind == ObservationKind.sensory:
-                await self._ingest_sensory(obs)
+                atom_id = await self._ingest_sensory(obs)
+                # The atom an outcome belongs to is the one that BEGAN the
+                # attempt. The unit is the attempt, not the command: ten failed
+                # test runs then a pass is one success, and scoring per command
+                # floors her mood permanently through any debugging session.
+                if atom_id is not None and obs.source == "lyra":
+                    self._last_intent_atom_id = atom_id
             elif obs.kind == ObservationKind.action_outcome:
                 await self._ingest_outcome(obs)
 

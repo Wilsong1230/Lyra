@@ -3,13 +3,11 @@ from __future__ import annotations
 import asyncio
 import datetime
 import os
-import sqlite3
-from pathlib import Path
 import httpx
 from mcp.server.fastmcp import FastMCP
-from lyra_memory.retrieval import search_episodes as _search_episodes_async
+from lyra_memory.retrieval import search_atoms as _search_atoms_async
+from lyra_memory.retrieval import get_facts as _get_facts_async
 
-_DB_PATH = Path.home() / ".lyra" / "memory.db"
 
 
 def _log(msg: str) -> None:
@@ -108,30 +106,23 @@ def lyra_see(source: str = "screen", prompt: str = "Describe what you see.") -> 
 
 
 @mcp.tool()
-def search_episodes(query: str, limit: int = 5) -> list[dict]:
-    """Search Lyra's long-term episodic memory using semantic similarity. Use natural language — paraphrased or conceptually related queries will find relevant episodes even without exact keyword overlap."""
-    _log(f"search_episodes query={query!r} limit={limit}")
+def search_memory(query: str, limit: int = 5) -> list[dict]:
+    """Search Lyra's long-term memory. Each result is one turn or observation, not a summary. Combines semantic similarity with keyword matching, so paraphrases and exact tokens (repo names, filenames) both find their target."""
+    _log(f"search_memory query={query!r} limit={limit}")
     try:
-        return asyncio.run(_search_episodes_async(query, limit=limit))
+        return asyncio.run(_search_atoms_async(query, limit=limit))
     except Exception as e:
         return [{"error": str(e)}]
 
 
 @mcp.tool()
-def get_fact(subject_key: str) -> dict | None:
-    """Look up a specific hard fact from Lyra's structured state. Use this when you need a precise value — API configs, user preferences, active project details, or any stored system state. Requires the exact key string. Returns None if key does not exist."""
-    _log(f"get_fact key={subject_key!r}")
+def get_facts(subject: str) -> list[dict]:
+    """Look up what Lyra knows about a subject. Facts are exact, permanent and matched on the subject key rather than by similarity. Returns every current fact for that subject, newest first — a suspected contradiction leaves both rows live rather than picking one, so more than one answer is a legitimate result."""
+    _log(f"get_facts subject={subject!r}")
     try:
-        with sqlite3.connect(_DB_PATH) as conn:
-            row = conn.execute(
-                "SELECT key, value, updated_at FROM facts WHERE key = ?",
-                (subject_key,),
-            ).fetchone()
-        if row is None:
-            return None
-        return {"key": row[0], "value": row[1], "updated_at": row[2]}
-    except sqlite3.Error as e:
-        return {"error": str(e)}
+        return asyncio.run(_get_facts_async(subject))
+    except Exception as e:
+        return [{"error": str(e)}]
 
 
 if __name__ == "__main__":

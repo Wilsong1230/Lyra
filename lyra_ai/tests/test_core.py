@@ -12,6 +12,8 @@ import time
 
 import pytest
 
+from tests.conftest import NullMemory
+
 from lyra_core.interface import (
     AffectState,
     AffectVector,
@@ -164,7 +166,7 @@ def test_affect_state_mood_and_temperament_accept_affect_vector():
 
 def test_tick_returns_correct_types():
     async def _run():
-        core = CognitiveCore()
+        core = CognitiveCore(memory=NullMemory())
         obs = Observation(kind=ObservationKind.sensory, source="test", content="x")
         return await core.tick([obs])
 
@@ -178,7 +180,7 @@ def test_tick_with_no_observations_emits_look_intent_from_boredom():
     frustration from one tick's worth of idle drift, so the selector emits
     a look intent."""
     async def _run():
-        core = CognitiveCore()
+        core = CognitiveCore(memory=NullMemory())
         return await core.tick([])
 
     intents, _ = asyncio.run(_run())
@@ -190,7 +192,7 @@ def test_tick_with_no_observations_affect_stays_near_neutral():
     """One idle tick nudges affect slightly negative (boredom's own push) but
     stays bounded — not the exact 0.0 of the old stub, but small."""
     async def _run():
-        core = CognitiveCore()
+        core = CognitiveCore(memory=NullMemory())
         return await core.tick([])
 
     _, affect = asyncio.run(_run())
@@ -215,8 +217,8 @@ def test_tick_observations_without_signal_match_empty_tick():
     ]
 
     async def _run():
-        with_obs = await CognitiveCore().tick(observations)
-        without_obs = await CognitiveCore().tick([])
+        with_obs = await CognitiveCore(memory=NullMemory()).tick(observations)
+        without_obs = await CognitiveCore(memory=NullMemory()).tick([])
         return with_obs, without_obs
 
     (intents_a, affect_a), (intents_b, affect_b) = asyncio.run(_run())
@@ -280,13 +282,13 @@ def test_ingest_routes_other_sources_to_add_observation_with_source():
 # ── CognitiveCore.introspect() ────────────────────────────────────────────────
 
 def test_introspect_returns_affect_state():
-    core = CognitiveCore()
+    core = CognitiveCore(memory=NullMemory())
     result = core.introspect()
     assert isinstance(result, AffectState)
 
 
 def test_introspect_returns_neutral_affect_before_any_tick():
-    core = CognitiveCore()
+    core = CognitiveCore(memory=NullMemory())
     state = core.introspect()
     assert state.valence == pytest.approx(0.0)
     assert state.arousal == pytest.approx(0.0)
@@ -300,7 +302,7 @@ def test_introspect_is_non_mutating():
     affect) -> introspect (must match the tick's result exactly) -> introspect
     again (must be idempotent)."""
     async def _run():
-        core = CognitiveCore()
+        core = CognitiveCore(memory=NullMemory())
         before = core.introspect()
         _, after_tick = await core.tick([])
         after = core.introspect()
@@ -327,7 +329,7 @@ from lyra_core.harness import Harness, Script, TickRecord, failures, outcome, se
 
 def test_run_produces_one_record_per_tick():
     async def _run():
-        h = Harness()
+        h = Harness(core=CognitiveCore(memory=NullMemory()))
         script: Script = [
             [sensory("frame 0")],
             [sensory("frame 1"), sensory("frame 2")],
@@ -341,7 +343,7 @@ def test_run_produces_one_record_per_tick():
 
 def test_tick_records_have_sequential_indices():
     async def _run():
-        h = Harness()
+        h = Harness(core=CognitiveCore(memory=NullMemory()))
         return await h.run([[sensory("a")], [sensory("b")], [sensory("c")]])
 
     trace = asyncio.run(_run())
@@ -354,7 +356,7 @@ def test_tick_record_observations_match_input():
     script: Script = [[obs0], [obs1]]
 
     async def _run():
-        h = Harness()
+        h = Harness(core=CognitiveCore(memory=NullMemory()))
         return await h.run(script)
 
     trace = asyncio.run(_run())
@@ -366,7 +368,7 @@ def test_tick_record_intents_are_allowed_kinds():
     """Every intent the live core proposes must be within ALLOWED_KINDS —
     the selector never has a path to a blocked kind."""
     async def _run():
-        h = Harness()
+        h = Harness(core=CognitiveCore(memory=NullMemory()))
         return await h.run([[sensory("x")], [sensory("y")]])
 
     trace = asyncio.run(_run())
@@ -377,7 +379,7 @@ def test_tick_record_intents_are_allowed_kinds():
 
 def test_tick_record_affect_is_bounded_and_typed():
     async def _run():
-        h = Harness()
+        h = Harness(core=CognitiveCore(memory=NullMemory()))
         return await h.run([[sensory("x")], [sensory("y")], []])
 
     trace = asyncio.run(_run())
@@ -389,24 +391,30 @@ def test_tick_record_affect_is_bounded_and_typed():
 
 def test_run_empty_script_returns_empty_trace():
     async def _run():
-        return await Harness().run([])
+        return await Harness(core=CognitiveCore(memory=NullMemory())).run([])
 
     assert asyncio.run(_run()) == []
 
 
 def test_harness_constructs_own_core_when_none_given():
-    """Harness() with no argument must build its own CognitiveCore and run."""
+    """Harness() with no argument must build its own CognitiveCore and run.
+
+    Driven with an empty batch: the assertion is about construction, and a
+    self-constructed core owns an unstarted MemorySystem, which now refuses
+    ingest loudly rather than discarding turns.
+    """
     async def _run():
         h = Harness()
-        return await h.run([[sensory("self-constructed core")]])
+        return await h.run([[]])
 
     trace = asyncio.run(_run())
     assert len(trace) == 1
+    assert isinstance(h_core_kind := trace[0].affect.valence, float)
 
 
 def test_harness_accepts_injected_core():
     async def _run():
-        core = CognitiveCore()
+        core = CognitiveCore(memory=NullMemory())
         h = Harness(core=core)
         return await h.run([[sensory("injected")]])
 
@@ -439,20 +447,6 @@ class _RecordingPool:
         self.calls.append((trait_name, trait_value, category))
 
 
-class _FakeMemory:
-    """Minimal memory stand-in: only candidate_pool is populated.
-
-    working_memory/identity_engine stay None, so ingest is a no-op and no
-    bias is computed — isolates the affect/drive/selector/consolidator loop.
-    """
-
-    def __init__(self, pool: _RecordingPool) -> None:
-        self.candidate_pool = pool
-        self.working_memory = None
-        self.identity_engine = None
-        self.structured_state = None
-
-
 def test_failures_full_loop_accumulates_frustration_overrides_drive_and_records_outcomes():
     """The live loop, end to end, against failures(10):
       - frustration accumulates: valence trends increasingly negative each tick
@@ -461,7 +455,7 @@ def test_failures_full_loop_accumulates_frustration_overrides_drive_and_records_
       - each failure outcome is recorded into the candidate pool
     """
     pool = _RecordingPool()
-    core = CognitiveCore(memory=_FakeMemory(pool))
+    core = CognitiveCore(memory=NullMemory(pool))
 
     async def _run():
         h = Harness(core=core)
@@ -497,7 +491,7 @@ def test_tick_intents_all_pass_gate_check():
     """Gate pass-through: tick()'s output already satisfies the gate — every
     intent it returns is in ALLOWED_KINDS."""
     async def _run():
-        core = CognitiveCore()
+        core = CognitiveCore(memory=NullMemory())
         return await core.tick([])
 
     intents, affect = asyncio.run(_run())
@@ -507,7 +501,7 @@ def test_tick_intents_all_pass_gate_check():
 
 
 def test_gate_intents_passes_allowed_kinds_through():
-    core = CognitiveCore()
+    core = CognitiveCore(memory=NullMemory())
     speak = Intent(kind=IntentKind.speak, payload={"text": "hello"})
     noop = Intent(kind=IntentKind.noop, payload={})
     result = core._gate_intents([speak, noop])
@@ -515,13 +509,13 @@ def test_gate_intents_passes_allowed_kinds_through():
 
 
 def test_gate_intents_drops_blocked_kind():
-    core = CognitiveCore()
+    core = CognitiveCore(memory=NullMemory())
     research = Intent(kind=IntentKind.research, payload={})
     assert core._gate_intents([research]) == []
 
 
 def test_gate_intents_mixed_list_keeps_allowed_drops_blocked():
-    core = CognitiveCore()
+    core = CognitiveCore(memory=NullMemory())
     speak = Intent(kind=IntentKind.speak, payload={"text": "hi"})
     research = Intent(kind=IntentKind.research, payload={})
     noop = Intent(kind=IntentKind.noop, payload={})
@@ -530,7 +524,7 @@ def test_gate_intents_mixed_list_keeps_allowed_drops_blocked():
 
 
 def test_gate_intents_logs_blocked_intent(capsys):
-    core = CognitiveCore()
+    core = CognitiveCore(memory=NullMemory())
     research = Intent(kind=IntentKind.research, payload={})
     core._gate_intents([research])
     captured = capsys.readouterr()
@@ -539,7 +533,7 @@ def test_gate_intents_logs_blocked_intent(capsys):
 
 
 def test_gate_intents_allowed_intent_produces_no_log(capsys):
-    core = CognitiveCore()
+    core = CognitiveCore(memory=NullMemory())
     speak = Intent(kind=IntentKind.speak, payload={"text": "hi"})
     core._gate_intents([speak])
     captured = capsys.readouterr()
@@ -548,7 +542,7 @@ def test_gate_intents_allowed_intent_produces_no_log(capsys):
 
 def test_default_gate_blocks_research():
     """Safe-by-default: no-arg CognitiveCore uses a real HarmGate and drops research."""
-    core = CognitiveCore()
+    core = CognitiveCore(memory=NullMemory())
     research = Intent(kind=IntentKind.research, payload={})
     assert core._gate_intents([research]) == []
 
@@ -579,7 +573,7 @@ def test_injected_gate_that_allows_all_passes_everything_through():
 
 def test_introspect_unaffected_by_gate_wiring():
     """introspect() is read-only; gate must not be involved."""
-    core = CognitiveCore()
+    core = CognitiveCore(memory=NullMemory())
     state = core.introspect()
     assert state.valence == pytest.approx(0.0)
     assert state.arousal == pytest.approx(0.0)
