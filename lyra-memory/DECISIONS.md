@@ -79,6 +79,67 @@ constant chosen in later steps is verified for *mechanism* here but is
 provisional and must be re-measured on a machine with the model before the
 retrieval-quality baseline in step 3 means anything.
 
+## Step 0.5 — what "evidence" is, and the missing-evidence fallback
+
+**Ambiguous:** "embed description + evidence, not the label" does not say what
+`evidence` is. The `candidates` table had no evidence text — only an
+`evidence_count`. Nor does it say what to embed when no evidence exists.
+
+**Chosen:** evidence is the concrete observation behind the claim, supplied
+per-observation by the dream pass (the obs prompt now asks for it: "quote or
+paraphrase what happened, not the pattern itself"), persisted in a new
+nullable `candidates.evidence_text`. When it is absent, `_embedding_text()`
+returns the description alone — exactly the previous behaviour.
+
+**Alternative:** falling back to the dream text. Rejected, and this matters:
+the dream text is *identical* for every observation extracted from one dream,
+so it would pull unrelated candidates from the same batch toward each other —
+manufacturing merges, which is the expensive direction of the error (see
+"asymmetry — tune conservative" in the spec).
+
+**Reversal:** the column is nullable and the helper is one function; dropping
+evidence from the embedded text restores step-0.5-minus behaviour without a
+migration.
+
+## Step 0.5 — cluster vector is a running centroid, not the first member
+
+**Ambiguous:** not specified. On a merge, does the stored vector stay as the
+first member's, or move?
+
+**Chosen:** the stored vector becomes the normalized running mean of the
+cluster's members. With a first-member representative, the same observations
+arriving in a different order produce a different pool — insertion order
+becomes load-bearing, which is not a property anyone chose.
+
+**Alternative:** keep the first vector (previous behaviour), or re-embed the
+concatenation of all members (unbounded text growth).
+
+**Reversal:** delete `_merge_centroid` and stop the `UPDATE vec_candidates`;
+existing centroids stay valid vectors either way.
+
+## Step 0.5 — existing pool is NOT re-clustered automatically
+
+**Ambiguous:** the sheet's verification target ("the 4 `self_*` labels
+collapse to 1") describes the *existing* 70-candidate pool in `~/.lyra`, but
+re-clustering it means deleting and rewriting every candidate row.
+
+**Chosen:** the schema migration is additive only (`ALTER TABLE ADD COLUMN
+evidence_text`). Re-clustering the live pool is written up in MANUAL.md as a
+manual step, not run. Two reasons: the instruction not to run destructive
+commands against `~/.lyra`, and the standing rule that nothing touching the
+store ships same-session.
+
+**Alternative:** a marker-guarded destructive re-cluster migration, matching
+the existing `_migrate_candidate_vectors` pattern.
+
+**Reversal:** run the MANUAL.md script, or promote it to a marker-guarded
+migration once it has been reviewed against a backup.
+
+**Note:** the verification target therefore has *not* been observed against
+the real pool — it is verified here against a constructed four-label fixture,
+mechanically under the offline stand-in and semantically under real MiniLM
+(skipped in this environment). Both remain to be confirmed on the real store.
+
 ## Step 0 — integrity assertion runs after every consolidate
 
 **Ambiguous:** "every trait mutation has a history row — 100%, asserted"
