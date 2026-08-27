@@ -50,6 +50,24 @@ CREATE TABLE IF NOT EXISTS traits (
     evidence_count INTEGER NOT NULL,
     updated_at     REAL NOT NULL
 );
+-- Append-only. Rows are never updated or deleted. `traits` is a materialized
+-- view of the latest state; this table is the source of truth, and a trait
+-- whose current value has no matching history row means something wrote
+-- outside IdentityEngine (see assert_trait_history_integrity).
+CREATE TABLE IF NOT EXISTS trait_history (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts             REAL NOT NULL,
+    trait_id       INTEGER NOT NULL REFERENCES traits(id),
+    trait_label    TEXT NOT NULL,
+    event          TEXT NOT NULL,       -- promoted | confidence_change | tier_change | decayed | retired
+    conf_before    REAL,
+    conf_after     REAL,
+    tier_before    TEXT,
+    tier_after     TEXT,
+    evidence_count INTEGER NOT NULL,
+    dream_id       INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_trait_history_trait ON trait_history(trait_id);
 """
 
 _CREATE_VEC_SQL = f"""
