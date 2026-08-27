@@ -61,6 +61,22 @@ EMBED_DIM = 384
 # both separate them and merge real duplicates. They dedup by exact name.
 CANDIDATE_DEDUP_THRESHOLD = 0.37
 
+# ── segmentation (step 5) ────────────────────────────────────────────────────
+# Time is the decisive signal. 30 minutes: long enough that a mid-conversation
+# pause (a meal, a meeting) does not shred one session into three, short enough
+# that two genuinely separate sittings do not merge. The labeled set contains a
+# 22-minute lunch pause specifically to hold this line.
+SESSION_GAP_SECONDS = 1800
+# A semantic shift can corroborate a smaller gap, but never splits on its own:
+# a topic change is not a session change. Both signals together are evidence.
+SESSION_SOFT_GAP_SECONDS = 600
+SESSION_SHIFT_COSINE = 0.25             # PROVISIONAL — untuned against real MiniLM
+# OFF by default because it was measured and it made segmentation worse:
+# time-only scored precision 1.00 / recall 1.00 against the hand-labeled set,
+# time+embeddings 0.89 / 1.00. See SegmentationPass for why the failure is
+# structural rather than a property of a particular embedder.
+SEGMENTATION_USE_EMBEDDINGS = False
+
 # ── dream (step 4) ───────────────────────────────────────────────────────────
 # Dream target length is an Open item on the sheet. Chosen conservatively:
 # short. The old essay averaged ~3,000 characters and reached 9,800, and the

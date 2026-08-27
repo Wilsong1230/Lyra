@@ -79,6 +79,69 @@ constant chosen in later steps is verified for *mechanism* here but is
 provisional and must be re-measured on a machine with the model before the
 retrieval-quality baseline in step 3 means anything.
 
+## Step 5 — the embedding signal is wired and disabled, because it measured worse
+
+**Ambiguous:** the sheet lists segmentation's inputs as "atoms.ts, embeddings"
+but does not say how the two combine.
+
+**Chosen:** time decides. A gap past 30 minutes is a boundary regardless of
+topic. A semantic shift can only corroborate a smaller gap, never split on its
+own — and even that combined rule is **off by default**.
+
+**Measured against the pre-committed labels:**
+
+| | precision | recall | spurious |
+|---|---|---|---|
+| time only | 1.00 | 1.00 | — |
+| time + embeddings | 0.89 | 1.00 | indices 14, 15 |
+
+Indices 14 and 15 are "hold on, food" and "ok back": the two halves of the
+22-minute mid-session pause the labeled set was built to protect.
+
+**Why the failure is structural, not an artifact of the stand-in embedder:**
+short interstitial utterances are semantically unlike everything around them,
+including each other. A shift test therefore fires hardest on exactly the
+pattern that marks a pause *within* a session rather than a break between two.
+A better embedder makes this worse, not better — which is why the finding is
+recorded rather than deferred to "re-measure on MiniLM".
+
+**Alternative:** raise `SESSION_SOFT_GAP_SECONDS` above 1320s so this specific
+pause squeaks under. Rejected: that is fitting a constant to one fixture.
+
+**Reversal:** `SEGMENTATION_USE_EMBEDDINGS = True`. A test asserts the
+over-splitting still happens, so if a future embedder changes the picture the
+test fails and asks for a re-measurement rather than silently passing.
+
+## Step 5 — sessions are rebuilt, not appended to
+
+**Chosen:** the pass deletes `sessions`, clears `atoms.session_id`, and
+re-derives both from scratch. Idempotent by construction.
+
+**Why:** a session row is a pure function of `atoms.ts`, and the atoms are
+permanent — so nothing is lost, and incremental boundary maintenance (what
+happens when an atom lands between two existing sessions?) is a class of bug
+that simply does not arise.
+
+**Reversal:** incremental update, if the pass ever becomes too slow to re-run.
+Worth measuring first: it is one pass over timestamps.
+
+## Step 5 — `session_id` stays cold (Open item)
+
+**Ambiguous:** the sheet asks whether `session_id` is assigned provisionally at
+write time or only by the cold pass.
+
+**Chosen:** cold only. The hot path writes NULL.
+
+**Why:** the invariant is that the hot path appends and everything structural
+is derived. A provisional `session_id` written at ingest would be a guess the
+cold pass then has to disagree with, and the disagreement would be invisible.
+It also costs the hot path a decision it has no information to make — whether
+this turn continues the last session depends on a gap that has not finished
+elapsing yet.
+
+**Reversal:** cheap; the column already exists and the pass already overwrites
+whatever is there.
+
 ## Step 4 — dream target length (Open item), resolved short
 
 **Ambiguous:** "dream target length" is an explicit Open item; the sheet only
