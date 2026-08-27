@@ -493,9 +493,12 @@ async def test_retrieval_empty_state(tmp_db_path: Path):
         _cfg.DB_PATH = original_db_path
 
 
-async def test_system_prompt_includes_relevant_episodes(tmp_db_path: Path):
+async def test_system_prompt_includes_relevant_episodes(tmp_db_path: Path, real_embeddings):
     """Dreamed episodes that are semantically relevant to current working memory
-    must surface into the system prompt under ## Past Reflections."""
+    must surface into the system prompt under ## Past Reflections.
+
+    Paraphrase-level match — asserts MiniLM's semantics. See tests/conftest.py.
+    """
     import time as _time
     from lyra_memory.embeddings import embed as _embed
 
@@ -635,9 +638,14 @@ async def test_system_prompt_omits_episodes_section_when_db_empty(tmp_db_path: P
         _cfg.CORE_PROMPT = original_core
 
 
-async def test_retrieval_failure_is_logged_not_raised(tmp_db_path: Path, capsys):
-    """A broken episode DB must not crash prompt assembly — failure is logged,
-    episodes section is omitted, and the core prompt still returns."""
+async def test_retrieval_failure_raises(tmp_db_path: Path):
+    """A broken store must crash prompt assembly, not degrade quietly.
+
+    This test previously asserted the opposite. The policy changed
+    deliberately: fail-open makes a broken store and an empty store
+    behaviourally identical, which is undetectable from transcripts and was
+    measured here — 653 turns, 0 episodes, no symptom. See DECISIONS.md.
+    """
     import aiosqlite as _aiosqlite
 
     original_db_path = _cfg.DB_PATH
@@ -663,13 +671,8 @@ async def test_retrieval_failure_is_logged_not_raised(tmp_db_path: Path, capsys)
             identity_engine = identity
             db = conn
 
-        prompt = await build_system_prompt(_FakeMemory())
-        assert "You are Lyra." in prompt
-        assert "## Past Reflections" not in prompt
-
-        captured = capsys.readouterr()
-        assert "[retrieval]" in captured.out
-        assert "episode retrieval failed" in captured.out
+        with pytest.raises(Exception):
+            await build_system_prompt(_FakeMemory())
 
         await conn.close()
     finally:
@@ -822,7 +825,9 @@ async def test_embed_different_texts_differ():
     assert a != b
 
 
-async def test_semantic_episode_search(tmp_db_path: Path):
+async def test_semantic_episode_search(tmp_db_path: Path, real_embeddings):
+    # The query is a deliberate paraphrase with no word overlap, so this
+    # asserts MiniLM's semantics, not retrieval wiring. See tests/conftest.py.
     conn = await init_db(tmp_db_path)
 
     # insert two episodes with their vec embeddings
@@ -859,7 +864,10 @@ async def test_semantic_episode_search(tmp_db_path: Path):
     assert "mathematics" in results[0]["content"]
 
 
-async def test_candidate_pool_semantic_deduplication(tmp_db_path: Path):
+async def test_candidate_pool_semantic_deduplication(tmp_db_path: Path, real_embeddings):
+    # "probing" vs "profound" is a meaning claim: under the offline stand-in
+    # these merge on shared surface words, which would be a green test for the
+    # wrong reason. See tests/conftest.py.
     conn = await init_db(tmp_db_path)
     pool = CandidatePool(conn)
 

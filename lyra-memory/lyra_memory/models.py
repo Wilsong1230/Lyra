@@ -25,6 +25,7 @@ class Candidate(BaseModel):
     evidence_count: int = 1
     last_seen: float
     category: Literal["behavioral", "emotional", "relational", "cognitive"]
+    evidence_text: str | None = None
 
 
 class Trait(BaseModel):

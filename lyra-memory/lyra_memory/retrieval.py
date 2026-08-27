@@ -54,14 +54,14 @@ async def build_context(memory: object, query: str | None = None) -> str:
         # previous answer to the same question - which it then reproduced
         # verbatim, writing a second copy that made the next repetition likelier
         # still. Past means past; the live window is not memory.
+        #
+        # The call itself is deliberately unguarded. A broken store and an empty
+        # store must not look the same from a transcript: swallowing this is how
+        # 653 turns produced 0 episodes with no symptom at all.
         live = {i.content for i in working}
-        try:
-            eps = await search_episodes(
-                query, limit=RETRIEVAL_EPISODE_LIMIT + len(live), path=db_path
-            )
-        except Exception as e:
-            print(f"[{datetime.datetime.now().isoformat()}] [retrieval] episode retrieval failed: {e}")
-            eps = []
+        eps = await search_episodes(
+            query, limit=RETRIEVAL_EPISODE_LIMIT + len(live), path=db_path
+        )
         eps = [e for e in eps if e["content"] not in live][:RETRIEVAL_EPISODE_LIMIT]
         if eps:
             parts.append("## Past Reflections\n" + "\n".join(f"- {e['content']}" for e in eps))
