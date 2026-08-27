@@ -1,0 +1,65 @@
+{
+  "_README": [
+    "A hand-marked session for the step 9 commitment check.",
+    "",
+    "Written and committed BEFORE the commitment pass existed, so the labels",
+    "cannot be fitted to the extractor's output.",
+    "",
+    "The verification target is RECALL: did the pass capture the commitments",
+    "that were actually stated. The set also carries near-misses, because an",
+    "extractor that captures everything trivially scores perfect recall and is",
+    "useless -- a hypothetical, a question, a past-tense report and an",
+    "abandoned idea all look like commitments to a careless reader.",
+    "",
+    "owner is who owes the thing, not who said it. 'can you migrate the db' from",
+    "Wilson is Lyra's commitment once she agrees; 'I'll migrate the db' from",
+    "Wilson is Wilson's."
+  ],
+  "session": [
+    {"i": 0,  "speaker": "wilson", "text": "morning. what is left on the memory rebuild"},
+    {"i": 1,  "speaker": "lyra",   "text": "steps 9 through 11. commitments, clustering, forgetting"},
+    {"i": 2,  "speaker": "wilson", "text": "I'll migrate the database over to the new store tonight"},
+    {"i": 3,  "speaker": "lyra",   "text": "then I'll re-run segmentation once it lands"},
+    {"i": 4,  "speaker": "wilson", "text": "should we also do the introspection tool"},
+    {"i": 5,  "speaker": "lyra",   "text": "it is gated on step 8, so it could happen now"},
+    {"i": 6,  "speaker": "wilson", "text": "if we had more time I would rewrite the whole affect layer"},
+    {"i": 7,  "speaker": "lyra",   "text": "that would be a separate project"},
+    {"i": 8,  "speaker": "wilson", "text": "true. anyway, can you write up the decisions file by friday"},
+    {"i": 9,  "speaker": "lyra",   "text": "yes, I will have it done by friday"},
+    {"i": 10, "speaker": "wilson", "text": "last week I fixed the avatar bug, that one is done"},
+    {"i": 11, "speaker": "lyra",   "text": "I remember, it was in avatar.js"},
+    {"i": 12, "speaker": "wilson", "text": "do you think the similarity floor is right"},
+    {"i": 13, "speaker": "lyra",   "text": "I cannot tell until it runs on real embeddings"},
+    {"i": 14, "speaker": "wilson", "text": "ok. I am going to book the flights at some point"},
+    {"i": 15, "speaker": "lyra",   "text": "I will check the retrieval baseline again after the next change"},
+    {"i": 16, "speaker": "wilson", "text": "we thought about switching to faiss but decided against it"},
+    {"i": 17, "speaker": "lyra",   "text": "sqlite-vec keeps it one portable file"}
+  ],
+  "commitments": [
+    {"atom": 2,  "owner": "wilson", "gist": "migrate the database to the new store", "due": "tonight"},
+    {"atom": 3,  "owner": "lyra",   "gist": "re-run segmentation once the migration lands", "due": null},
+    {"atom": 9,  "owner": "lyra",   "gist": "write up the decisions file", "due": "friday"},
+    {"atom": 14, "owner": "wilson", "gist": "book the flights", "due": null},
+    {"atom": 15, "owner": "lyra",   "gist": "check the retrieval baseline after the next change", "due": null}
+  ],
+  "near_misses": [
+    {"atom": 4,  "why": "a question about whether to do something, not a commitment to do it"},
+    {"atom": 5,  "why": "states that something is possible, commits to nothing"},
+    {"atom": 6,  "why": "explicitly counterfactual -- 'if we had more time'"},
+    {"atom": 10, "why": "past tense, already done"},
+    {"atom": 12, "why": "a question"},
+    {"atom": 13, "why": "a statement of uncertainty"},
+    {"atom": 16, "why": "a decision NOT to do something"}
+  ],
+  "closure_session": [
+    {"speaker": "wilson", "text": "the database migration is finished, everything is on the new store"},
+    {"speaker": "lyra",   "text": "good, I re-ran segmentation against it just now"}
+  ],
+  "closure_expected": [
+    {"gist": "migrate the database to the new store", "status": "done"},
+    {"gist": "re-run segmentation once the migration lands", "status": "done"},
+    {"gist": "write up the decisions file", "status": "open"},
+    {"gist": "book the flights", "status": "open"},
+    {"gist": "check the retrieval baseline after the next change", "status": "open"}
+  ]
+}
