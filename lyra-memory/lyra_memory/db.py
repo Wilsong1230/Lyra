@@ -295,7 +295,15 @@ async def init_db(path: Path) -> aiosqlite.Connection:
     await conn.executescript(_CREATE_VEC_SQL)
     await conn.executescript(_CREATE_FTS_SQL)
     await conn.commit()
-    await assert_schema_version(conn)
+    try:
+        await assert_schema_version(conn)
+    except BaseException:
+        # Close before propagating. The failure is meant to be the loudest
+        # thing on the terminal; leaking the connection buries it under an
+        # unrelated "Event loop is closed" traceback from aiosqlite's worker
+        # thread, which reads like the bug rather than the diagnosis.
+        await conn.close()
+        raise
     return conn
 
 
