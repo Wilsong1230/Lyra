@@ -137,7 +137,55 @@ Do not adjust a label because the output disagreed with it. One case in the
 shipped set already disagrees (see BASELINE.md) and was deliberately left
 alone.
 
-## 5. Backup before every cold pass
+## 5. Read ~50 extracted facts (step 8 verification)
+
+Step 8's check is "facts extracted are true — manual read, ~50 rows". There is
+no automated version: whether "studies at FGCU" is true is not a property of
+the code. The harness puts each claim next to the atom it came from so the
+read is quick.
+
+```bash
+cd lyra-memory
+./venv/bin/python -m lyra_memory.store.review_facts --limit 50
+./venv/bin/python -m lyra_memory.store.review_facts --conflicts   # flagged pairs only
+```
+
+Read for three things:
+
+1. **Is the claim true?**
+2. **Does the source atom actually support it**, or did extraction infer past
+   its evidence?
+3. **Is `source_kind` right?** A `document` claim recorded as `stated` is the
+   failure that matters most — it launders a file's authority into something
+   she treats as first-hand.
+
+Record what fraction of the 50 are wrong before changing the extraction
+prompt. If the same *kind* of error repeats, that is a prompt problem; if the
+errors are scattered, it is a model problem, and the fix is a different model
+rather than more prompt.
+
+**Do not edit fact rows.** Wilson never writes fact content — reading output
+to find that a mechanism under-fires and then adjusting the mechanism is the
+same move as the trait-dedup fix; editing the rows is authorship.
+
+## 6. Re-measure segmentation on real embeddings
+
+`SEGMENTATION_USE_EMBEDDINGS` is off because turning it on scored worse
+against the labeled set (precision 1.00 → 0.89, over-splitting a mid-session
+pause). That was measured with the stand-in embedder. The argument for why it
+would also fail on MiniLM is in `SegmentationPass`'s docstring, but it is an
+argument, not a measurement. On a machine with the model:
+
+```bash
+cd lyra-memory
+./venv/bin/python -m pytest tests/test_segmentation.py -q
+```
+
+`test_the_embedding_signal_is_off_and_this_is_why` fails if embeddings stop
+over-splitting — which is the signal to re-measure and reconsider the default,
+not to delete the test.
+
+## 7. Backup before every cold pass
 
 Hard rule: back up before each cold pass, 30-day retention. Not automated
 here, and deliberately not run against `~/.lyra` from the build:

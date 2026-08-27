@@ -61,6 +61,23 @@ EMBED_DIM = 384
 # both separate them and merge real duplicates. They dedup by exact name.
 CANDIDATE_DEDUP_THRESHOLD = 0.37
 
+# ── facts (step 8) ───────────────────────────────────────────────────────────
+# Confidence by epistemic channel. She should be able to say which: "you told
+# me" and "I read it in your resume" are different states, and a document she
+# did not author is attributable and lower-confidence by construction.
+FACT_CONFIDENCE: dict[str, float] = {
+    "stated": 0.9,
+    "observed": 0.9,
+    "document": 0.6,
+    "inferred": 0.4,
+}
+# Supersession compares within a subject — tens of rows, not thousands — so an
+# LLM call per new fact is cheap.
+FACT_MAX_COMPARISONS = 20
+# Logged, never enforced. A subject past this many facts suggests consolidation
+# is under-firing; it is not a reason to drop anything.
+FACT_CROWDED_SUBJECT = 20
+
 # ── entities (step 7) ────────────────────────────────────────────────────────
 ENTITY_BATCH_SIZE = 20
 
