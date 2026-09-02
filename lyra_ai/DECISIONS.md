@@ -1403,3 +1403,338 @@ the real event loop, a real `LyraClient` over a real loopback socket):
   CP-C; +9 net — see "Files touched outside the FILES set" above for what
   changed); `lyra-memory` 283 passed, 4 skipped, unchanged from CP-C (this
   checkpoint touched nothing under `lyra-memory/`).
+
+---
+
+# CP-D — the loop closes (retrieval)
+
+Register: `Store.ingest_turn()` is wired (CP-D.0); `context_log` has real
+rows. The fourth and last unmet condition for construct-hood: `tick()`'s
+return value has been discarded by every caller since the project began.
+This checkpoint makes retrieval the first intent that actually executes.
+
+## Change 1 — what `tick()` returned, before this checkpoint touched anything
+
+Read end to end (`action_selection.py`'s `ActionSelector.select`, the only
+producer; `interface.py`'s `CognitiveCore.tick`, the only caller of it) before
+adding anything.
+
+**`Intent`'s shape** (`interface.py`, unchanged by this checkpoint):
+`kind: IntentKind`, `payload: dict`, `ts: float` (auto-stamped).
+
+**What `ActionSelector.select(drive_pressures, affect, bias=None)` produced,
+pre-CP-D** — `frustration = max(0, -affect.valence) * effective_weight`
+(`effective_weight = affect_weight`, optionally shifted by `bias.
+affect_weight_delta`):
+- `drive_pressures["boredom"] > 0` and `> frustration` ->
+  `Intent(look, {"reason": "curiosity"})`; additionally, if boredom also
+  `>= speak_threshold` (default 1.0) -> `Intent(speak, {"reason": "boredom"})`
+  in the same call.
+- `drive_pressures["relational"] > 0` and `> frustration` ->
+  `Intent(speak, {"reason": "friction"})`.
+- Neither wins (both zero, or both flipped by frustration) ->
+  `Intent(noop, {})`.
+- `IntentKind.research` is declared but has no producer anywhere — reserved,
+  never emitted, before or after this checkpoint.
+
+**Consumption, pre-CP-D:** `CognitiveCore.tick()` returned `(intents,
+affect_state)`. `TurnHandler.tick()` (`runtime.py`) stored the list on
+`self.last_intents` and did nothing else with it — the module's own
+docstring said so directly ("tick() still returns intents; they are bound
+and left unconsumed, as CP-A requires"). `Harness.run()` (`harness.py`)
+records each tick's intents into a `TickRecord` for tests to inspect and
+likewise never executes any of them. No path from an `Intent` to an
+observable effect existed anywhere in the tree.
+
+## Change 2 — `IntentKind.retrieval`, and where "the core decides"
+
+**Added** `IntentKind.retrieval = "retrieval"` (`interface.py`). Fields:
+inherited from `Intent` — no new shape, `payload={"reason": "turn"}`.
+
+**Where the decision lives:** in `ActionSelector.select()`, reusing the
+exact frustration-vs-pressure mechanism boredom/relational already use —
+not a second way to decide anything. `CognitiveCore.tick()` computes a
+third pressure, `drive_pressures["retrieval"]`, set to `_RETRIEVAL_PRESSURE`
+(1.0) whenever a `sensory` observation with `source == "conversation"`
+arrived this tick (the first tick of an exchange, before `retrieve_context()`
+would run), else `0.0`. Deliberately not "any observation this tick" —
+the later `"lyra"` tick and any `"vision"` tick within the same exchange
+must not each propose a fresh retrieval for it.
+
+**"The core decides," not the daemon:** `TurnHandler.handle()` never
+computes whether to retrieve — it reads `self.last_intents` (already
+existing state, set by the immediately-preceding `tick("conversation", ...)`
+call) for an `IntentKind.retrieval` entry and acts on what it finds.
+
+**Files touched outside the closed FILES set, and why unavoidable:**
+- `action_selection.py` — the frustration/pressure comparison lives in
+  exactly one place in the codebase; duplicating it in `interface.py`
+  to avoid touching this file would mean two formulas that could drift
+  out of sync. Added one branch, same shape as the boredom/relational ones
+  already there.
+- `gate.py` — `HarmGate.check()` is a hard allow-list
+  (`ALLOWED_KINDS`); a new `IntentKind` that isn't added there is silently
+  dropped by `_gate_intents()`, never executed, regardless of anything
+  `ActionSelector` does. There is no way to make change 2/3 work without
+  this edit. `gate.py`'s own comment names the exact process this
+  checkpoint follows: "Extend this set only after explicit review of the
+  new capability" — the review is this checkpoint (retrieval is a read
+  against a store the daemon already owns, gated the same way every other
+  intent already is; no new external effect). `tests/test_gate.py` has a
+  tripwire test asserting `ALLOWED_KINDS`'s exact membership specifically
+  to catch an *undeliberate* addition — updated to include `retrieval`,
+  by name, as the reviewed fifth kind.
+
+## Change 3 — execution, and a declined turn's visible row
+
+`TurnHandler.handle()` (`runtime.py`): if retrieval was produced, calls
+`CognitiveCore.retrieve_context()` (moved here from CP-D.0, unchanged) and
+logs `INTENT_EXECUTED`; if not, logs `INTENT_DECLINED` and proceeds with
+`context = None`. `_compose_system_prompt()` treats `None` the same as an
+empty `ContextResult` — no retrieved text in the prompt, nothing else
+different.
+
+**A declined turn's `context_log` row:** `CognitiveCore.ingest_exchange()`
+accepts `context=None` and, in that case, builds the `injected` dict itself
+— `atom_ids/fact_ids/dream_ids: []`, `budget_used: 0`,
+`misses: [interface.DECLINED_MARKER]` (`"retrieval: declined"`) — rather
+than skipping the `Store.ingest_turn()` call. The row exists, is queryable,
+and is visible in `report.py` as `logged_declined_window`, counted
+separately from `logged_vector_only_window`/`fts_only`/`both`/`neither`
+(all of which describe retrieval that actually ran) and from
+`logged_empty_window` (retrieval ran and found nothing — a different fact
+than "retrieval did not run at all").
+
+## Change 4 — the outcome row, packed into columns `Store.record_outcome()` already has
+
+**The weak signal** (change 4's own wording): `atom_count > 0` ->
+`valence = 1.0`, else `0.0` — computed once, in
+`TurnHandler._retrieval_path()`, shared by the `INTENT_EXECUTED` log line
+and the outcome row so they can never disagree.
+
+**No new columns.** `outcomes` has `intent_atom_id, predicted, actual,
+valence, ts, environment` — no `atom_count`/`path`/`context_log_id` fields,
+and OUT OF SCOPE gives no license to add any (Store's schema is not in this
+checkpoint's FILES set either). Packed into what's there, all free-text/
+free-float by design:
+- `intent_atom_id` = the user's atom id for this exchange (a real FK into
+  `atoms`, not a phantom "intent atom" — there is no atom representing an
+  intent, so the atom the retrieval was *for* is the closest honest fit).
+- `valence` = the weak signal above.
+- `actual` = the path label (`"vector"|"fts"|"both"|"neither"`) —
+  `Store`'s own free-text convention for an outcome's result, same idea as
+  `lyra_core/outcomes.py`'s `ENGAGEMENT`/`SILENCE`.
+- `predicted` = the fixed string `"context_available"` — what a retrieval
+  intent always wants, mirroring `predicted`/`actual` pairing elsewhere in
+  the codebase even though retrieval has no real "prediction" to make.
+- `environment` = `"context_log_id={id};atom_count={n}"` — a small,
+  parseable string, not a new column. Verified live: recovered by regex
+  from a real outcomes row and cross-checked against a real, existing
+  `context_log` row (see DONE-WHEN evidence below).
+
+**`context_log_id` doesn't come back from `ingest_turn()`.** OUT OF SCOPE
+forbids changing its return signature. `ingest_exchange()` passes an
+explicit `ts` into `ingest_turn()` and reads the row back afterward
+(`SELECT id FROM context_log WHERE ts = ? ORDER BY id DESC LIMIT 1`) — a
+read-after-write against the same connection in the same call, not a
+schema or signature change to `Store` itself.
+
+## Change 5 — a minimal, Store-native consolidator; no dedup, no promotion
+
+**Not `development.py`'s `OutcomeConsolidator`/`CandidatePool`.** Those are
+built against `MemorySystem`'s old `db.py` schema and semantic-embedding
+dedup — neither of which `Store` has, and CP-B already found this whole
+path permanently inert against `Store` (`getattr(self._memory,
+"candidate_pool", None)` is always `None`). Reusing them would mean giving
+`Store` a `candidate_pool` shim just to satisfy an old interface — a bigger,
+riskier change than writing five lines of SQL.
+
+**What was built instead:** `CognitiveCore.consolidate_retrieval_outcome
+(had_context: bool)` — one `INSERT INTO candidates` per call, `category=
+'retrieval'`, `evidence_count=1`, no read-before-write, no merge, no update
+to an existing row. `_retrieval_trait_from_outcome()` is the two-branch
+closed vocabulary (`"retrieval finds relevant context"` /
+`"retrieval finds nothing"`), same shape as `development.py`'s
+`trait_name_from_outcome` but not derived from it — that function is keyed
+to `predicted == actual` (boredom/relational's "success" concept), which
+retrieval has no equivalent of.
+
+**"Must not promote traits":** trivially true by construction — nothing in
+this mechanism ever reads or writes `traits` or calls `IdentityEngine`.
+Not blocked, not a finding to record under change 5's "if promotion cannot
+be separated" clause — there was never a path to separate, because nothing
+here reaches promotion in the first place. Verified live: `traits` count
+0 before and after twenty exchanges producing twenty candidate rows.
+
+**No dedup is a real, disclosed consequence, not silently absorbed:**
+twenty turns produced twenty `candidates` rows (one of two closed values,
+repeated), not one row with `evidence_count=20`. OUT OF SCOPE says "trait
+dedup" is not this checkpoint's concern — read as covering *this* too, since
+the old system's dedup is semantic-embedding-based (the exact thing named
+out of scope) and there is no non-embedding dedup already built to fall
+back to. A future checkpoint doing dedup or promotion for these candidates
+has real data to work from either way.
+
+## Change 6 — six markers, one shared id
+
+`INTENT_PRODUCED`, `INTENT_EXECUTED`, `INTENT_DECLINED`,
+`OUTCOME_RECORDED`, `CONSOLIDATOR_FIRED`, `CANDIDATE_CREATED` — all on
+logger `lyra_core.runtime`, all carrying `turn=<id>`.
+
+**The shared id is `TurnHandler._turn_seq`**, a plain per-process counter
+incremented once at the top of `handle()` — not a database id.
+`Store.ingest_turn()` doesn't return a context_log id (change 4), and even
+if it did, `INTENT_PRODUCED`/`INTENT_DECLINED` are logged *before*
+`ingest_exchange()` ever runs, so no store-derived id could exist yet at
+that point regardless. A counter that exists from the first line of
+`handle()` is available to every log line the whole turn produces, in
+order, with no dependency on how far the turn gets. Safe under concurrent
+turns on the same `TurnHandler` (confirmed the daemon serves connections
+concurrently — `test_two_clients_at_once_land_in_one_history_in_arrival_
+order`): `self._turn_seq += 1` contains no `await`, so no other coroutine
+can interleave inside it.
+
+`INTENT_PRODUCED` and `INTENT_EXECUTED` are always emitted together in this
+design (nothing currently separates "the core proposed it" from "the
+daemon executed it" — there is no failure mode between them yet), so their
+window counts are always equal — verified live (20 = 20). Logged as two
+markers anyway, per change 6's explicit list, not collapsed into one —
+future checkpoints that could introduce a gap between proposing and
+executing (a retrieval that's produced but then fails, say) inherit a
+distinction that already exists rather than needing to invent one.
+
+## Change 7 — `report.py`: the loop, and outcomes as a real number
+
+New fields (all in `FIELDS`, all in the daemon's periodic line and
+`--report` alike): `intents_produced_window`, `intents_executed_window`,
+`intents_declined_window`, `consolidator_fired_window`,
+`candidates_created_window_log` — all parsed from the log (`_loop_log_
+section`, the same technique `_clamp_section`/`_log_affect_ranges` already
+use for `DT_CLAMP_ENGAGED`/tick lines — there is no table that records "an
+intent was produced," only the log line that says so).
+`candidates_created_window` — a second, DB-derived count
+(`candidates WHERE last_seen >= window_start`), a cross-check against the
+log count rather than a replacement for it (candidates still has no
+`created_ts` — CP-C's finding stands — but this checkpoint's own writer
+never updates an existing row, so `last_seen` doubles as a creation time
+for *these* rows specifically). `logged_declined_window` — read from
+`context_log` directly (change 3).
+
+**The "expected: 0" line:** it was never in the hardcoded `KNOWN_GAPS` list
+(CP-C put it in `render()`'s section header instead, `"2e. outcomes
+(expected: 0 until CP-D)"`) — checked before editing rather than assumed.
+Removed; `outcomes_total` now renders under a plain `"2e. outcomes"`
+heading, the number speaking for itself. No new `KNOWN_GAPS` line was
+needed for anything change 5 blocks, because nothing was blocked (see
+change 5 above) — checked, not skipped by omission.
+
+## Change 8 — did the daemon need something `tick()` didn't return?
+
+**No.** Everything `TurnHandler.handle()` needed was already reachable:
+whether retrieval was produced, from the existing `self.last_intents`
+(unchanged field, unchanged `tick()` signature); the retrieved content,
+from the already-existing `retrieve_context()` (CP-D.0); `context_log_id`,
+recovered via a read-after-write against `Store` directly (change 4), not
+by widening `tick()`'s contract. `tick()`'s signature and return shape —
+`(observations, dt) -> (intents, affect)` — are exactly what they were
+before this checkpoint.
+
+## `_RETRIEVAL_PRESSURE = 1.0`, and the "no decline in twenty" finding
+
+Chosen as "yes, unless frustration is high enough to say no," in the same
+units `ActionSelector` already compares boredom/relational pressure
+against — not tuned, not derived, matching the checkpoint's own framing
+that whether decline is reachable is part of what this checkpoint measures.
+
+**Measured live, twenty real exchanges through a real `Runtime`** (a fake
+backend that always replies, never fails — no `action_outcome`
+observations, so `RelationalDrive` stays at zero pressure throughout; only
+`BoredomDrive`'s own small negative valence push, bounded to
+`_BOREDOM_PRESSURE_CEILING = 0.02`, ever moves valence away from zero):
+`intents_produced_window = 20`, `intents_declined_window = 0`. Every turn
+retrieved; none declined. This is the sanctioned outcome the done-when
+itself names ("If no turn declines in twenty, report the drive conditions
+that make declining unreachable and record it as a finding") — recorded
+here as that finding, not treated as a failure to fix.
+
+**Decline is reachable, demonstrated separately, not inferred:**
+`test_action_selection.py::test_strong_negative_affect_flips_retrieval_to_
+declined` drives `ActionSelector.select({"retrieval": 0.3}, valence=-0.8)`
+directly and confirms no retrieval intent is proposed — the same mechanism,
+exercised at the frustration level a twenty-turn friendly conversation
+with this backend never reaches on its own. Nothing here was tuned to make
+the live run decline; the live run's honest zero and the unit test's
+honest "yes, it can" are two different, both-true facts about the same
+mechanism.
+
+## Files touched outside the FILES set
+
+- `lyra_ai/lyra_core/action_selection.py`, `lyra_ai/lyra_core/gate.py` — see
+  change 2 above; both necessary, both explicitly reasoned through, neither
+  a "wire it as built" violation (nothing about how retrieval, forgetting,
+  context assembly, `ingest_turn()`, affect, or drives *work* changed).
+- `lyra_ai/tests/test_gate.py` — the `ALLOWED_KINDS` tripwire test updated
+  to name `retrieval` as the fifth reviewed kind (renamed
+  `test_allow_list_is_exactly_the_four_safe_kinds` ->
+  `..._five_reviewed_kinds`).
+- `lyra_ai/tests/test_action_selection.py` — new tests for the retrieval
+  pressure branch (selects when pressure>0, doesn't when 0, frustration can
+  flip it, coexists with boredom in one call, passes the real `HarmGate`);
+  `test_extreme_affect_only_produces_allowed_intent_kinds`'s pressure
+  scenarios extended to include `{"retrieval": 1.0}`.
+- `lyra_ai/tests/test_core.py` — new tests for `tick()` producing/not
+  producing the retrieval intent by observation source; new tests for
+  `CognitiveCore.record_retrieval_outcome`/`consolidate_retrieval_outcome`
+  (both the graceful-absence path via `_RecordingMemory` and real-`Store`
+  integration tests: outcome row content, valence by branch, candidate row
+  content, zero writes to `traits`); `ingest_exchange`'s return signature
+  test updated for the 3-tuple; a new test for the `context=None` (declined)
+  path building the right `injected` dict.
+- `lyra_ai/tests/test_runtime.py` — `_FakeCore` gained
+  `produces_retrieval` (defaults to matching the real selector's behavior
+  on a "conversation" tick), `record_retrieval_outcome`, and
+  `consolidate_retrieval_outcome`; new tests for the full log sequence and
+  shared turn id, the declined path (log lines, the `context=None` exchange,
+  no outcome/consolidator calls), the executed path (outcome fields,
+  consolidator `had_context` argument by branch), `CANDIDATE_CREATED`
+  logging, and two turns getting two different turn ids.
+- `lyra_ai/tests/test_report.py` — `path_label` tests; a `logged_declined_
+  window` test against a real declined `ingest_turn` row; `_loop_log_
+  section`/`collect_from_path` tests parsing a synthetic log for the five
+  markers, including the unavailable-without-a-log case; a
+  `candidates_created_window` DB cross-check test.
+
+## DONE-WHEN — evidence
+
+All run live against a real `Runtime` (tmp-path store; fake LLM backend;
+everything else real — sqlite, sqlite-vec, aiosqlite, the hashed embedder,
+the real event loop, a real `LyraClient` over a real loopback socket, real
+file-backed logging):
+
+- **One turn; log shows the sequence, shared id:** `INTENT_PRODUCED ->
+  INTENT_EXECUTED -> OUTCOME_RECORDED -> CONSOLIDATOR_FIRED`, in order,
+  all `turn=1`.
+- **`outcomes` row, live:** `(intent_atom_id=1, valence=0.0, actual='neither',
+  predicted='context_available', environment='context_log_id=1;
+  atom_count=0')` — the first turn, against an empty store, correctly found
+  nothing; `context_log_id=1` resolved to a real, existing `context_log`
+  row.
+- **Twenty exchanges, decline reachability:** `produced=20, executed=20,
+  declined=0` — see the finding above.
+- **`python -m lyra_core --report`:** `outcomes_total=20`,
+  `intents_produced_window=20 == intents_executed_window=20`,
+  `+ intents_declined_window=0 == 20`. `outcomes_total ==
+  intents_executed_window` (every executed retrieval produced exactly one
+  outcome row).
+- **Candidates traceable to an outcome:** the first turn's outcome
+  (`outcome_id=1`) is immediately followed, same turn, by
+  `CONSOLIDATOR_FIRED turn=1 outcome_id=1` and a real `candidates` row
+  (`category='retrieval'`); twenty turns produced twenty such rows.
+- **No trait promotes:** `traits` count 0 before, 0 after twenty exchanges.
+- **grep, no direct `build_context()` in the daemon path:** `grep -n
+  "build_context(" lyra_core/runtime.py` — zero matches (re-confirmed after
+  every edit in this checkpoint); the one call site remains
+  `interface.py`'s `retrieve_context()`.
+- **Both test suites green:** `lyra_ai` 339 passed (was 303 at the end of
+  CP-D.0); `lyra-memory` 283 passed, 4 skipped, unchanged (this checkpoint
+  touched nothing under `lyra-memory/`).

@@ -95,14 +95,20 @@ FIELDS: tuple[str, ...] = (
     # docstring. "logged_*" is a historical tally read from context_log;
     # "selftest_*" is the live, read-only self-test (CP-C).
     "logged_assemblies_window", "logged_with_hit_window", "logged_empty_window",
+    "logged_declined_window",
     "logged_vector_only_window", "logged_fts_only_window",
     "logged_both_window", "logged_neither_window",
     "selftest_assemblies", "selftest_with_hit",
     "selftest_vector_only", "selftest_fts_only",
     "selftest_both", "selftest_neither",
+    # CP-D: the intent loop (change 7) — log-derived counts (runtime.py's
+    # six markers) plus the outcomes/candidates rows they produced.
+    "intents_produced_window", "intents_executed_window", "intents_declined_window",
+    "outcomes_total",
+    "consolidator_fired_window",
+    "candidates_created_window_log", "candidates_created_window",
     "candidates_total", "candidates_promoted_window",
     "trait_count", "trait_confidence_mean",
-    "outcomes_total",
     "emotion_v", "emotion_a", "mood_v", "mood_a",
     "temperament_v", "temperament_a", "temperament_c",
     "emotion_v_min", "emotion_v_max", "emotion_a_min", "emotion_a_max",
@@ -181,12 +187,31 @@ async def _retrievability_section(db: aiosqlite.Connection) -> dict:
     return {"atoms_below_floor": below, "atoms_above_floor": above}
 
 
-def _classify_misses(misses: list[str]) -> tuple[bool, bool]:
+def classify_misses(misses: list[str]) -> tuple[bool, bool]:
     """(vector_hit, fts_hit) from a ContextResult's misses list — a miss
-    entry means that path found nothing; its absence means it did."""
+    entry means that path found nothing; its absence means it did.
+
+    Shared with runtime.py (TurnHandler._retrieval_path): the same
+    classification decides both what gets logged (INTENT_EXECUTED,
+    OUTCOME_RECORDED) and what gets reported (this module's logged_*/
+    selftest_* sections) — one place, not two that could drift apart.
+    """
     vector_missed = any(m.startswith("semantic:") for m in misses)
     fts_missed = any(m.startswith("lexical:") for m in misses)
     return not vector_missed, not fts_missed
+
+
+def path_label(vector_hit: bool, fts_hit: bool) -> str:
+    """"vector" | "fts" | "both" | "neither" — the string form of
+    classify_misses()'s pair, for anywhere (a log line, an outcomes row)
+    that wants one label rather than two booleans."""
+    if vector_hit and fts_hit:
+        return "both"
+    if vector_hit:
+        return "vector"
+    if fts_hit:
+        return "fts"
+    return "neither"
 
 
 async def _selftest_retrieval_section(
@@ -204,12 +229,13 @@ async def _selftest_retrieval_section(
     vector_only = fts_only = both = neither = with_hit = 0
     for q in queries:
         ctx = await build_context(store_like, query=q, recent_turns=0)
-        vector_hit, fts_hit = _classify_misses(ctx.misses)
-        if vector_hit and fts_hit:
+        vector_hit, fts_hit = classify_misses(ctx.misses)
+        label = path_label(vector_hit, fts_hit)
+        if label == "both":
             both += 1
-        elif vector_hit:
+        elif label == "vector":
             vector_only += 1
-        elif fts_hit:
+        elif label == "fts":
             fts_only += 1
         else:
             neither += 1
@@ -228,22 +254,33 @@ async def _context_log_section(db: aiosqlite.Connection, window_start: float) ->
     — what CognitiveCore.ingest_exchange actually logged for real turns in
     the window, not a measurement performed now. An assembly that returned
     nothing is a row with an empty atom_ids list, not a missing row — that
-    row is what logged_empty_window counts."""
+    row is what logged_empty_window counts.
+
+    CP-D: a row whose misses carries interface.DECLINED_MARKER is a turn
+    that never attempted retrieval at all (change 3) — counted separately
+    as logged_declined_window, not folded into vector/fts/both/neither
+    (which all describe retrieval that ran)."""
+    from lyra_core.interface import DECLINED_MARKER
+
     async with db.execute(
         "SELECT atom_ids, misses FROM context_log WHERE ts >= ?", (window_start,)
     ) as cur:
         rows = await cur.fetchall()
 
-    vector_only = fts_only = both = neither = with_hit = empty = 0
+    vector_only = fts_only = both = neither = with_hit = empty = declined = 0
     for atom_ids_json, misses_json in rows:
         atom_ids = json.loads(atom_ids_json) if atom_ids_json else []
         misses = json.loads(misses_json) if misses_json else []
-        vector_hit, fts_hit = _classify_misses(misses)
-        if vector_hit and fts_hit:
+        if DECLINED_MARKER in misses:
+            declined += 1
+            continue
+        vector_hit, fts_hit = classify_misses(misses)
+        label = path_label(vector_hit, fts_hit)
+        if label == "both":
             both += 1
-        elif vector_hit:
+        elif label == "vector":
             vector_only += 1
-        elif fts_hit:
+        elif label == "fts":
             fts_only += 1
         else:
             neither += 1
@@ -254,7 +291,7 @@ async def _context_log_section(db: aiosqlite.Connection, window_start: float) ->
 
     return {
         "logged_assemblies_window": len(rows), "logged_with_hit_window": with_hit,
-        "logged_empty_window": empty,
+        "logged_empty_window": empty, "logged_declined_window": declined,
         "logged_vector_only_window": vector_only, "logged_fts_only_window": fts_only,
         "logged_both_window": both, "logged_neither_window": neither,
     }
@@ -263,6 +300,16 @@ async def _context_log_section(db: aiosqlite.Connection, window_start: float) ->
 async def _candidates_traits_section(db: aiosqlite.Connection, window_start: float) -> dict:
     async with db.execute("SELECT COUNT(*) FROM candidates") as cur:
         candidates_total = (await cur.fetchone())[0]
+    # CP-D: candidates still has no created_ts (CP-C's finding stands) —
+    # but CognitiveCore.consolidate_retrieval_outcome always sets last_seen
+    # to the moment it inserts a *new* row (no dedup, no updates to an
+    # existing one — see DECISIONS.md), so for these rows specifically
+    # last_seen doubles as a creation time. A cross-check against the
+    # log-derived candidates_created_window_log, not a replacement for it.
+    async with db.execute(
+        "SELECT COUNT(*) FROM candidates WHERE last_seen >= ?", (window_start,)
+    ) as cur:
+        candidates_created_window = (await cur.fetchone())[0]
     async with db.execute(
         "SELECT COUNT(*) FROM trait_history WHERE event = 'promoted' AND ts >= ?",
         (window_start,),
@@ -274,6 +321,7 @@ async def _candidates_traits_section(db: aiosqlite.Connection, window_start: flo
     mean_conf = sum(confidences) / len(confidences) if confidences else 0.0
     return {
         "candidates_total": candidates_total,
+        "candidates_created_window": candidates_created_window,
         "candidates_promoted_window": promoted,
         "trait_count": len(rows),
         "trait_confidence_mean": mean_conf,
@@ -388,6 +436,52 @@ def _clamp_section(log_path: Path, window_start: float) -> dict:
     }
 
 
+# CP-D: the intent loop has no table of its own to count from — the six
+# markers in runtime.py (INTENT_PRODUCED/EXECUTED/DECLINED,
+# CONSOLIDATOR_FIRED, CANDIDATE_CREATED) are the only record of "did this
+# step happen," the same way DT_CLAMP_ENGAGED already was the only record
+# of a clamp. OUTCOME_RECORDED is deliberately not parsed here — the
+# outcomes table itself is the authoritative count (_outcomes_section);
+# parsing the log for it too would just be two ways to get one number.
+_LOOP_LINE_RE = re.compile(
+    r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ \S+ lyra_core\.runtime: "
+    r"(?P<marker>INTENT_PRODUCED|INTENT_EXECUTED|INTENT_DECLINED|CONSOLIDATOR_FIRED|CANDIDATE_CREATED)\b"
+)
+
+
+def _loop_log_section(log_path: Path, window_start: float) -> dict:
+    fields = (
+        "intents_produced_window", "intents_executed_window", "intents_declined_window",
+        "consolidator_fired_window", "candidates_created_window_log",
+    )
+    if not log_path.is_file():
+        return {f: UNAVAILABLE for f in fields}
+
+    counts = {
+        "INTENT_PRODUCED": 0, "INTENT_EXECUTED": 0, "INTENT_DECLINED": 0,
+        "CONSOLIDATOR_FIRED": 0, "CANDIDATE_CREATED": 0,
+    }
+    for line in log_path.read_text(errors="replace").splitlines():
+        m = _LOOP_LINE_RE.match(line)
+        if not m:
+            continue
+        try:
+            ts = datetime.strptime(m.group("ts"), "%Y-%m-%d %H:%M:%S").timestamp()
+        except ValueError:
+            continue
+        if ts < window_start:
+            continue
+        counts[m.group("marker")] += 1
+
+    return {
+        "intents_produced_window": counts["INTENT_PRODUCED"],
+        "intents_executed_window": counts["INTENT_EXECUTED"],
+        "intents_declined_window": counts["INTENT_DECLINED"],
+        "consolidator_fired_window": counts["CONSOLIDATOR_FIRED"],
+        "candidates_created_window_log": counts["CANDIDATE_CREATED"],
+    }
+
+
 def _file_sizes_section(store_path: Path, runs_path: Path, history_path: Path | None) -> dict:
     def size(p: Path | None) -> object:
         if p is None or not p.is_file():
@@ -447,6 +541,7 @@ async def collect_measurements(
     await _section(
         "context_log",
         ("logged_assemblies_window", "logged_with_hit_window", "logged_empty_window",
+         "logged_declined_window",
          "logged_vector_only_window", "logged_fts_only_window",
          "logged_both_window", "logged_neither_window"),
         _context_log_section(db, window_start),
@@ -459,8 +554,8 @@ async def collect_measurements(
     )
     await _section(
         "candidates_traits",
-        ("candidates_total", "candidates_promoted_window", "trait_count",
-         "trait_confidence_mean"),
+        ("candidates_total", "candidates_created_window", "candidates_promoted_window",
+         "trait_count", "trait_confidence_mean"),
         _candidates_traits_section(db, window_start),
     )
     await _section("outcomes", ("outcomes_total",), _outcomes_section(db))
@@ -480,6 +575,15 @@ async def collect_measurements(
     except Exception:
         out["clamp_count_window"] = UNAVAILABLE
         out["clamp_max_elapsed_window"] = UNAVAILABLE
+
+    try:
+        out.update(_loop_log_section(log_path, window_start))
+    except Exception:
+        for f in (
+            "intents_produced_window", "intents_executed_window", "intents_declined_window",
+            "consolidator_fired_window", "candidates_created_window_log",
+        ):
+            out[f] = UNAVAILABLE
 
     try:
         out.update(_file_sizes_section(store_path, runs_path, history_path))
@@ -551,6 +655,7 @@ def render(measurements: dict, window_days: int) -> str:
     lines.append(f"    assemblies        {measurements.get('logged_assemblies_window', UNAVAILABLE)}")
     lines.append(f"    with >=1 atom     {measurements.get('logged_with_hit_window', UNAVAILABLE)}")
     lines.append(f"    empty (0 atoms)   {measurements.get('logged_empty_window', UNAVAILABLE)}")
+    lines.append(f"    declined          {measurements.get('logged_declined_window', UNAVAILABLE)}")
     lines.append(f"    vector only       {measurements.get('logged_vector_only_window', UNAVAILABLE)}")
     lines.append(f"    fts only          {measurements.get('logged_fts_only_window', UNAVAILABLE)}")
     lines.append(f"    both              {measurements.get('logged_both_window', UNAVAILABLE)}")
@@ -565,13 +670,14 @@ def render(measurements: dict, window_days: int) -> str:
 
     lines.append("\n2d. candidates / traits")
     lines.append(f"  candidates total    {measurements.get('candidates_total', UNAVAILABLE)}")
+    lines.append(f"  created (window)    {measurements.get('candidates_created_window', UNAVAILABLE)}")
     lines.append(f"  promoted (window)   {measurements.get('candidates_promoted_window', UNAVAILABLE)}")
     lines.append(f"  trait count         {measurements.get('trait_count', UNAVAILABLE)}")
     for name, value, conf in measurements.get("_traits", []):
         lines.append(f"    {name}: {value} (confidence={conf:.2f})" if conf is not None
                       else f"    {name}: {value} (confidence=?)")
 
-    lines.append("\n2e. outcomes (expected: 0 until CP-D)")
+    lines.append("\n2e. outcomes")
     lines.append(f"  outcomes total      {measurements.get('outcomes_total', UNAVAILABLE)}")
 
     lines.append("\n2f. affect (temperament is a static parameter set, not a timescale)")
@@ -592,6 +698,14 @@ def render(measurements: dict, window_days: int) -> str:
     lines.append(f"  store.db bytes      {measurements.get('store_db_bytes', UNAVAILABLE)}")
     lines.append(f"  runs.db bytes       {measurements.get('runs_db_bytes', UNAVAILABLE)}")
     lines.append(f"  history.db bytes    {measurements.get('history_db_bytes', UNAVAILABLE)}")
+
+    lines.append("\n2i. intent loop (CP-D — from the daemon log's six markers; window)")
+    lines.append(f"  produced            {measurements.get('intents_produced_window', UNAVAILABLE)}")
+    lines.append(f"  executed            {measurements.get('intents_executed_window', UNAVAILABLE)}")
+    lines.append(f"  declined            {measurements.get('intents_declined_window', UNAVAILABLE)}")
+    lines.append(f"  consolidator fired  {measurements.get('consolidator_fired_window', UNAVAILABLE)}")
+    lines.append(f"  candidates created  {measurements.get('candidates_created_window_log', UNAVAILABLE)}"
+                  f"  (candidates table, same window: {measurements.get('candidates_created_window', UNAVAILABLE)})")
 
     lines.append("\nKNOWN GAPS")
     for gap in KNOWN_GAPS:

@@ -46,6 +46,7 @@ class IntentKind(str, Enum):
     set_state  = "set_state"
     noop       = "noop"
     research   = "research"   # RESERVED — deliberate information-seeking
+    retrieval  = "retrieval"  # CP-D: retrieve context for the turn in progress
 
 
 # ── Port types ────────────────────────────────────────────────────────────────
@@ -151,6 +152,34 @@ _DEFAULT_ATOM_SOURCE = "cli"
 # DECISIONS.md (CP-B, "affect_state has no table of its own").
 _AFFECT_STATE_FACT_SUBJECT = "_lyra_internal_affect_state"
 
+# CP-D: full strength — retrieval is proposed whenever a turn is in progress
+# (see tick()) and is overridden only by the same frustration-flip every
+# drive-produced intent already goes through (action_selection.py). Not
+# tuned; 1.0 is "yes, unless frustration is high enough to say no" in the
+# same units ActionSelector already compares boredom/relational pressure
+# against. See DECISIONS.md for what a 20-turn live run actually did with
+# this value — whether decline is reachable at this pressure is itself part
+# of what this checkpoint measures, not something assumed going in.
+_RETRIEVAL_PRESSURE = 1.0
+
+# CP-D: the two-branch weak signal a retrieval outcome reduces to (change 4)
+# — whether the assembled context contained at least one atom above the
+# retrievability floor. Mirrors development.py's trait_name_from_outcome in
+# shape (a fixed, closed vocabulary of exactly two outcomes), not reused
+# from it: that function is keyed to the boredom/relational "success"
+# concept (predicted == actual), which retrieval has no equivalent of.
+def _retrieval_trait_from_outcome(had_context: bool) -> tuple[str, str]:
+    if had_context:
+        return (
+            "retrieval finds relevant context",
+            "an assembled context contained at least one atom above the retrievability floor",
+        )
+    return (
+        "retrieval finds nothing",
+        "an assembled context contained no atoms above the retrievability floor",
+    )
+
+
 # CP-D.0: obs.source values whose text is NOT written here — they are the two
 # halves of one exchange, persisted together (with the retrieval that
 # informed them) by ingest_exchange() -> Store.ingest_turn(), not as two
@@ -159,6 +188,13 @@ _AFFECT_STATE_FACT_SUBJECT = "_lyra_internal_affect_state"
 # (vision, ...) is unaffected and still persists here, one atom per tick,
 # exactly as before.
 _EXCHANGE_OBS_SOURCES: frozenset[str] = frozenset(_ATOM_SPEAKER_BY_OBS_SOURCE)
+
+# CP-D: the context_log.misses entry that marks a turn which declined to
+# retrieve — distinct from a "semantic:"/"lexical:" miss (which mean
+# retrieval ran and found nothing) so report.py can tell "didn't try" apart
+# from "tried and found nothing." Change 3's own requirement: a declined
+# turn is still a visible row, not an absent one.
+DECLINED_MARKER = "retrieval: declined"
 
 
 class CognitiveCore:
@@ -349,10 +385,17 @@ class CognitiveCore:
 
     async def ingest_exchange(
         self, user_text: str, lyra_text: str, context, session_id, source: str = "cli",
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, int | None]:
         """Persist one full exchange — both atoms and the context_log row
         recording what retrieve_context() actually returned for it — in the
         one transaction Store.ingest_turn() provides (CP-D.0 change 2).
+
+        `context` is the ContextResult retrieve_context() returned, or None
+        when the turn declined to retrieve (CP-D change 3) — a declined turn
+        still gets a context_log row, marked as such via a distinguished
+        `misses` entry (`DECLINED_MARKER`) rather than being silently
+        absent; report.py's `_context_log_section` recognizes it and counts
+        it separately from a genuine empty retrieval.
 
         `session_id` is the daemon's own per-connection session string
         (TurnHandler.handle's `session` parameter) — Store's context_log
@@ -362,6 +405,12 @@ class CognitiveCore:
         DECISIONS.md for why reusing the session string here, rather than
         minting a new integer, is the honest choice — no cold-pass session
         row exists yet for this connection to reference.
+
+        Returns (user_atom_id, lyra_atom_id, context_log_id). ingest_turn()
+        itself does not return the context_log row's id (OUT OF SCOPE
+        forbids changing it), so it is read back by the exact `ts` this call
+        passed in — see _latest_context_log_id. None if it cannot be found
+        (memory without a `.db`, e.g. a test fake).
 
         Unguarded, like _ingest_sensory: a failed write is a turn that did
         not happen, not a turn silently missing its record.
@@ -375,11 +424,85 @@ class CognitiveCore:
         choice this checkpoint could avoid; recorded so it reads as known,
         not missed. See DECISIONS.md.
         """
-        injected = context.as_log_row()
+        if context is not None:
+            injected = context.as_log_row()
+        else:
+            injected = {
+                "atom_ids": [], "fact_ids": [], "dream_ids": [], "budget_used": 0,
+                "misses": [DECLINED_MARKER],
+            }
         injected["session_id"] = session_id
-        return await self._memory.ingest_turn(
-            user_text=user_text, lyra_text=lyra_text, source=source, injected=injected,
+        now = time.time()
+        user_atom_id, lyra_atom_id = await self._memory.ingest_turn(
+            user_text=user_text, lyra_text=lyra_text, source=source, injected=injected, ts=now,
         )
+        context_log_id = await self._latest_context_log_id(now)
+        return user_atom_id, lyra_atom_id, context_log_id
+
+    async def _latest_context_log_id(self, ts: float) -> int | None:
+        db = getattr(self._memory, "db", None)
+        if db is None:
+            return None
+        async with db.execute(
+            "SELECT id FROM context_log WHERE ts = ? ORDER BY id DESC LIMIT 1", (ts,)
+        ) as cur:
+            row = await cur.fetchone()
+        return row[0] if row is not None else None
+
+    async def record_retrieval_outcome(
+        self, user_atom_id: int, context_log_id: int | None, atom_count: int, path: str,
+    ) -> int | None:
+        """One outcomes row per executed retrieval intent (CP-D change 4).
+
+        The outcome bit is deliberately weak: whether the assembly returned
+        at least one atom above the retrievability floor (atom_count > 0),
+        encoded as `valence` (1.0/0.0) so it reads the same way every other
+        outcome's success bit does. `record_outcome()`'s own columns have no
+        room for atom_count/path/context_log_id as first-class fields (OUT
+        OF SCOPE does not license changing Store's schema for them) — `path`
+        goes in `actual` (Store's own free-text convention, e.g.
+        lyra_core.outcomes' ENGAGEMENT/SILENCE), `predicted` names what a
+        retrieval intent always wants ("context_available"), and
+        `environment` carries context_log_id/atom_count as a small
+        `key=value;...` string — parseable later, not a new column. See
+        DECISIONS.md.
+        """
+        record_outcome = getattr(self._memory, "record_outcome", None)
+        if record_outcome is None:
+            return None
+        valence = 1.0 if atom_count > 0 else 0.0
+        return await record_outcome(
+            intent_atom_id=user_atom_id,
+            valence=valence,
+            actual=path,
+            predicted="context_available",
+            environment=f"context_log_id={context_log_id};atom_count={atom_count}",
+        )
+
+    async def consolidate_retrieval_outcome(self, had_context: bool) -> tuple[str, str] | None:
+        """Fires on a retrieval outcome (CP-D change 5) — writes exactly one
+        `candidates` row, no dedup, no promotion. This is deliberately NOT
+        development.py's OutcomeConsolidator/CandidatePool: those are built
+        against MemorySystem's old db.py schema and semantic-embedding
+        dedup, neither of which Store has an equivalent of, and OUT OF SCOPE
+        excludes trait dedup from this checkpoint regardless. A minimal,
+        Store-native insert is the whole mechanism; nothing here ever
+        touches `traits` — promotion cannot happen because nothing promotes.
+
+        Returns (trait_name, trait_value) if a candidate row was written,
+        else None (memory without a `.db`, e.g. a test fake).
+        """
+        db = getattr(self._memory, "db", None)
+        if db is None:
+            return None
+        trait_name, trait_value = _retrieval_trait_from_outcome(had_context)
+        await db.execute(
+            "INSERT INTO candidates (trait_name, trait_value, evidence_count, last_seen, category, evidence_text)"
+            " VALUES (?, ?, 1, ?, 'retrieval', ?)",
+            (trait_name, trait_value, time.time(), trait_value),
+        )
+        await db.commit()
+        return trait_name, trait_value
 
     async def _ingest_outcome(self, obs: Observation) -> None:
         if obs.predicted is None or obs.actual is None:
@@ -468,7 +591,21 @@ class CognitiveCore:
         traits = await self._get_promoted_traits()
         bias = bias_from_traits(traits)
 
-        pressures = {"boredom": self._boredom.pressure, "relational": self._relational.pressure}
+        # CP-D: retrieval is proposed — at full strength, subject to the same
+        # frustration flip every other drive-produced intent goes through —
+        # exactly when a "conversation" observation arrived this tick (the
+        # first tick of an exchange, before retrieve_context() would run).
+        # Not "engaged" in general: the later "lyra" tick and any vision tick
+        # must not each propose their own retrieval for the same exchange.
+        awaiting_reply = any(
+            obs.kind == ObservationKind.sensory and obs.source == "conversation"
+            for obs in observations
+        )
+        pressures = {
+            "boredom": self._boredom.pressure,
+            "relational": self._relational.pressure,
+            "retrieval": _RETRIEVAL_PRESSURE if awaiting_reply else 0.0,
+        }
         intents = self._selector.select(pressures, self._affect.state, bias=bias)
         intents = self._gate_intents(intents)
 

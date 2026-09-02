@@ -20,11 +20,20 @@ from lyra_core.interface import Intent, IntentKind
 # Extend this set only after explicit review of the new capability.
 # Adding a kind here without a corresponding gate review is the mistake
 # this structure is designed to make visible.
+#
+# CP-D: IntentKind.retrieval reviewed and added. The capability is "read
+# from the store the daemon already owns, gated by frustration exactly like
+# boredom/relational" (action_selection.py) — no new external effect, no
+# write the daemon couldn't already do on the turn path. Not in the closed
+# FILES set for CP-D, but ALLOWED_KINDS is the one place a new IntentKind
+# MUST be added before it can ever execute (an ungated kind is silently
+# dropped by _gate_intents, never a bypass) — see DECISIONS.md.
 ALLOWED_KINDS: frozenset[IntentKind] = frozenset({
     IntentKind.speak,
     IntentKind.set_state,
     IntentKind.look,
     IntentKind.noop,
+    IntentKind.retrieval,
 })
 
 

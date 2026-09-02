@@ -34,7 +34,18 @@ Drive → intent mapping (within ALLOWED_KINDS only):
   "boredom" ≥ speak_threshold
                → IntentKind.speak (reach out — unprompted speech)
   "relational" → IntentKind.speak (address recurring friction)
+  "retrieval"  → IntentKind.retrieval (CP-D: retrieve context for the turn
+                 in progress — proposed by CognitiveCore.tick() at full
+                 strength whenever a "conversation" observation arrived
+                 this tick; the SAME frustration flip below can still
+                 override it, exactly as it can override boredom/relational)
   (nothing)    → IntentKind.noop  (abandon / wait)
+
+CP-D: retrieval reuses this file's one mechanism (drive pressure vs.
+frustration) rather than inventing a second way to decide anything,
+specifically so a frustrated-enough moment can make Lyra skip even pulling
+up context to answer — the same "abandons under frustration" shape this
+file already gives boredom and relational, not a new concept.
 
 WHY BOREDOM ALSO SPEAKS
 ───────────────────────
@@ -104,6 +115,13 @@ class ActionSelector:
         if relational > 0.0 and relational > frustration:
             # Drive wins: address recurring friction
             chosen.append(Intent(kind=IntentKind.speak, payload={"reason": "friction"}))
+
+        # CP-D: retrieval — same comparison, a different "drive" (not one of
+        # BoredomDrive/RelationalDrive; CognitiveCore.tick() sets this
+        # pressure directly from whether a turn is in progress this tick).
+        retrieval = drive_pressures.get("retrieval", 0.0)
+        if retrieval > 0.0 and retrieval > frustration:
+            chosen.append(Intent(kind=IntentKind.retrieval, payload={"reason": "turn"}))
 
         if not chosen:
             # All drives overridden or no drives active: abandon / wait

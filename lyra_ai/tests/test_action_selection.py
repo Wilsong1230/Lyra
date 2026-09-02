@@ -194,6 +194,44 @@ def test_encouragement_delays_abandon_flip():
     # else: encouraged never flipped within 30 steps → definitively later ✓
 
 
+# ── CP-D: retrieval — same drive-vs-frustration mechanism, a new pseudo-drive ──
+
+def test_neutral_affect_retrieval_pressure_selects_retrieval_intent():
+    selector = ActionSelector()
+    intents = selector.select({"retrieval": 1.0}, _make_affect(valence=0.0))
+    assert any(i.kind == IntentKind.retrieval for i in intents)
+
+
+def test_zero_retrieval_pressure_does_not_select_retrieval():
+    selector = ActionSelector()
+    intents = selector.select({"retrieval": 0.0}, _make_affect(valence=0.0))
+    assert not any(i.kind == IntentKind.retrieval for i in intents)
+
+
+def test_strong_negative_affect_flips_retrieval_to_declined():
+    """The same frustration flip that overrides boredom/relational can
+    override retrieval too — declining even to pull up context."""
+    selector = ActionSelector(affect_weight=1.0)
+    intents = selector.select({"retrieval": 0.3}, _make_affect(valence=-0.8))
+    assert not any(i.kind == IntentKind.retrieval for i in intents)
+
+
+def test_retrieval_and_boredom_can_both_be_selected_in_one_tick():
+    selector = ActionSelector()
+    intents = selector.select({"boredom": 0.5, "retrieval": 1.0}, _make_affect(valence=0.0))
+    kinds = {i.kind for i in intents}
+    assert IntentKind.retrieval in kinds
+    assert IntentKind.look in kinds
+
+
+def test_retrieval_intent_passes_the_real_harm_gate():
+    selector = ActionSelector()
+    gate = HarmGate()
+    intents = selector.select({"retrieval": 1.0}, _make_affect(valence=0.0))
+    retrieval_intent = next(i for i in intents if i.kind == IntentKind.retrieval)
+    assert gate.check(retrieval_intent).allowed
+
+
 # ── Gate boundary: affect override can never produce a blocked intent ─────────
 
 def test_extreme_affect_only_produces_allowed_intent_kinds():
@@ -206,6 +244,7 @@ def test_extreme_affect_only_produces_allowed_intent_kinds():
         {"boredom": 1.0},
         {"relational": 1.0},
         {"boredom": 1.0, "relational": 1.0},
+        {"retrieval": 1.0},
         {},
     ]
     for pressures in pressure_scenarios:

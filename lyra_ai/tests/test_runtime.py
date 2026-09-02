@@ -28,10 +28,16 @@ import pytest
 from lyra.assistant import LAYER1_FACTS, LyraClient
 from lyra_core import runtime
 from lyra_core.affect import AffectEngine
-from lyra_core.interface import AffectState, CognitiveCore
+from lyra_core.interface import AffectState, CognitiveCore, Intent, IntentKind
 from lyra_core.runtime import (
+    CANDIDATE_CREATED,
+    CONSOLIDATOR_FIRED,
     CORE_CONSTRUCTED,
     DT_CLAMP_ENGAGED,
+    INTENT_DECLINED,
+    INTENT_EXECUTED,
+    INTENT_PRODUCED,
+    OUTCOME_RECORDED,
     REQUIRED_TABLES,
     Runtime,
     StoreMissing,
@@ -235,26 +241,41 @@ def test_tick_clock_passes_small_gaps_through_and_clamps_large_ones():
 # ── turn handler ─────────────────────────────────────────────────────────────
 
 class _FakeCore:
-    """Records ticks and ingest_exchange calls; introspects a fixed affect;
-    retrieve_context() returns a fixed (default empty) ContextResult — CP-D.0
-    moved both retrieval and the atom+context_log write onto CognitiveCore,
-    so the fake now stands in for both."""
+    """Records ticks, ingest_exchange, record_retrieval_outcome, and
+    consolidate_retrieval_outcome calls; introspects a fixed affect;
+    retrieve_context() returns a fixed (default empty) ContextResult —
+    CP-D.0 moved retrieval and the atom+context_log write onto
+    CognitiveCore, CP-D added the retrieval intent itself plus the
+    outcome/consolidator steps, so the fake stands in for all of it.
+
+    produces_retrieval=True (the default) makes tick() propose
+    IntentKind.retrieval on every "conversation"-sourced observation,
+    matching the real CognitiveCore/ActionSelector (interface.py,
+    action_selection.py) — set False to test the declined path without
+    depending on frustration actually being high enough."""
 
     def __init__(
         self, affect: AffectState | None = None, context: "ContextResult | None" = None,
         retrieve_context_error: Exception | None = None,
+        produces_retrieval: bool = True,
     ) -> None:
         self.ticks: list[tuple[str, str, float]] = []
         self.exchanges: list[tuple[str, str, object, object]] = []
+        self.retrieval_outcomes: list[tuple] = []
+        self.consolidations: list[bool] = []
         self._affect = affect or AffectState()
         self._context = context if context is not None else _context_result("")
         self._retrieve_context_error = retrieve_context_error
+        self._produces_retrieval = produces_retrieval
         self.memory = MagicMock()
 
     async def tick(self, observations, dt=0.1):
         for obs in observations:
             self.ticks.append((obs.source, obs.content, dt))
-        return [], self._affect
+        intents = []
+        if self._produces_retrieval and any(o.source == "conversation" for o in observations):
+            intents.append(Intent(kind=IntentKind.retrieval, payload={"reason": "turn"}))
+        return intents, self._affect
 
     def introspect(self) -> AffectState:
         return self._affect
@@ -266,7 +287,15 @@ class _FakeCore:
 
     async def ingest_exchange(self, user_text, lyra_text, context, session_id, source="cli"):
         self.exchanges.append((user_text, lyra_text, context, session_id))
-        return (1, 2)
+        return (1, 2, 99)
+
+    async def record_retrieval_outcome(self, user_atom_id, context_log_id, atom_count, path):
+        self.retrieval_outcomes.append((user_atom_id, context_log_id, atom_count, path))
+        return len(self.retrieval_outcomes)
+
+    async def consolidate_retrieval_outcome(self, had_context):
+        self.consolidations.append(had_context)
+        return ("retrieval finds relevant context", "...") if had_context else ("retrieval finds nothing", "...")
 
 
 def _handler(backend, core=None, vision=None, history=None, now=None):
@@ -304,6 +333,115 @@ def test_handle_ingests_the_exchange_once_with_both_texts_and_the_session():
     assert lyra_text == "hi there"
     assert session_id == "s1"
     assert context is core._context, "the exact ContextResult retrieve_context() returned, not a second one"
+
+
+# ── CP-D: the intent loop, its log markers, and the declined path ─────────────
+
+def test_handle_logs_the_full_loop_in_order_with_a_shared_turn_id(caplog):
+    backend = _FakeBackend(["hi there"])
+    handler, core, history = _handler(backend)
+    with caplog.at_level(logging.INFO, logger="lyra_core.runtime"):
+        asyncio.run(handler.handle("hello", "s1"))
+
+    markers = [INTENT_PRODUCED, INTENT_EXECUTED, OUTCOME_RECORDED, CONSOLIDATOR_FIRED]
+    lines = [l for l in caplog.text.splitlines() if any(m in l for m in markers)]
+    seen = [next(m for m in markers if m in l) for l in lines]
+    assert seen == markers, f"expected {markers} in order, got {seen}"
+
+    turn_ids = {l.split("turn=")[1].split()[0] for l in lines}
+    assert turn_ids == {"1"}, "all four lines must share one turn id"
+
+
+def test_handle_declined_retrieval_logs_declined_not_produced(caplog):
+    backend = _FakeBackend(["hi there"])
+    core = _FakeCore(produces_retrieval=False)
+    handler, _, _ = _handler(backend, core=core)
+    with caplog.at_level(logging.INFO, logger="lyra_core.runtime"):
+        asyncio.run(handler.handle("hello", "s1"))
+
+    assert any(INTENT_DECLINED in l for l in caplog.text.splitlines())
+    assert not any(INTENT_PRODUCED in l for l in caplog.text.splitlines())
+    assert not any(OUTCOME_RECORDED in l for l in caplog.text.splitlines())
+    assert not any(CONSOLIDATOR_FIRED in l for l in caplog.text.splitlines())
+
+
+def test_handle_declined_retrieval_still_ingests_the_exchange_with_no_context():
+    """Change 3: a turn with no retrieval must still produce a context_log
+    row (via ingest_exchange with context=None), not skip persistence."""
+    backend = _FakeBackend(["hi there"])
+    core = _FakeCore(produces_retrieval=False)
+    handler, _, _ = _handler(backend, core=core)
+    asyncio.run(handler.handle("hello", "s1"))
+
+    assert len(core.exchanges) == 1
+    _user, _lyra, context, _session = core.exchanges[0]
+    assert context is None
+
+
+def test_handle_declined_retrieval_never_calls_record_outcome_or_consolidator():
+    backend = _FakeBackend(["hi there"])
+    core = _FakeCore(produces_retrieval=False)
+    handler, _, _ = _handler(backend, core=core)
+    asyncio.run(handler.handle("hello", "s1"))
+
+    assert core.retrieval_outcomes == []
+    assert core.consolidations == []
+
+
+def test_handle_executed_retrieval_calls_record_outcome_with_atom_count_and_path():
+    context = _context_result("## Recall\n- something")
+    context.atom_ids = [1, 2, 3]
+    backend = _FakeBackend(["hi there"])
+    core = _FakeCore(context=context)
+    handler, _, _ = _handler(backend, core=core)
+    asyncio.run(handler.handle("hello", "s1"))
+
+    assert len(core.retrieval_outcomes) == 1
+    user_atom_id, context_log_id, atom_count, path = core.retrieval_outcomes[0]
+    assert atom_count == 3
+    assert path == "both"  # no misses recorded on this ContextResult
+    assert context_log_id == 99  # the third element of _FakeCore.ingest_exchange's return
+
+
+def test_handle_executed_retrieval_fires_the_consolidator_with_had_context():
+    context = _context_result("## Recall\n- something")
+    context.atom_ids = [1]
+    backend = _FakeBackend(["hi there"])
+    core = _FakeCore(context=context)
+    handler, _, _ = _handler(backend, core=core)
+    asyncio.run(handler.handle("hello", "s1"))
+
+    assert core.consolidations == [True]
+
+
+def test_handle_executed_retrieval_with_no_atoms_fires_consolidator_with_false():
+    backend = _FakeBackend(["hi there"])
+    core = _FakeCore()  # default empty ContextResult: atom_ids == []
+    handler, _, _ = _handler(backend, core=core)
+    asyncio.run(handler.handle("hello", "s1"))
+
+    assert core.consolidations == [False]
+
+
+def test_handle_logs_candidate_created_when_consolidator_returns_one(caplog):
+    backend = _FakeBackend(["hi there"])
+    handler, core, _ = _handler(backend)
+    with caplog.at_level(logging.INFO, logger="lyra_core.runtime"):
+        asyncio.run(handler.handle("hello", "s1"))
+
+    assert any(CANDIDATE_CREATED in l for l in caplog.text.splitlines())
+
+
+def test_two_turns_get_two_different_turn_ids(caplog):
+    backend = _FakeBackend(["first reply", "second reply"])
+    handler, _, _ = _handler(backend)
+    with caplog.at_level(logging.INFO, logger="lyra_core.runtime"):
+        asyncio.run(handler.handle("one", "s1"))
+        asyncio.run(handler.handle("two", "s1"))
+
+    produced = [l for l in caplog.text.splitlines() if INTENT_PRODUCED in l]
+    turn_ids = [l.split("turn=")[1].split()[0] for l in produced]
+    assert turn_ids == ["1", "2"]
 
 
 def test_handle_calls_vision_and_reprompts():

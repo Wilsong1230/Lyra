@@ -16,39 +16,53 @@ from lyra_core.report import (
     FIELDS,
     KNOWN_GAPS,
     UNAVAILABLE,
-    _classify_misses,
+    classify_misses,
     collect_from_path,
     collect_measurements,
     format_log_line,
     open_read_only,
+    path_label,
     render,
 )
+from lyra_core.interface import DECLINED_MARKER
 from lyra_memory.store import Store
 
 
-# ── _classify_misses ─────────────────────────────────────────────────────────
+# ── classify_misses ─────────────────────────────────────────────────────────
 
 def test_classify_misses_both_hit_when_no_miss_recorded():
-    assert _classify_misses([]) == (True, True)
+    assert classify_misses([]) == (True, True)
 
 
 def test_classify_misses_vector_missed():
-    assert _classify_misses(["semantic: nothing above similarity floor 0.35"]) == (False, True)
+    assert classify_misses(["semantic: nothing above similarity floor 0.35"]) == (False, True)
 
 
 def test_classify_misses_lexical_missed():
-    assert _classify_misses(["lexical: no BM25 match"]) == (True, False)
+    assert classify_misses(["lexical: no BM25 match"]) == (True, False)
 
 
 def test_classify_misses_neither_hit():
-    assert _classify_misses(["semantic: nothing above similarity floor 0.35",
+    assert classify_misses(["semantic: nothing above similarity floor 0.35",
                               "lexical: query had no selective tokens"]) == (False, False)
 
 
 def test_classify_misses_ignores_unrelated_miss_strings():
     """A "recall: ..." miss (temporal withheld) says nothing about either
     path on its own — must not be misread as a vector or lexical miss."""
-    assert _classify_misses(["recall: no relevant hit on any path; temporal pool withheld"]) == (True, True)
+    assert classify_misses(["recall: no relevant hit on any path; temporal pool withheld"]) == (True, True)
+
+
+# ── path_label (CP-D: shared with runtime.py's INTENT_EXECUTED/OUTCOME_RECORDED) ──
+
+@pytest.mark.parametrize("vector_hit,fts_hit,expected", [
+    (True, True, "both"),
+    (True, False, "vector"),
+    (False, True, "fts"),
+    (False, False, "neither"),
+])
+def test_path_label(vector_hit, fts_hit, expected):
+    assert path_label(vector_hit, fts_hit) == expected
 
 
 # ── format_log_line / render ────────────────────────────────────────────────
@@ -183,6 +197,27 @@ async def test_collect_measurements_context_log_nonempty_atom_ids_counts_as_with
     assert m["logged_both_window"] == 1
 
 
+async def test_collect_measurements_context_log_declined_row_counted_separately(store, tmp_path):
+    """CP-D: a turn that declined to retrieve (interface.DECLINED_MARKER in
+    misses) must not be folded into vector/fts/both/neither — those all
+    describe retrieval that actually ran."""
+    await store.ingest_turn(
+        user_text="q", lyra_text="a",
+        injected={"atom_ids": [], "fact_ids": [], "dream_ids": [], "budget_used": 0,
+                  "misses": [DECLINED_MARKER]},
+    )
+
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["logged_assemblies_window"] == 1
+    assert m["logged_declined_window"] == 1
+    assert m["logged_empty_window"] == 0
+    assert m["logged_both_window"] == 0
+    assert m["logged_neither_window"] == 0
+
+
 async def test_collect_measurements_outcomes_zero_on_a_fresh_store(store, tmp_path):
     m = await collect_measurements(
         store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
@@ -299,3 +334,58 @@ async def test_collect_from_path_history_bytes_unavailable_when_missing(tmp_path
         log_path=tmp_path / "no_such_log.log",
     )
     assert m["history_db_bytes"] == UNAVAILABLE
+
+
+# ── CP-D: the intent loop, parsed from the daemon's log (change 7) ────────────
+
+def _write_log(path: Path, lines: list[str]) -> None:
+    fmt = "2026-09-02 12:00:00,000 INFO lyra_core.runtime: {}\n"
+    path.write_text("".join(fmt.format(l) for l in lines))
+
+
+async def test_collect_from_path_counts_loop_markers_from_the_log(tmp_path):
+    store = await Store.open(tmp_path / "store.db")
+    await store.close()
+    log_path = tmp_path / "lyra_core.log"
+    _write_log(log_path, [
+        "INTENT_PRODUCED turn=1 kind=retrieval",
+        "INTENT_EXECUTED turn=1 kind=retrieval atom_count=2 path=both",
+        "OUTCOME_RECORDED turn=1 outcome_id=1 atom_count=2 path=both context_log_id=1",
+        "CONSOLIDATOR_FIRED turn=1 outcome_id=1",
+        "CANDIDATE_CREATED turn=1 trait_name='retrieval finds relevant context'",
+        "INTENT_DECLINED turn=2 kind=retrieval valence=-0.900000",
+    ])
+
+    m = await collect_from_path(tmp_path / "store.db", tmp_path / "runs.db", None, log_path=log_path)
+
+    assert m["intents_produced_window"] == 1
+    assert m["intents_executed_window"] == 1
+    assert m["intents_declined_window"] == 1
+    assert m["consolidator_fired_window"] == 1
+    assert m["candidates_created_window_log"] == 1
+
+
+async def test_collect_from_path_loop_counts_unavailable_without_a_log(tmp_path):
+    store = await Store.open(tmp_path / "store.db")
+    await store.close()
+
+    m = await collect_from_path(
+        tmp_path / "store.db", tmp_path / "runs.db", None,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["intents_produced_window"] == UNAVAILABLE
+    assert m["consolidator_fired_window"] == UNAVAILABLE
+
+
+async def test_collect_measurements_candidates_created_window_from_db(store, tmp_path):
+    from lyra_core.interface import CognitiveCore
+
+    core = CognitiveCore(memory=store)
+    await core.consolidate_retrieval_outcome(had_context=True)
+
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["candidates_created_window"] == 1
+    assert m["candidates_total"] == 1

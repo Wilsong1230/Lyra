@@ -26,10 +26,21 @@ Lifecycle:
   stop  : cancel the self-report task -> stop listening (no new turns) ->
           stop the core (affect persisted) -> close the store
 
+CP-D: the loop closes. CognitiveCore.tick() can now propose an
+IntentKind.retrieval intent (interface.py, action_selection.py) for the
+turn in progress; TurnHandler.handle() below executes it instead of
+discarding it — retrieve_context(), an outcomes row per execution
+(record_retrieval_outcome), and a minimal consolidator firing
+(consolidate_retrieval_outcome) that may write one `candidates` row but
+never promotes a trait. Every step logs one line on a stable marker
+(INTENT_PRODUCED/EXECUTED/DECLINED, OUTCOME_RECORDED, CONSOLIDATOR_FIRED,
+CANDIDATE_CREATED), all sharing one per-turn id. Every OTHER intent kind
+(look, speak, noop) tick() may still produce is still bound and left
+unexecuted — CP-D closes the loop for retrieval only.
+
 Ticks happen when a turn arrives, not on a timer. dt is wall-clock seconds
 since the previous tick, clamped to config.MAX_TICK_DT_SECONDS — see the
-note there for why the clamp is what it is. tick() still returns intents;
-they are bound and left unconsumed, as CP-A requires.
+note there for why the clamp is what it is.
 
 Every tick logs one structured INFO line (TurnHandler.tick): raw elapsed,
 applied dt, whether the clamp engaged, both drives' pressure, and the
@@ -63,8 +74,8 @@ from lyra.backends import Backend
 from lyra.memory import ConversationMemory
 from lyra_core.config import DAEMON_HOST, DAEMON_PORT, MAX_TICK_DT_SECONDS, REPORT_INTERVAL_SECONDS
 from lyra_core.expression import prose_hint
-from lyra_core.interface import AffectVector, CognitiveCore, Observation, ObservationKind
-from lyra_core.report import UNAVAILABLE, collect_from_path, format_log_line
+from lyra_core.interface import AffectVector, CognitiveCore, IntentKind, Observation, ObservationKind
+from lyra_core.report import UNAVAILABLE, classify_misses, collect_from_path, format_log_line, path_label
 from lyra_core.transport import TurnRejected, TurnServer
 from lyra_memory.config import DB_PATH, EMBED_MODEL, STORE_PATH
 from lyra_memory.embeddings import embed
@@ -76,6 +87,16 @@ log = logging.getLogger("lyra_core.runtime")
 CORE_CONSTRUCTED = "CORE_CONSTRUCTED"
 DT_CLAMP_ENGAGED = "DT_CLAMP_ENGAGED"
 
+# CP-D: the intent loop, one marker per step, all sharing one per-turn id
+# (TurnHandler._turn_seq) so `grep` on any one of them and following the
+# turn= value finds the whole sequence for that turn.
+INTENT_PRODUCED = "INTENT_PRODUCED"
+INTENT_EXECUTED = "INTENT_EXECUTED"
+INTENT_DECLINED = "INTENT_DECLINED"
+OUTCOME_RECORDED = "OUTCOME_RECORDED"
+CONSOLIDATOR_FIRED = "CONSOLIDATOR_FIRED"
+CANDIDATE_CREATED = "CANDIDATE_CREATED"
+
 # Tables the hot path and the current retrieval queries reference (CP-B —
 # Store's schema, lyra_memory/store/schema.py, not the older db.py):
 #   atoms       — every turn is written here (CognitiveCore._ingest_sensory)
@@ -83,12 +104,12 @@ DT_CLAMP_ENGAGED = "DT_CLAMP_ENGAGED"
 #   vec_atoms   — its embedding, store.context._semantic_hits
 #   facts       — affect_state restore/persist AND store.context._facts_block
 #   commitments — store.context._commitments_block
-#   outcomes    — CognitiveCore._ingest_outcome's eventual home (unwritten
-#                 this checkpoint; required so a mismatch is caught early)
+#   outcomes    — CP-D: one row per executed retrieval intent
+#                 (CognitiveCore.record_retrieval_outcome)
 #   traits      — store.context._traits_block
-#   candidates  — where trait promotion would write (inert without an
-#                 identity_engine against Store — OUT OF SCOPE; see
-#                 DECISIONS.md)
+#   candidates  — CP-D: one row per consolidator firing on a retrieval
+#                 outcome (CognitiveCore.consolidate_retrieval_outcome) —
+#                 never promoted to traits (OUT OF SCOPE)
 # Named, not the old memory.db's table names verbatim, so a pre-CP-B
 # memory.db (which lacks atoms_fts, commitments, and outcomes) can never
 # satisfy this check by accident — see DECISIONS.md (CP-B, change 3).
@@ -333,8 +354,16 @@ class TurnHandler:
         self._clock = clock
         self._vision_fn = vision_fn
         self._system = system
-        # Bound, not executed. CP-A leaves tick() output unconsumed.
+        # Bound; look/speak/noop are still left unexecuted (CP-D closes the
+        # loop for retrieval only). handle() reads this after every
+        # "conversation" tick to see whether retrieval was produced.
         self.last_intents: list = []
+        # CP-D: the shared identifier tying one turn's log lines together —
+        # a plain per-process counter, not a store id (nothing durable needs
+        # to reference it; it only has to be unique within one daemon's
+        # log). Safe under concurrent turns: incremented in one statement
+        # with no `await` inside it, so no other coroutine can interleave.
+        self._turn_seq: int = 0
 
     async def tick(self, source: str, content: str) -> None:
         obs = Observation(kind=ObservationKind.sensory, source=source, content=content)
@@ -372,16 +401,26 @@ class TurnHandler:
         string and fetching it here: handle() needs that same ContextResult
         again afterward, for ingest_exchange() — fetching it twice would
         both double the retrieval cost and risk the two calls disagreeing.
+        `context` is None when the turn declined to retrieve (CP-D change
+        3) — the prompt then carries no retrieved context at all, same as
+        an empty ContextResult would, just without ever having asked.
         Unguarded on purpose, same as before: a broken store and an empty
         store must not produce the same prompt.
         """
         parts = [self._system]
-        if context.text:
+        if context is not None and context.text:
             parts.append(context.text)
         hint = prose_hint(self._core.introspect())
         if hint:
             parts.append(hint)
         return "\n\n".join(parts)
+
+    def _retrieval_path(self, context) -> tuple[int, str]:
+        """(atom_count, path) for one ContextResult — the same shape both
+        INTENT_EXECUTED's log line and record_retrieval_outcome() need."""
+        atom_count = len(context.atom_ids)
+        vector_hit, fts_hit = classify_misses(context.misses)
+        return atom_count, path_label(vector_hit, fts_hit)
 
     async def _complete(self, session: str, system: str) -> str:
         history = self._history.get_history(session)
@@ -404,9 +443,36 @@ class TurnHandler:
         # for the user's message arriving; it no longer writes an atom
         # (interface.py's _ingest_sensory) — ingest_exchange() at the end
         # does, for both halves of the exchange, atomically.
+        self._turn_seq += 1
+        turn_id = self._turn_seq
+
         self._history.add(session, "user", message)
         await self.tick("conversation", message)
-        context = await self._core.retrieve_context(message)
+
+        # CP-D: the core decided (CognitiveCore.tick -> ActionSelector) —
+        # this reads that decision off last_intents rather than deciding
+        # anything itself. Producing and executing are one step apart here
+        # (nothing currently separates them), but logged as two distinct
+        # markers per change 6.
+        retrieval_intended = any(i.kind == IntentKind.retrieval for i in self.last_intents)
+        if retrieval_intended:
+            log.info("%s turn=%d kind=retrieval", INTENT_PRODUCED, turn_id)
+            context = await self._core.retrieve_context(message)
+            atom_count, path = self._retrieval_path(context)
+            log.info(
+                "%s turn=%d kind=retrieval atom_count=%d path=%s",
+                INTENT_EXECUTED, turn_id, atom_count, path,
+            )
+        else:
+            # Declined: frustration outweighed the retrieval pressure this
+            # tick (action_selection.py) — valence is logged as the
+            # legible reason, not a re-derivation of the flip's arithmetic.
+            log.info(
+                "%s turn=%d kind=retrieval valence=%.6f",
+                INTENT_DECLINED, turn_id, self._core.introspect().valence,
+            )
+            context = None
+
         system = self._compose_system_prompt(context)
         for _ in range(_VISION_ATTEMPTS):
             response = await self._complete(session, system)
@@ -414,7 +480,7 @@ class TurnHandler:
             if source is None:
                 self._history.add(session, "assistant", response)
                 await self.tick("lyra", response)
-                await self._core.ingest_exchange(message, response, context, session_id=session)
+                await self._finish_exchange(message, response, context, session, turn_id, retrieval_intended)
                 return response
             self._history.add(session, "assistant", truncate_at_tool_call(response))
             description = await asyncio.to_thread(self._vision_fn, source)
@@ -422,8 +488,38 @@ class TurnHandler:
             self._history.add(session, "user", f"[Vision result: {description}]")
         self._history.add(session, "assistant", _VISION_FALLBACK)
         await self.tick("lyra", _VISION_FALLBACK)
-        await self._core.ingest_exchange(message, _VISION_FALLBACK, context, session_id=session)
+        await self._finish_exchange(message, _VISION_FALLBACK, context, session, turn_id, retrieval_intended)
         return _VISION_FALLBACK
+
+    async def _finish_exchange(
+        self, message: str, response: str, context, session: str, turn_id: int,
+        retrieval_intended: bool,
+    ) -> None:
+        """ingest_exchange() always; the outcome/consolidator steps only
+        when a retrieval intent actually executed this turn (change 4:
+        "one outcome row per EXECUTED retrieval intent" — a declined turn
+        produced neither an intent to execute nor context to score)."""
+        user_atom_id, _lyra_atom_id, context_log_id = await self._core.ingest_exchange(
+            message, response, context, session_id=session)
+
+        if not retrieval_intended:
+            return
+
+        atom_count, path = self._retrieval_path(context)
+        outcome_id = await self._core.record_retrieval_outcome(
+            user_atom_id, context_log_id, atom_count, path)
+        if outcome_id is None:
+            return
+        log.info(
+            "%s turn=%d outcome_id=%d atom_count=%d path=%s context_log_id=%s",
+            OUTCOME_RECORDED, turn_id, outcome_id, atom_count, path, context_log_id,
+        )
+
+        consolidated = await self._core.consolidate_retrieval_outcome(atom_count > 0)
+        log.info("%s turn=%d outcome_id=%d", CONSOLIDATOR_FIRED, turn_id, outcome_id)
+        if consolidated is not None:
+            trait_name, _trait_value = consolidated
+            log.info("%s turn=%d trait_name=%r", CANDIDATE_CREATED, turn_id, trait_name)
 
 
 def parse_tool_call(response: str) -> str | None:

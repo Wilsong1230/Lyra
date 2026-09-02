@@ -21,6 +21,7 @@ from lyra_core.interface import (
     Observation,
     ObservationKind,
 )
+from lyra_memory.store import Store
 
 
 # ── Observation ───────────────────────────────────────────────────────────────
@@ -225,6 +226,49 @@ def test_tick_observations_without_signal_match_empty_tick():
     assert affect_a.arousal == pytest.approx(affect_b.arousal)
 
 
+# ── CP-D: retrieval intent production ──────────────────────────────────────────
+
+def test_tick_produces_retrieval_intent_for_a_conversation_observation():
+    memory = _RecordingMemory()
+    core = CognitiveCore(memory=memory)
+    obs = Observation(kind=ObservationKind.sensory, source="conversation", content="hello")
+
+    intents, _ = asyncio.run(core.tick([obs]))
+
+    assert any(i.kind == IntentKind.retrieval for i in intents)
+
+
+def test_tick_does_not_produce_retrieval_intent_for_a_lyra_observation():
+    """The SECOND tick of an exchange (her reply) must not itself propose a
+    fresh retrieval — retrieval already happened for this exchange."""
+    memory = _RecordingMemory()
+    core = CognitiveCore(memory=memory)
+    obs = Observation(kind=ObservationKind.sensory, source="lyra", content="hi there")
+
+    intents, _ = asyncio.run(core.tick([obs]))
+
+    assert not any(i.kind == IntentKind.retrieval for i in intents)
+
+
+def test_tick_does_not_produce_retrieval_intent_for_a_vision_observation():
+    memory = _RecordingMemory()
+    core = CognitiveCore(memory=memory)
+    obs = Observation(kind=ObservationKind.sensory, source="vision", content="a window")
+
+    intents, _ = asyncio.run(core.tick([obs]))
+
+    assert not any(i.kind == IntentKind.retrieval for i in intents)
+
+
+def test_tick_does_not_produce_retrieval_intent_for_an_empty_tick():
+    memory = _RecordingMemory()
+    core = CognitiveCore(memory=memory)
+
+    intents, _ = asyncio.run(core.tick([]))
+
+    assert not any(i.kind == IntentKind.retrieval for i in intents)
+
+
 # ── Ingest routing: source threading ──────────────────────────────────────────
 
 class _RecordingMemory:
@@ -343,14 +387,31 @@ def test_ingest_exchange_carries_the_context_result_as_log_row():
         assert injected[key] == value
 
 
-def test_ingest_exchange_returns_the_two_atom_ids():
+def test_ingest_exchange_returns_the_two_atom_ids_and_a_context_log_id():
+    """CP-D: context_log_id is None here because _RecordingMemory has no
+    `.db` for _latest_context_log_id to query — the real lookup against a
+    live Store is covered below (test_ingest_exchange_against_a_real_store)."""
     memory = _RecordingMemory()
     core = CognitiveCore(memory=memory)
     context = _FakeContextResult({"atom_ids": [], "fact_ids": [], "dream_ids": [], "budget_used": 0})
 
     result = asyncio.run(core.ingest_exchange("q", "a", context, session_id="s1"))
 
-    assert result == (1, 2)
+    assert result == (1, 2, None)
+
+
+def test_ingest_exchange_with_none_context_marks_the_turn_declined():
+    """CP-D change 3: a turn that declined to retrieve still gets a
+    context_log row, marked via a distinguished misses entry rather than
+    being silently absent."""
+    memory = _RecordingMemory()
+    core = CognitiveCore(memory=memory)
+
+    asyncio.run(core.ingest_exchange("q", "a", None, session_id="s1"))
+
+    injected = memory.ingest_calls[0]["injected"]
+    assert injected["atom_ids"] == []
+    assert injected["misses"] == ["retrieval: declined"]
 
 
 def test_retrieve_context_calls_through_to_build_context(monkeypatch):
@@ -367,6 +428,28 @@ def test_retrieve_context_calls_through_to_build_context(monkeypatch):
 
     result = asyncio.run(core.retrieve_context("what's the plan"))
     assert result == "SENTINEL"
+
+
+# ── record_retrieval_outcome / consolidate_retrieval_outcome (CP-D) ────────────
+
+def test_record_retrieval_outcome_returns_none_without_a_record_outcome_method():
+    """_RecordingMemory has no record_outcome — same duck-typed graceful
+    absence as every other Store-only method on CognitiveCore."""
+    memory = _RecordingMemory()
+    core = CognitiveCore(memory=memory)
+
+    result = asyncio.run(core.record_retrieval_outcome(1, context_log_id=2, atom_count=3, path="both"))
+
+    assert result is None
+
+
+def test_consolidate_retrieval_outcome_returns_none_without_a_db():
+    memory = _RecordingMemory()
+    core = CognitiveCore(memory=memory)
+
+    result = asyncio.run(core.consolidate_retrieval_outcome(had_context=True))
+
+    assert result is None
 
 
 def test_ingest_routes_other_sources_to_system_speaker_over_cli():
@@ -689,3 +772,97 @@ def test_introspect_unaffected_by_gate_wiring():
     state = core.introspect()
     assert state.valence == pytest.approx(0.0)
     assert state.arousal == pytest.approx(0.0)
+
+
+# ── CP-D against a real Store: context_log_id, outcomes, candidates ────────────
+
+@pytest.fixture
+async def store(tmp_path):
+    s = await Store.open(tmp_path / "store.db")
+    yield s
+    await s.close()
+
+
+async def test_ingest_exchange_against_a_real_store(store):
+    core = CognitiveCore(memory=store)
+    context = await core.retrieve_context("hello")
+
+    user_id, lyra_id, context_log_id = await core.ingest_exchange(
+        "hello", "hi there", context, session_id="s1")
+
+    assert user_id != lyra_id
+    assert context_log_id is not None
+    async with store.db.execute(
+        "SELECT session_id, atom_ids FROM context_log WHERE id = ?", (context_log_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    assert row is not None
+    assert row[0] == "s1"
+
+
+async def test_record_retrieval_outcome_writes_an_outcomes_row(store):
+    core = CognitiveCore(memory=store)
+    user_id = await store.append_atom(speaker="wilson", source="cli", text="hello")
+
+    outcome_id = await core.record_retrieval_outcome(
+        user_id, context_log_id=7, atom_count=3, path="both")
+
+    assert outcome_id is not None
+    async with store.db.execute(
+        "SELECT intent_atom_id, valence, actual, predicted, environment FROM outcomes WHERE id = ?",
+        (outcome_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    assert row[0] == user_id
+    assert row[1] == 1.0
+    assert row[2] == "both"
+    assert row[3] == "context_available"
+    assert "context_log_id=7" in row[4]
+    assert "atom_count=3" in row[4]
+
+
+async def test_record_retrieval_outcome_valence_is_zero_when_nothing_was_found(store):
+    core = CognitiveCore(memory=store)
+    user_id = await store.append_atom(speaker="wilson", source="cli", text="hello")
+
+    outcome_id = await core.record_retrieval_outcome(
+        user_id, context_log_id=1, atom_count=0, path="neither")
+
+    async with store.db.execute("SELECT valence FROM outcomes WHERE id = ?", (outcome_id,)) as cur:
+        row = await cur.fetchone()
+    assert row[0] == 0.0
+
+
+async def test_consolidate_retrieval_outcome_writes_a_candidates_row(store):
+    core = CognitiveCore(memory=store)
+
+    result = await core.consolidate_retrieval_outcome(had_context=True)
+
+    assert result == (
+        "retrieval finds relevant context",
+        "an assembled context contained at least one atom above the retrievability floor",
+    )
+    async with store.db.execute("SELECT trait_name, category FROM candidates") as cur:
+        rows = await cur.fetchall()
+    assert rows == [("retrieval finds relevant context", "retrieval")]
+
+
+async def test_consolidate_retrieval_outcome_names_the_other_branch_when_empty(store):
+    core = CognitiveCore(memory=store)
+
+    result = await core.consolidate_retrieval_outcome(had_context=False)
+
+    assert result[0] == "retrieval finds nothing"
+
+
+async def test_consolidate_retrieval_outcome_never_writes_to_traits(store):
+    """CP-D change 5: must not promote — this consolidator has no path to
+    `traits` at all."""
+    core = CognitiveCore(memory=store)
+
+    await core.consolidate_retrieval_outcome(had_context=True)
+    await core.consolidate_retrieval_outcome(had_context=False)
+
+    async with store.db.execute("SELECT COUNT(*) FROM traits") as cur:
+        count = (await cur.fetchone())[0]
+    assert count == 0
