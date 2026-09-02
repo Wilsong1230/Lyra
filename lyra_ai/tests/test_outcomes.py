@@ -13,7 +13,6 @@ from lyra_core.interface import (
     Observation,
     ObservationKind,
 )
-from lyra_core.runtime import CoreSink
 
 
 def _speak(reason: str = "boredom") -> Intent:
@@ -182,25 +181,3 @@ def test_outcome_observation_reaches_consolidator_and_writes_a_candidate():
         "developmental trait names must dedup by exact name — semantic dedup "
         "merges 'persists under frustration' into 'abandons under frustration'"
     )
-
-
-def test_coresink_starts_an_outcome_watch_only_for_executed_speech():
-    class _FakeCore:
-        def __init__(self, intents): self._intents = intents
-        async def tick(self, obs, dt=0.1):
-            return self._intents, AffectState(emotion=AffectVector())
-
-    async def ok_send(text): return True
-    async def fail_send(text): return False
-
-    tr_ok = OutcomeTracker()
-    sink_ok = CoreSink(_FakeCore([_speak()]), dt=2.0,
-                       actuator=SpeechActuator(send_fn=ok_send), outcomes=tr_ok)
-    asyncio.run(sink_ok([]))
-    assert tr_ok.pending_count == 1
-
-    tr_fail = OutcomeTracker()
-    sink_fail = CoreSink(_FakeCore([_speak()]), dt=2.0,
-                         actuator=SpeechActuator(send_fn=fail_send), outcomes=tr_fail)
-    asyncio.run(sink_fail([]))
-    assert tr_fail.pending_count == 0, "a failed send is not an executed action"

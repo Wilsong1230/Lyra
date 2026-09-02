@@ -75,12 +75,14 @@ if (-not $ollamaUp) {
 }
 
 if ($Chat) {
+    # CP-A: the CLI is a client of the daemon and takes no backend arguments.
+    # Start the mind first (this script without -Chat), then attach.
+    & (Join-Path $PSScriptRoot "lyra_ai\$venvDir\Scripts\lyra.exe")
+} else {
     # Pass the tag explicitly: OllamaBackend.default_model is "llama3.2", which
     # resolves to llama3.2:latest and is not pulled here. llama3:latest rather
     # than llama3.2:3b because the 3B cannot hold LAYER1_FACTS - it denies being
     # Lyra and denies having internal states, both of which the prompt forbids.
-    & (Join-Path $PSScriptRoot "lyra_ai\$venvDir\Scripts\lyra.exe") --backend ollama --model $Model
-} else {
     Set-Location (Join-Path $PSScriptRoot "lyra_ai")
-    & $python -m lyra_core
+    & $python -m lyra_core --backend ollama --model $Model
 }

@@ -1,33 +1,37 @@
+"""lyra.cli — the `lyra` command. A thin client of the daemon.
+
+Attaches to the daemon over loopback, sends turns, prints replies, and
+detaches on /quit, EOF or Ctrl-C without signalling the daemon. If no
+daemon is listening it says so on one line and exits nonzero; it never
+starts a core of its own.
+
+The peripherals the CLI already drove — avatar state, TTS playback,
+push-to-talk recording — stay here. They are the body in the room, not
+cognition, and the daemon does not need to know about them.
+"""
 from __future__ import annotations
 
 import argparse
 import asyncio
 import json
 import os
-import signal
 import sys
-import uuid
+import threading
 from http.client import HTTPConnection
 from urllib.parse import urlparse
 
 import readchar
 
-from lyra.assistant import Assistant
-from lyra.backends import BACKENDS, auto_select_backend, available_backends, create_backend
-from lyra.memory import ConversationMemory
+from lyra.assistant import DaemonError, DaemonGone, DaemonUnavailable, LyraClient, new_session_id
+from lyra_core.config import DAEMON_HOST, DAEMON_PORT
 
 HELP_TEXT = """\
 Commands:
   /help             Show this help
-  /quit             Exit
-  /stream           Toggle streaming output on/off
-  /history          Print this session's conversation
-  /clear            Erase this session's history
-  /session list     List all saved sessions
+  /quit             Exit (the daemon keeps running)
+  /session          Show the current session id
   /session new      Start a fresh session
   /session <id>     Switch to an existing session
-  /backend          Show current backend
-  /model            Show current model
   /voice            Toggle voice output on/off
 
 Push-to-talk: press Ctrl+R at the prompt, speak, press Enter to send.
@@ -36,7 +40,6 @@ Push-to-talk: press Ctrl+R at the prompt, speak, press Enter to send.
 EMBODIMENT_URL = os.getenv("EMBODIMENT_URL", "http://localhost:8000")
 VOICE_URL = os.getenv("VOICE_URL", "http://localhost:8001")
 LISTEN_URL = os.getenv("LISTEN_URL", "http://localhost:8002")
-VISION_URL = os.getenv("VISION_URL", "http://localhost:8003")
 
 
 def _post_json(url: str, body: dict, timeout: float = 1.0) -> dict:
@@ -65,14 +68,6 @@ def speak_response(text: str) -> None:
         pass
 
 
-def _call_vision(source: str) -> str:
-    try:
-        result = _post_json(f"{VISION_URL}/see", {"source": source, "prompt": "Describe what you see in detail."}, timeout=30.0)
-        return result.get("description", "Error: empty vision response")
-    except Exception as e:
-        return f"Error: vision service unavailable — {e}"
-
-
 _PTT_KEY  = "\x12"   # Ctrl+R
 _CTRL_C   = "\x03"
 _CTRL_D   = "\x04"
@@ -81,8 +76,17 @@ _BACKSPACE = ("\x7f", "\x08")
 
 
 def _read_input() -> str | None:
-    """Read a line from stdin char-by-char. Returns None if Ctrl+R pressed."""
+    """Read a line from stdin. Returns None if Ctrl+R (push-to-talk) is pressed.
+
+    Char-by-char on a terminal so Ctrl+R can be caught; plain line reads
+    when stdin is a pipe, where there is no push-to-talk.
+    """
     print("you> ", end="", flush=True)
+    if not sys.stdin.isatty():
+        line = sys.stdin.readline()
+        if not line:
+            raise EOFError
+        return line.rstrip("\r\n")
     buf: list[str] = []
     while True:
         ch = readchar.readchar()
@@ -123,81 +127,96 @@ def _wait_for_enter() -> None:
             return
 
 
-async def _main() -> None:
-    parser = argparse.ArgumentParser(prog="lyra", description="Lyra — conversational assistant")
-    parser.add_argument("--backend", choices=list(BACKENDS), help="Backend to use")
-    parser.add_argument("--model", help="Model name (overrides backend default)")
-    parser.add_argument("--session", help="Resume a specific session ID")
-    parser.add_argument("--list-backends", action="store_true", help="Show available backends and exit")
-    parser.add_argument("--list-models", action="store_true", help="List models for the chosen backend and exit")
-    args = parser.parse_args()
+def _read_input_in_thread(loop: asyncio.AbstractEventLoop) -> asyncio.Future:
+    """Run _read_input on a daemon thread and hand back a future.
 
-    if args.list_backends:
-        avail = available_backends()
-        for name in BACKENDS:
-            marker = "+" if name in avail else "-"
-            print(f"  [{marker}] {name}")
-        return
+    A daemon thread rather than to_thread's pool: if the daemon connection
+    drops while the user is sitting at the prompt, the process must exit
+    now, and a pool thread blocked in readchar would be joined at interpreter
+    exit and hang until a key was pressed.
+    """
+    future: asyncio.Future = loop.create_future()
 
-    if args.backend:
+    def _deliver(fn, value) -> None:
+        if not future.done():
+            fn(value)
+
+    def _run() -> None:
         try:
-            backend = create_backend(args.backend)
-        except ValueError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            sys.exit(1)
-    else:
+            result = _read_input()
+        except BaseException as exc:  # EOFError / KeyboardInterrupt travel to the loop
+            outcome = (future.set_exception, exc)
+        else:
+            outcome = (future.set_result, result)
         try:
-            backend = auto_select_backend()
-        except RuntimeError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            sys.exit(1)
-
-    if args.model:
-        backend.default_model = args.model
-
-    if args.list_models:
-        try:
-            for m in backend.list_models():
-                print(f"  {m}")
-        except Exception as exc:
-            print(f"error fetching models: {exc}", file=sys.stderr)
-            sys.exit(1)
-        return
-
-    memory = ConversationMemory()
-    session = args.session or str(uuid.uuid4())
-    assistant = Assistant(backend=backend, memory=memory)
-
-    print("Starting memory system...", end="", flush=True)
-    try:
-        await assistant.start()
-        print(" ready.")
-    except Exception as exc:
-        print(f" unavailable ({exc}).")
-
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, lambda: asyncio.create_task(assistant.stop()))
-        except NotImplementedError:
-            # Windows: ProactorEventLoop has no add_signal_handler. Ctrl-C is already
-            # handled by the KeyboardInterrupt branch around _read_input below.
+            loop.call_soon_threadsafe(_deliver, *outcome)
+        except RuntimeError:
+            # The loop is already closed: the CLI exited (daemon gone) while
+            # this thread was still waiting on the keyboard. Nothing to tell.
             pass
 
-    prior = memory.get_history(session)
-    print(f"Lyra  [{backend.name} / {backend.default_model}]")
-    if prior:
-        print(f"Resumed session {session}  ({len(prior) // 2} prior turns)")
-    else:
-        print(f"Session {session}")
+    threading.Thread(target=_run, name="lyra-input", daemon=True).start()
+    return future
+
+
+class _Terminal:
+    """Remembers the terminal's line discipline so an abrupt exit can restore it.
+
+    readchar puts the tty into raw mode for each keypress. If the process
+    exits while the input thread is inside one, the shell inherits raw mode.
+    """
+
+    def __init__(self) -> None:
+        self._fd: int | None = None
+        self._saved = None
+        if os.name == "posix" and sys.stdin.isatty():
+            import termios
+
+            self._fd = sys.stdin.fileno()
+            self._saved = termios.tcgetattr(self._fd)
+
+    def restore(self) -> None:
+        if self._fd is not None and self._saved is not None:
+            import termios
+
+            termios.tcsetattr(self._fd, termios.TCSADRAIN, self._saved)
+
+
+def _daemon_lost(terminal: _Terminal, reason: str) -> None:
+    terminal.restore()
+    print(f"\nlyra: {reason}", file=sys.stderr, flush=True)
+    sys.exit(1)
+
+
+async def _main() -> None:
+    parser = argparse.ArgumentParser(prog="lyra", description="Lyra — talk to the running daemon")
+    parser.add_argument("--session", help="Resume a specific session ID")
+    args = parser.parse_args()
+
+    try:
+        client = await LyraClient.connect(DAEMON_HOST, DAEMON_PORT)
+    except DaemonUnavailable as exc:
+        print(f"lyra: {exc} — start it with `python -m lyra_core`", file=sys.stderr)
+        sys.exit(1)
+
+    terminal = _Terminal()
+    session = args.session or new_session_id()
+    print(f"Lyra  [daemon {DAEMON_HOST}:{DAEMON_PORT}]")
+    print(f"Session {session}")
     print("Type /help for commands or /quit to exit.\n")
 
-    streaming = False
     voice = True
+    loop = asyncio.get_running_loop()
     try:
         while True:
+            input_future = _read_input_in_thread(loop)
+            closed_wait = asyncio.create_task(client.closed.wait())
+            done, _ = await asyncio.wait({input_future, closed_wait}, return_when=asyncio.FIRST_COMPLETED)
+            if closed_wait in done and input_future not in done:
+                _daemon_lost(terminal, f"daemon at {DAEMON_HOST}:{DAEMON_PORT} closed the connection")
+            closed_wait.cancel()
             try:
-                raw = await asyncio.to_thread(_read_input)
+                raw = input_future.result()
             except (EOFError, KeyboardInterrupt):
                 print("\nGoodbye.")
                 break
@@ -234,79 +253,42 @@ async def _main() -> None:
                 arg = parts[1] if len(parts) > 1 else ""
 
                 if cmd in ("/quit", "/exit", "/q"):
-                    await assistant.stop()
                     print("Goodbye.")
                     break
                 elif cmd == "/help":
                     print(HELP_TEXT)
-                elif cmd == "/history":
-                    hist = memory.get_history(session)
-                    if not hist:
-                        print("(empty)")
-                    for turn in hist:
-                        snippet = turn["content"][:200].replace("\n", " ")
-                        print(f"  {turn['role']:9s}  {snippet}")
-                elif cmd == "/clear":
-                    memory.clear_session(session)
-                    print("Session cleared.")
                 elif cmd == "/session":
-                    if arg == "list":
-                        sessions = memory.list_sessions()
-                        if not sessions:
-                            print("No saved sessions.")
-                        for s in sessions:
-                            print(f"  {s}")
-                    elif arg == "new":
-                        session = str(uuid.uuid4())
+                    if arg == "new":
+                        session = new_session_id()
                         print(f"New session: {session}")
                     elif arg:
                         session = arg
-                        hist = memory.get_history(session)
-                        print(f"Session {session}  ({len(hist) // 2} turns)")
+                        print(f"Session {session}")
                     else:
-                        print("Usage: /session list | new | <id>")
-                elif cmd == "/backend":
-                    print(f"Backend: {backend.name}")
-                elif cmd == "/model":
-                    print(f"Model: {backend.default_model}")
-                elif cmd == "/stream":
-                    streaming = not streaming
-                    print("Streaming on." if streaming else "Streaming off.")
+                        print(f"Session {session}")
                 elif cmd == "/voice":
                     voice = not voice
                     print("Voice on." if voice else "Voice off.")
                 else:
-                    print(f"Unknown command. Try /help.")
+                    print("Unknown command. Try /help.")
                 continue
 
+            set_state("thinking")
             try:
-                if streaming:
-                    set_state("thinking")
-                    print("\nlyra> ", end="", flush=True)
-                    chunks: list[str] = []
-                    async for chunk in assistant.stream_chat_with_tools(user_input, session, vision_fn=_call_vision):
-                        print(chunk, end="", flush=True)
-                        chunks.append(chunk)
-                    print()
-                    full_response = "".join(chunks)
-                    if voice:
-                        speak_response(full_response)
-                    else:
-                        set_state("idle")
-                else:
-                    set_state("thinking")
-                    response = await assistant.chat_with_tools(user_input, session, vision_fn=_call_vision)
-                    print(f"\nlyra> {response}\n")
-                    if voice:
-                        speak_response(response)
-                    else:
-                        set_state("speaking")
-                        set_state("idle")
-            except Exception as exc:
+                response = await client.chat(user_input, session)
+            except DaemonError as exc:
                 set_state("idle")
                 print(f"[error] {exc}", file=sys.stderr)
+                continue
+            except DaemonGone as exc:
+                _daemon_lost(terminal, str(exc))
+            print(f"\nlyra> {response}\n")
+            if voice:
+                speak_response(response)
+            else:
+                set_state("idle")
     finally:
-        await assistant.stop()
+        await client.close()
 
 
 def main() -> None:
