@@ -1738,3 +1738,406 @@ file-backed logging):
 - **Both test suites green:** `lyra_ai` 339 passed (was 303 at the end of
   CP-D.0); `lyra-memory` 283 passed, 4 skipped, unchanged (this checkpoint
   touched nothing under `lyra-memory/`).
+
+# CP-E — candidate deduplication
+
+## Change 1 — the present dedup path, read end to end before touching anything
+
+**The module exists and is already wired into the live Store — CP-D's own
+docstring on `consolidate_retrieval_outcome()` was wrong about this, not
+merely stale.** That docstring said: "This is deliberately NOT
+development.py's OutcomeConsolidator/CandidatePool: those are built against
+MemorySystem's old db.py schema and semantic-embedding dedup, neither of
+which Store has an equivalent of." Verified false by reading
+`lyra_memory/candidate_pool.py` and `lyra-memory/lyra_memory/store/passes/
+dream.py`: `CandidatePool.__init__` takes a bare `aiosqlite.Connection`, not
+a `MemorySystem`; `DreamPass._extract_observations`/`consolidate` already
+construct `CandidatePool(self.store.db)` against the live Store connection;
+and `store/schema.py`'s `VEC_SQL` defines `vec_candidates` identically to
+what `CandidatePool` expects. Store has had an equivalent since CP-B —
+CP-D's consolidator just never used it, and its own comment asserted the
+opposite of what the code two directories over does. Corrected in
+`interface.py`'s new docstring (see change 2 below); the same claim was not
+present anywhere else in the FILES set.
+
+**Two dedup modes coexist in `CandidatePool`, by design, not by accident:**
+
+- **Open vocabulary** (`closed_vocabulary=False`, the default) — the
+  dream-generated (open, model-invented) vocabulary. `_embedding_text
+  (trait_value, evidence)` embeds the **description** (`trait_value`) plus
+  **evidence** when supplied (`f"{trait_value}\n{evidence}"`), **never**
+  `trait_name` (the label) — the module's own docstring names exactly why:
+  "'analytical_orientation' and 'analytical_approach' name two different
+  behaviours while their descriptions sit 1.22 apart. Matching on them is
+  why 70 candidates produced 60 singletons and one promoted trait." Compared
+  by a `vec_candidates` KNN query (`k=1`) against every existing open-
+  vocabulary candidate's stored embedding; threshold is `_L2_THRESHOLD =
+  sqrt(2 * CANDIDATE_DEDUP_THRESHOLD)`, `CANDIDATE_DEDUP_THRESHOLD = 0.37`
+  (cosine, `lyra_memory/config.py`). On a match (`nearest.distance <
+  _L2_THRESHOLD`): `evidence_count += 1`, `trait_value`/`last_seen` replaced
+  with the new observation's, `evidence_text` — **before this checkpoint** —
+  overwritten only if it had been NULL (`COALESCE(?, evidence_text)`, i.e.
+  every evidence string after the first was silently discarded); the stored
+  vector is replaced with `_merge_centroid` — the running mean of every
+  member vector merged so far, renormalized — not the first member's vector,
+  so cluster membership does not depend on insertion order. On no match: a
+  fresh `candidates` row plus a fresh `vec_candidates` row.
+- **Closed vocabulary** (`closed_vocabulary=True`) — used today by
+  `development.py`'s `OutcomeConsolidator` for its four frustration-outcome
+  trait names (`trait_name_from_outcome`). Bypasses embedding and
+  `vec_candidates` entirely; matches by **exact `trait_name` SQL equality**
+  (`_add_exact`). The module's own docstring gives the reason, and it is a
+  measured one, not a guess: "'persists under frustration' and 'abandons
+  under frustration' sit at L2 0.746, inside any threshold loose enough to
+  merge genuine duplicates." A fixed, template-generated vocabulary produces
+  near-identical surface text for *opposite* outcomes, and no single
+  semantic threshold can both merge real duplicates and keep those apart —
+  so this vocabulary does not use a threshold at all. Same UPDATE-on-match
+  shape as the open path (`evidence_count += 1`, `trait_value`/`last_seen`
+  replaced), same pre-existing `evidence_text` loss on every merge past the
+  first (now fixed for both paths — see change 3).
+
+**CP-D's `consolidate_retrieval_outcome()`, before this checkpoint, used
+neither mode** — a bare `INSERT INTO candidates`, one row per call, no
+comparison against anything already in the table. Every one of the twenty
+turns in CP-D's own live run wrote a distinct row (register: "Candidate
+creation is one row per turn, no dedup. Singletons by construction.");
+nothing compared a new observation against what already existed, by label,
+by exact name, or by embedding.
+
+## Change 2 — description vs label, and which one retrieval candidates actually use
+
+`_retrieval_trait_from_outcome` (interface.py) is, by the comment already
+sitting above it, deliberately shaped like `development.py`'s
+`trait_name_from_outcome`: a fixed, two-branch, template-generated
+vocabulary ("retrieval finds relevant context" / "retrieval finds
+nothing"), not the open, model-invented kind. That is exactly the shape
+`CandidatePool`'s `closed_vocabulary=True` path exists for, and exactly the
+shape its docstring warns will falsely merge under semantic
+description-embedding.
+
+**Measured, not assumed**, before deciding: embedded both retrieval
+descriptions under the offline hashed backend (`LYRA_EMBED_BACKEND=hashed`,
+what this container actually runs with; see note below on the real model),
+and compared to the same `_L2_THRESHOLD` the pool uses:
+
+```
+a = "an assembled context contained at least one atom above the retrievability floor"
+b = "an assembled context contained no atoms above the retrievability floor"
+L2 distance:     0.5240675273905536
+L2 threshold:    0.8602325267042626   (sqrt(2 * 0.37))
+would merge under description-embedding: True
+```
+
+The two retrieval descriptions differ by one clause ("at least one atom" vs
+"no atoms") and sit well inside the merge threshold — embedding them would
+collapse "finds context" into "finds nothing" (or vice versa), silently
+counting a hit as evidence of a miss. This was re-confirmed end to end by
+`tools/dedup_probe.py` against the real live store after the twenty-turn
+run (change 6 below): description-embedding groups the two real candidate
+rows into **1** group; label-embedding (and exact-name) into **2**. Same
+finding, from two different measurements.
+
+**Decision: retrieval candidates route through `CandidatePool.add_observation
+(..., closed_vocabulary=True)`** — the same mechanism `OutcomeConsolidator`
+already uses for its own closed vocabulary, not a new exception invented for
+this checkpoint. Consequence, answered directly per change 2's own question:
+**label text (`trait_name`) is the only thing that contributes to matching**
+for retrieval candidates; `trait_value` (the description) is stored and
+displayed but never embedded, never compared. This does not contradict the
+open-vocabulary behavior above — it is the same module's existing second
+mode, applied to the vocabulary shape it was built for. See interface.py's
+`consolidate_retrieval_outcome()` docstring for the same reasoning inline
+with the code.
+
+*(Caveat on the measurement above: this container has no network access to
+fetch `all-MiniLM-L6-v2` on first use, so every number in this checkpoint —
+here and in change 6 — was measured under `LYRA_EMBED_BACKEND=hashed`, the
+deterministic offline stand-in, not the real model. The stand-in is
+"surface-level only" by its own docstring; the qualitative finding — two
+sentences differing by one clause sit far inside a threshold tuned to catch
+paraphrase-level duplicates — is exactly the surface-level effect the
+stand-in is suited to measuring, and it independently agrees with
+`CandidatePool`'s own already-committed docstring finding for the
+structurally identical frustration vocabulary ("persists"/"abandons" at L2
+0.746). Re-run `tools/dedup_probe.py` on a machine with the real model
+cached to confirm against MiniLM specifically; not done here — no such
+machine was available.)*
+
+## Change 3 — what "strengthen" means in the schema as built
+
+No column added, per the checkpoint's own instruction. "Strengthen" is
+exactly what `CandidatePool._add_exact` (closed vocabulary) already does on
+a `trait_name` match, unchanged by this checkpoint except for evidence
+handling (below):
+
+- `evidence_count = evidence_count + 1` (read, incremented, written back;
+  not a SQL `+1` update because the read is needed to compute
+  `evidence_text` too).
+- `last_seen = now` — moves on every strengthen, not only on creation.
+- `trait_value` replaced with the incoming observation's `trait_value` —
+  the same string every call for a given branch (`_retrieval_trait_from_
+  outcome` is deterministic), so this is a no-op in practice for retrieval
+  candidates specifically, but it is the pool's existing, shared behavior
+  and not something this checkpoint changed.
+- `evidence_text` — **changed by this checkpoint**, see change 4.
+
+No new row. `consolidate_retrieval_outcome()` returns `(trait_name,
+trait_value)` on every call now, same as before — the caller (runtime.py's
+`CANDIDATE_CREATED` log line) cannot tell strengthen from creation from that
+return value alone; left alone rather than touched, see "Files touched
+outside the FILES set" below for why.
+
+## Change 4 — provenance: evidence_text now accumulates instead of discarding
+
+**Found, before fixing it:** `_add_exact` and the open-vocabulary merge
+branch both wrote `evidence_text = COALESCE(?, evidence_text)` — the
+FIRST evidence string a candidate ever received, forever, with every
+later merge's evidence silently dropped. `test_closed_vocabulary_ignores_
+evidence_for_matching` (already in `test_candidate_dedup.py`) drives exactly
+this case — two calls, two evidence strings — and only ever asserted
+`evidence_count == 2`, never checked what happened to the text, so this had
+no test coverage either way. A candidate strengthened five times before
+this checkpoint had one contributing observation recoverable and four
+gone.
+
+**Fixed in `candidate_pool.py`** (in the FILES set): a new `_append_evidence
+(existing, new)` helper — `None` if both empty, the single non-empty side if
+only one is, else `f"{existing}\n{new}"` — replaces `COALESCE(?,
+evidence_text)` in both merge branches (`_add_exact` and the open-vocabulary
+KNN-match branch; both had the identical bug, both are the same shared
+module, fixing one and not the other would leave the module internally
+inconsistent for no reason). `evidence_text` is the existing column, not a
+new one — a newline-joined list of everything that has ever contributed,
+oldest first.
+
+**What `consolidate_retrieval_outcome()` now passes as evidence:**
+`f"outcome_id={outcome_id}"` when the caller has one (threaded through from
+`record_retrieval_outcome()`'s return — see "Files touched outside the
+FILES set" for the one-line companion change this required in runtime.py),
+else `None`. So a strengthened retrieval candidate's `evidence_text` is
+literally a newline-separated list of the `outcomes.id` values that
+contributed to it — provenance is a `str.splitlines()` plus a `WHERE id IN
+(...)` away, no new column, no schema change:
+
+```sql
+-- given a candidates.evidence_text like "outcome_id=2\noutcome_id=3\n...":
+SELECT * FROM outcomes WHERE id IN (2, 3, ...)
+```
+
+**Measured live** (change 6/DONE-WHEN below): after twenty turns, candidate
+id=2 (`"retrieval finds relevant context"`) has `evidence_count=19` and
+`evidence_text` containing exactly 19 `outcome_id=N` lines; every one of
+those 19 ids resolved to a real, distinct row in `outcomes` with
+`intent_atom_id`/`valence`/`actual` intact. The schema as built expresses
+change 4's requirement; nothing blocks it, so there is nothing to stop and
+record a blocker for.
+
+## Change 5 — `tools/dedup_probe.py`
+
+New file, in the shape of `tools/affect_probe.py`: offline, no daemon, no
+Store, no CognitiveCore, stdlib plus `lyra_memory.config`/`embeddings` only
+(does not import `candidate_pool.py` — it re-derives grouping from
+first principles rather than reusing the pool's own online, order-dependent
+merge logic, see the module docstring for why that is a deliberate,
+different question). Takes a path to any sqlite file with a `candidates`
+table (works unmodified against both the old db.py-shaped `memory.db` and
+the new store/schema.py-shaped `store.db` — identical columns), embeds every
+row's `trait_name` and `trait_value` separately, and reports for each: the
+pairwise L2 distance distribution, the number of distinct groups at
+`CANDIDATE_DEDUP_THRESHOLD` (connected components of the
+pairwise-below-threshold graph — an order-independent notion of "how many
+groups does this data support," not a replay of the pool's own
+insertion-order-sensitive centroid merging), and the largest group size.
+Also reports one bonus measurement past the two required by change 5: exact
+`trait_name` groups — what the live closed vocabulary actually uses — so a
+reader sees, side by side, why retrieval candidates use neither embedding
+method.
+
+Requires a venv with `lyra_memory` installed (`lyra_ai/venv` or
+`lyra-memory/venv`) — `lyra_memory/__init__.py` imports `aiosqlite`
+unconditionally even though this script's own imports do not need it; not
+worked around, that import shape is outside this checkpoint's FILES set.
+
+## Change 6 — the probe run against both required inputs
+
+**Input 1: the archived `memory.db`, opened read-only.** The register
+claimed "~70 historical singleton candidates live in the archived
+memory.db." **Measured, and false for the file actually present in this
+container:**
+
+```
+$ lyra_ai/venv/bin/python3 tools/dedup_probe.py /root/.lyra/memory.db.2026-09-02.archive
+=== dedup_probe: /root/.lyra/memory.db.2026-09-02.archive ===
+candidates: 0
+(no candidates in this store — nothing to group)
+```
+
+The archive's actual contents: 10 rows in `atoms`, 3 in `facts`, 0 in
+`candidates`/`traits`/`trait_history`/`episodes`. CP-B's own DECISIONS.md
+entry (see "Files touched outside the FILES set" there) already recorded
+this file as "left over from an earlier bootstrap/test run," not three
+months of production use — it never claimed 70 candidates itself. The
+"~70 historical candidates, self_reflection/self_awareness at L2 0.858"
+figures live in `lyra_memory/config.py`'s `CANDIDATE_DEDUP_THRESHOLD`
+docstring and in `docs/PICKUP.md`, both apparently describing a different
+prior environment/session's real accumulated pool, not a file present on
+this container's disk — no second archive file exists anywhere on this
+filesystem (`find / -iname "*memory.db*"`/`*.archive*"` outside `/tmp`
+pytest artifacts turned up exactly the one file above). The probe was run
+exactly as instructed, against the real file that exists; the result is
+zero candidates, honestly reported rather than substituted with the
+register's number or with synthetic data dressed up as "the archive."
+
+**Input 2: the live store's CP-E candidates**, after the twenty-turn run in
+DONE-WHEN below:
+
+```
+$ lyra_ai/venv/bin/python3 tools/dedup_probe.py <tmp-store>/store.db
+candidates: 2
+CANDIDATE_DEDUP_THRESHOLD (cosine) = 0.37  ->  L2 threshold = 0.860233
+
+-- embedding: label (trait_name) --
+  pairwise L2 distance: n=1 min=0.9975 max=0.9975 mean=0.9975 median=0.9975
+  distinct groups at threshold: 2
+  largest group size: 1
+
+-- embedding: description (trait_value) --
+  pairwise L2 distance: n=1 min=0.5241 max=0.5241 mean=0.5241 median=0.5241
+  distinct groups at threshold: 1
+  largest group size: 2
+
+-- bonus: exact trait_name match (what the live closed vocabulary actually uses) --
+  distinct groups: 2
+  largest group size: 1
+```
+
+**The two numbers differ** (2 groups by label, 1 by description) — DONE-
+WHEN's explicit allowance ("The two numbers differ, or they do not and the
+reason is stated") is satisfied by the first branch, and the reason is
+change 2's finding: the live set is exactly the two-branch closed
+vocabulary CP-E targeted, so label/exact-name matching (2 groups — the
+correct answer, matching what the live pool actually produced) and
+description-embedding (1 group — the wrong answer, the two branches would
+wrongly merge) diverge exactly as predicted. This is also the legitimate
+one-group-is-fine case the checkpoint itself names ("the live set is one
+intent kind and may legitimately collapse to one group") — legitimate for
+label/exact-name matching if there had been only one branch exercised; here
+both branches were exercised (twenty turns produced both "finds nothing"
+once and "finds relevant context" nineteen times — see DONE-WHEN), so 2 is
+the right group count for label/exact matching, and 1 is specifically
+description-embedding's failure mode, not an artifact of a narrow sample.
+
+## Change 7 — `report.py`: candidates by group
+
+`_candidates_traits_section` (report.py) now selects `COUNT(*),
+SUM(evidence_count), MAX(evidence_count), SUM(evidence_count = 1)` from
+`candidates` in one query and returns four fields instead of one bare
+total: `candidates_total` (distinct, post-dedup groups — this field's
+*meaning* changed even though its name didn't: dedup now happens at write
+time, so a row already is a group, not a raw per-turn count),
+`candidates_total_evidence`, `candidates_largest_evidence`,
+`candidates_singleton_count`. All four added to `FIELDS` (shared by
+`format_log_line` and the daemon's periodic `SELF_REPORT` line) and to the
+`candidates_traits` section's field list and `render()`'s "2d. candidates /
+traits" block. `candidates_created_window`'s existing comment claimed
+`last_seen` "doubles as a creation time" because nothing ever updated an
+existing row — false as of this checkpoint (`last_seen` now also moves on
+strengthen) — corrected in place to "created or strengthened in window,"
+cross-referenced against the log-derived `candidates_created_window_log`
+count, which is imprecise in the same new way (see "Files touched outside
+the FILES set").
+
+## Files touched outside the FILES set
+
+- `lyra_ai/lyra_core/runtime.py` — one line, structurally unavoidable:
+  `consolidate_retrieval_outcome()` gained a second parameter (`outcome_id`,
+  default `None`) so it can pass evidence provenance through to
+  `CandidatePool` (change 4); its one call site
+  (`TurnHandler._finish_exchange`) already has `outcome_id` in scope from
+  the preceding `record_retrieval_outcome()` call and now passes it
+  positionally. No other line in this file changed — nothing about how
+  retrieval, forgetting, context assembly, affect, or drives *works*
+  changed; `CANDIDATE_CREATED`'s log line and its name were deliberately
+  left alone even though "created" is now imprecise (it fires on strengthen
+  too, same as `consolidate_retrieval_outcome()` returning non-`None` on
+  every call, unchanged from CP-D) — renaming it would mean touching more
+  of runtime.py than one call site requires, for a cosmetic fix DONE-WHEN
+  does not ask for; the imprecision is recorded here and in report.py's
+  comment instead of silently accepted.
+- `lyra_ai/tests/test_runtime.py` — `_FakeCore.consolidate_retrieval_outcome`
+  gained the `outcome_id` parameter (recorded as `(had_context, outcome_id)`
+  tuples instead of bare bools) to match the real signature; the two
+  assertions that inspected `core.consolidations` updated to the new tuple
+  shape (`test_handle_executed_retrieval_fires_the_consolidator_with_
+  had_context`, `test_handle_executed_retrieval_with_no_atoms_fires_
+  consolidator_with_false`).
+
+Both are one-parameter-addition companion edits forced by change 4's
+provenance requirement, not scope creep — no behavior in either file's
+domain (transport, logging shape, turn sequencing) changed.
+
+## DONE-WHEN — evidence
+
+All measured live: a real `Runtime` (tmp-path store, `init_store=True`),
+`LYRA_EMBED_BACKEND=hashed`, a fake backend that always replies (no
+`action_outcome` observations, matching CP-D's own setup), twenty turns
+driven through `TurnHandler.handle()` directly (the same code path a real
+socket client reaches — this checkpoint's scope is `CandidatePool`/
+`consolidate_retrieval_outcome`, not the transport layer, so a real
+`TurnServer`/socket round-trip was not additionally exercised).
+
+- **`DECISIONS.md` contains the change-1 present-behavior record and both
+  change-6 probe tables as numbers:** above.
+- **`python tools/dedup_probe.py` runs standalone against the archived
+  store:** yes — `candidates: 0`, honestly reported (see change 6 for why
+  the register's "~70" claim did not hold for the file actually present).
+- **Twenty new turns; candidate table growth:** grew by **2** rows, not
+  twenty. `outcomes_total = 20` (one outcome row per executed retrieval,
+  unchanged from CP-D); `candidates` table has exactly 2 rows afterward —
+  id=1 `"retrieval finds nothing"` (evidence_count=1, the first turn,
+  against an empty store), id=2 `"retrieval finds relevant context"`
+  (evidence_count=19, every turn from the second turn on). Both branches
+  were genuinely exercised, not just one.
+- **A candidate with evidence_count > 1, provenance identifiable:**
+  candidate id=2, `evidence_count=19`. `evidence_text` is 19 newline-joined
+  `outcome_id=N` lines; every one resolved via `SELECT * FROM outcomes
+  WHERE id IN (...)` to a real, distinct `outcomes` row with intact
+  `intent_atom_id`/`valence`/`actual` — e.g. outcome_id=2 -> `(id=2,
+  intent_atom_id=3, valence=1.0, actual='both')`; all 19 resolved, none
+  missing.
+- **`python -m lyra_core --report` shows the grouped fields, singleton
+  count visible:** measured via `collect_from_path()` (the same function
+  `--report` calls) against the tmp store above — `candidates_total=2`,
+  `candidates_total_evidence=20`, `candidates_largest_evidence=19`,
+  `candidates_singleton_count=1`. Rendered section:
+  ```
+  2d. candidates / traits (grouped — a row is a distinct, post-dedup candidate)
+    distinct candidates 2
+    total evidence      20
+    largest evidence    19
+    singletons          1
+    created/strengthened (window)  2
+    promoted (window)   0
+    trait count         0
+  ```
+- **Trait count before/after; promotion or the gap to it:** 0 before, 0
+  after. No trait promoted. Highest evidence count reached: 19 (candidate
+  id=2). `TRAIT_THRESHOLDS` (`lyra_memory/config.py`) are `{surface: 5,
+  character: 15, core: 50}` — 19 is past the surface and character raw
+  numbers and 31 short of core — but comparing evidence_count to those
+  numbers directly is not why nothing promoted: promotion is
+  `IdentityEngine.consolidate()`, called only from `DreamPass.consolidate()`
+  (`store/passes/dream.py`), and this checkpoint's `consolidate_retrieval_
+  outcome()` never calls it, unchanged from CP-D's own stated design
+  ("nothing here ever touches `traits`"). SCOPE is candidate dedup, not
+  wiring the retrieval vocabulary into promotion, and OUT OF SCOPE forbids
+  tuning thresholds either way — so this is recorded as a structural gap
+  (no path from these candidates to `traits` exists yet at all, not "close
+  but under the threshold") rather than acted on.
+- **Both test suites green:** `lyra_ai` 339 passed (unchanged count — no
+  tests added or removed, three updated in place: `_FakeCore`'s signature
+  and the two assertions that depended on it); `lyra-memory` 283 passed, 4
+  skipped (unchanged count — `candidate_pool.py`'s existing evidence-text
+  tests did not assert on the text this checkpoint changed the handling of,
+  so all pass unmodified against the new append behavior).

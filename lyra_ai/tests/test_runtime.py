@@ -262,7 +262,7 @@ class _FakeCore:
         self.ticks: list[tuple[str, str, float]] = []
         self.exchanges: list[tuple[str, str, object, object]] = []
         self.retrieval_outcomes: list[tuple] = []
-        self.consolidations: list[bool] = []
+        self.consolidations: list[tuple] = []
         self._affect = affect or AffectState()
         self._context = context if context is not None else _context_result("")
         self._retrieve_context_error = retrieve_context_error
@@ -293,8 +293,8 @@ class _FakeCore:
         self.retrieval_outcomes.append((user_atom_id, context_log_id, atom_count, path))
         return len(self.retrieval_outcomes)
 
-    async def consolidate_retrieval_outcome(self, had_context):
-        self.consolidations.append(had_context)
+    async def consolidate_retrieval_outcome(self, had_context, outcome_id=None):
+        self.consolidations.append((had_context, outcome_id))
         return ("retrieval finds relevant context", "...") if had_context else ("retrieval finds nothing", "...")
 
 
@@ -411,7 +411,7 @@ def test_handle_executed_retrieval_fires_the_consolidator_with_had_context():
     handler, _, _ = _handler(backend, core=core)
     asyncio.run(handler.handle("hello", "s1"))
 
-    assert core.consolidations == [True]
+    assert core.consolidations == [(True, 1)]
 
 
 def test_handle_executed_retrieval_with_no_atoms_fires_consolidator_with_false():
@@ -420,7 +420,7 @@ def test_handle_executed_retrieval_with_no_atoms_fires_consolidator_with_false()
     handler, _, _ = _handler(backend, core=core)
     asyncio.run(handler.handle("hello", "s1"))
 
-    assert core.consolidations == [False]
+    assert core.consolidations == [(False, 1)]
 
 
 def test_handle_logs_candidate_created_when_consolidator_returns_one(caplog):

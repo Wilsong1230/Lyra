@@ -107,7 +107,13 @@ FIELDS: tuple[str, ...] = (
     "outcomes_total",
     "consolidator_fired_window",
     "candidates_created_window_log", "candidates_created_window",
-    "candidates_total", "candidates_promoted_window",
+    # CP-E: candidates by GROUP, not a bare count — dedup now collapses
+    # matching candidates into one row (see candidate_pool.py), so a row is
+    # already a distinct, post-dedup group; these three make the collapse
+    # itself visible rather than reporting only its result.
+    "candidates_total", "candidates_total_evidence",
+    "candidates_largest_evidence", "candidates_singleton_count",
+    "candidates_promoted_window",
     "trait_count", "trait_confidence_mean",
     "emotion_v", "emotion_a", "mood_v", "mood_a",
     "temperament_v", "temperament_a", "temperament_c",
@@ -298,14 +304,28 @@ async def _context_log_section(db: aiosqlite.Connection, window_start: float) ->
 
 
 async def _candidates_traits_section(db: aiosqlite.Connection, window_start: float) -> dict:
-    async with db.execute("SELECT COUNT(*) FROM candidates") as cur:
-        candidates_total = (await cur.fetchone())[0]
-    # CP-D: candidates still has no created_ts (CP-C's finding stands) —
-    # but CognitiveCore.consolidate_retrieval_outcome always sets last_seen
-    # to the moment it inserts a *new* row (no dedup, no updates to an
-    # existing one — see DECISIONS.md), so for these rows specifically
-    # last_seen doubles as a creation time. A cross-check against the
-    # log-derived candidates_created_window_log, not a replacement for it.
+    # CP-E: candidates are deduplicated at write time (candidate_pool.py) —
+    # a row IS a distinct, post-collapse group, evidence_count IS how much
+    # evidence collapsed into it. "candidates_total" therefore already means
+    # distinct-candidate-groups, not a raw per-turn row count; the three new
+    # fields make the collapse legible instead of reporting only its result.
+    async with db.execute(
+        "SELECT COUNT(*), COALESCE(SUM(evidence_count), 0), COALESCE(MAX(evidence_count), 0),"
+        " COALESCE(SUM(CASE WHEN evidence_count = 1 THEN 1 ELSE 0 END), 0) FROM candidates"
+    ) as cur:
+        candidates_total, total_evidence, largest_evidence, singleton_count = await cur.fetchone()
+    # CP-D: candidates still has no created_ts (CP-C's finding stands).
+    # CP-D's comment here claimed last_seen doubles as a creation time
+    # because nothing ever updated an existing row — CP-E's dedup makes
+    # that false: last_seen now also moves every time a repeat observation
+    # STRENGTHENS an existing candidate. So this is now "created or
+    # strengthened in window", not "created in window" — still a useful
+    # cross-check against the log-derived candidates_created_window_log
+    # (which counts only fresh CANDIDATE_CREATED-logged inserts... except
+    # runtime.py's CANDIDATE_CREATED log line still fires on every
+    # non-None return from the consolidator, i.e. on strengthen too — see
+    # DECISIONS.md, CP-E, for why that name is now imprecise in both
+    # places and was left alone rather than touched outside interface.py).
     async with db.execute(
         "SELECT COUNT(*) FROM candidates WHERE last_seen >= ?", (window_start,)
     ) as cur:
@@ -321,6 +341,9 @@ async def _candidates_traits_section(db: aiosqlite.Connection, window_start: flo
     mean_conf = sum(confidences) / len(confidences) if confidences else 0.0
     return {
         "candidates_total": candidates_total,
+        "candidates_total_evidence": total_evidence,
+        "candidates_largest_evidence": largest_evidence,
+        "candidates_singleton_count": singleton_count,
         "candidates_created_window": candidates_created_window,
         "candidates_promoted_window": promoted,
         "trait_count": len(rows),
@@ -554,7 +577,8 @@ async def collect_measurements(
     )
     await _section(
         "candidates_traits",
-        ("candidates_total", "candidates_created_window", "candidates_promoted_window",
+        ("candidates_total", "candidates_total_evidence", "candidates_largest_evidence",
+         "candidates_singleton_count", "candidates_created_window", "candidates_promoted_window",
          "trait_count", "trait_confidence_mean"),
         _candidates_traits_section(db, window_start),
     )
@@ -668,9 +692,12 @@ def render(measurements: dict, window_days: int) -> str:
     lines.append(f"    both              {measurements.get('selftest_both', UNAVAILABLE)}")
     lines.append(f"    neither           {measurements.get('selftest_neither', UNAVAILABLE)}")
 
-    lines.append("\n2d. candidates / traits")
-    lines.append(f"  candidates total    {measurements.get('candidates_total', UNAVAILABLE)}")
-    lines.append(f"  created (window)    {measurements.get('candidates_created_window', UNAVAILABLE)}")
+    lines.append("\n2d. candidates / traits (grouped — a row is a distinct, post-dedup candidate)")
+    lines.append(f"  distinct candidates {measurements.get('candidates_total', UNAVAILABLE)}")
+    lines.append(f"  total evidence      {measurements.get('candidates_total_evidence', UNAVAILABLE)}")
+    lines.append(f"  largest evidence    {measurements.get('candidates_largest_evidence', UNAVAILABLE)}")
+    lines.append(f"  singletons          {measurements.get('candidates_singleton_count', UNAVAILABLE)}")
+    lines.append(f"  created/strengthened (window)  {measurements.get('candidates_created_window', UNAVAILABLE)}")
     lines.append(f"  promoted (window)   {measurements.get('candidates_promoted_window', UNAVAILABLE)}")
     lines.append(f"  trait count         {measurements.get('trait_count', UNAVAILABLE)}")
     for name, value, conf in measurements.get("_traits", []):

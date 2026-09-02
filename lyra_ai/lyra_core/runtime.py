@@ -515,7 +515,7 @@ class TurnHandler:
             OUTCOME_RECORDED, turn_id, outcome_id, atom_count, path, context_log_id,
         )
 
-        consolidated = await self._core.consolidate_retrieval_outcome(atom_count > 0)
+        consolidated = await self._core.consolidate_retrieval_outcome(atom_count > 0, outcome_id)
         log.info("%s turn=%d outcome_id=%d", CONSOLIDATOR_FIRED, turn_id, outcome_id)
         if consolidated is not None:
             trait_name, _trait_value = consolidated

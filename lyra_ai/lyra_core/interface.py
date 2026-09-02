@@ -27,6 +27,7 @@ from enum import Enum
 # agnostic like the rest of CognitiveCore, so there is no genericity to
 # preserve by deferring this one. Cheap to import: store.context only
 # type-imports the heavy embedding model lazily, inside embed() itself.
+from lyra_memory.candidate_pool import CandidatePool
 from lyra_memory.store.context import build_context as _build_context
 
 
@@ -479,29 +480,63 @@ class CognitiveCore:
             environment=f"context_log_id={context_log_id};atom_count={atom_count}",
         )
 
-    async def consolidate_retrieval_outcome(self, had_context: bool) -> tuple[str, str] | None:
-        """Fires on a retrieval outcome (CP-D change 5) — writes exactly one
-        `candidates` row, no dedup, no promotion. This is deliberately NOT
-        development.py's OutcomeConsolidator/CandidatePool: those are built
-        against MemorySystem's old db.py schema and semantic-embedding
-        dedup, neither of which Store has an equivalent of, and OUT OF SCOPE
-        excludes trait dedup from this checkpoint regardless. A minimal,
-        Store-native insert is the whole mechanism; nothing here ever
-        touches `traits` — promotion cannot happen because nothing promotes.
+    async def consolidate_retrieval_outcome(
+        self, had_context: bool, outcome_id: int | None = None,
+    ) -> tuple[str, str] | None:
+        """Fires on a retrieval outcome (CP-E: routes through CandidatePool
+        instead of CP-D's bare INSERT).
 
-        Returns (trait_name, trait_value) if a candidate row was written,
-        else None (memory without a `.db`, e.g. a test fake).
+        CP-D's docstring here previously claimed Store had no equivalent of
+        development.py's OutcomeConsolidator/CandidatePool. That was wrong,
+        not merely outdated: `lyra_memory.candidate_pool.CandidatePool`
+        already runs against this exact Store connection —
+        `store/passes/dream.py`'s DreamPass constructs
+        `CandidatePool(self.store.db)` for the dream-derived (open)
+        vocabulary, and Store's own schema (`store/schema.py`) defines
+        `vec_candidates` for it to use. See DECISIONS.md (CP-E, change 1)
+        for the full read of that path before this change.
+
+        `_retrieval_trait_from_outcome` is, by its own comment above,
+        shaped exactly like development.py's `trait_name_from_outcome`: a
+        fixed, two-branch, template-generated vocabulary. CandidatePool's
+        `closed_vocabulary=True` mode exists precisely for that shape —
+        OutcomeConsolidator already uses it for the frustration vocabulary,
+        with a documented reason: descriptions of opposite branches from one
+        template sit too close in embedding space to separate from genuine
+        duplicates with any single threshold. Measured here too (see
+        DECISIONS.md, change 2): the two retrieval descriptions
+        ("...at least one atom above the retrievability floor" vs "...no
+        atoms above the retrievability floor") sit well inside
+        CANDIDATE_DEDUP_THRESHOLD under the offline embedding stand-in —
+        embedding them would merge "finds context" and "finds nothing" into
+        one candidate. So retrieval candidates dedup by exact trait_name
+        (the label), not by embedding trait_value (the description); label
+        text is what CandidatePool actually matches on for this vocabulary,
+        by the same reasoning already established for the other closed
+        vocabulary in this codebase, not a new exception invented here.
+
+        Provenance (change 4): `evidence` is `outcome_id=<id>` when the
+        caller has one, so a merged candidate's `evidence_text` accumulates
+        one line per contributing `outcomes` row (CandidatePool now appends
+        rather than replacing — see candidate_pool.py's _append_evidence).
+        Parsing that back to `outcomes` rows is a store-side read, not a
+        new column.
+
+        Returns (trait_name, trait_value) on every call — CandidatePool
+        inserts a new row on first sight of a branch and strengthens the
+        existing one (evidence_count, last_seen, evidence_text) on every
+        repeat, never a fresh row. Returns None only when memory has no
+        `.db` (e.g. a test fake).
         """
         db = getattr(self._memory, "db", None)
         if db is None:
             return None
         trait_name, trait_value = _retrieval_trait_from_outcome(had_context)
-        await db.execute(
-            "INSERT INTO candidates (trait_name, trait_value, evidence_count, last_seen, category, evidence_text)"
-            " VALUES (?, ?, 1, ?, 'retrieval', ?)",
-            (trait_name, trait_value, time.time(), trait_value),
+        evidence = f"outcome_id={outcome_id}" if outcome_id is not None else None
+        pool = CandidatePool(db)
+        await pool.add_observation(
+            trait_name, trait_value, "retrieval", evidence=evidence, closed_vocabulary=True,
         )
-        await db.commit()
         return trait_name, trait_value
 
     async def _ingest_outcome(self, obs: Observation) -> None:
