@@ -67,3 +67,13 @@ MAX_TICK_DT_SECONDS = 600.0
 # The daemon logs to stderr and to this file. "grep the log for
 # CORE_CONSTRUCTED" needs a log that outlives the terminal it started in.
 LOG_PATH = Path.home() / ".lyra" / "lyra_core.log"
+
+# ── self-report (CP-C) ──────────────────────────────────────────────────────
+# How often the daemon emits its periodic SELF_REPORT telemetry line
+# (lyra_core.runtime, lyra_core.report). One hour: frequent enough to catch
+# the memory-store-disconnected-for-months class of failure (CP-C's WHY)
+# long before three months pass, infrequent enough that the retrieval
+# self-test it runs (a handful of build_context() calls against the live
+# store) is negligible overhead. `python -m lyra_core --report` ignores
+# this entirely — it renders once, on demand, and exits.
+REPORT_INTERVAL_SECONDS = 3600.0

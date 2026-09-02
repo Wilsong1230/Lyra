@@ -10,15 +10,21 @@ not the older lyra_memory.MemorySystem (memory.db). MemorySystem,
 lyra_memory.retrieval, and lyra_memory.db keep working and keep their tests —
 they are simply never imported on this path again. See DECISIONS.md.
 
+CP-C: the daemon also emits one structured SELF_REPORT log line at startup
+and every REPORT_INTERVAL_SECONDS after — the same measurements, the same
+field names, as `python -m lyra_core --report` (lyra_core/report.py). A
+separate asyncio task, never awaited by the turn path; a failure collecting
+it is logged and the daemon stays up (see Runtime._emit_self_report).
+
 Lifecycle:
   start : archive any leftover pre-CP-B memory.db (one-time courtesy) ->
           prepare the store (present? right schema? archive-and-recreate if
           not) -> open it (Store.open) -> warm the embedder (fatal if the
           model is missing and no offline opt-in is set) -> construct the
           core (CORE_CONSTRUCTED) -> start it (affect restore) -> open
-          history -> listen
-  stop  : stop listening (no new turns) -> stop the core (affect persisted)
-          -> close the store
+          history -> listen -> start the self-report task
+  stop  : cancel the self-report task -> stop listening (no new turns) ->
+          stop the core (affect persisted) -> close the store
 
 Ticks happen when a turn arrives, not on a timer. dt is wall-clock seconds
 since the previous tick, clamped to config.MAX_TICK_DT_SECONDS — see the
@@ -55,9 +61,10 @@ from urllib.parse import urlparse
 from lyra.assistant import DEFAULT_SYSTEM
 from lyra.backends import Backend
 from lyra.memory import ConversationMemory
-from lyra_core.config import DAEMON_HOST, DAEMON_PORT, MAX_TICK_DT_SECONDS
+from lyra_core.config import DAEMON_HOST, DAEMON_PORT, MAX_TICK_DT_SECONDS, REPORT_INTERVAL_SECONDS
 from lyra_core.expression import prose_hint
 from lyra_core.interface import AffectVector, CognitiveCore, Observation, ObservationKind
+from lyra_core.report import UNAVAILABLE, collect_from_path, format_log_line
 from lyra_core.transport import TurnRejected, TurnServer
 from lyra_memory.config import DB_PATH, EMBED_MODEL, STORE_PATH
 from lyra_memory.embeddings import embed
@@ -440,6 +447,7 @@ class Runtime:
         init_store: bool = False,
         vision_fn: Callable[[str], str] = call_vision,
         now: Callable[[], float] = time.time,
+        report_interval: float = REPORT_INTERVAL_SECONDS,
     ) -> None:
         self._backend = backend
         self._db_path = db_path or STORE_PATH
@@ -450,9 +458,11 @@ class Runtime:
         self._init_store = init_store
         self._vision_fn = vision_fn
         self._now = now
+        self._report_interval = report_interval
         self._core: CognitiveCore | None = None
         self._handler: TurnHandler | None = None
         self._server: TurnServer | None = None
+        self._report_task: asyncio.Task | None = None
 
     @property
     def core(self) -> CognitiveCore:
@@ -491,6 +501,10 @@ class Runtime:
         log.info("core started; store open at %s", self._db_path)
 
         history = ConversationMemory(self._history_path)
+        # Resolve None -> ConversationMemory's own default now, so the
+        # self-report task (change 5) can report history_db_bytes without
+        # re-deriving that default itself.
+        self._history_path = history.db_path
         log.info("history store open at %s", history.db_path)
 
         self._handler = TurnHandler(
@@ -507,7 +521,75 @@ class Runtime:
             self._backend.name, self._backend.default_model, self._host, self._server.port,
         )
 
+        # CP-C change 5: a separate task, not awaited here — the turn queue
+        # is never blocked waiting on telemetry. Emits once immediately
+        # (the startup line) then every self._report_interval seconds.
+        self._report_task = asyncio.create_task(self._self_report_loop(), name="lyra-self-report")
+
+    async def _emit_self_report(self) -> None:
+        """Collect and log one SELF_REPORT line, through the exact same
+        read-only path `python -m lyra_core --report` uses
+        (collect_from_path — a fresh mode=ro connection, opened and closed
+        here, never the daemon's own live write connection). Two reasons:
+        it is what change 5 means by "the same measurements... as the
+        report", and it keeps the two failure domains apart — the turn
+        path's long-lived write connection is unaffected by whatever makes
+        a *fresh* open of store.db fail (permissions revoked, the file
+        replaced), so a broken self-report can never take the turn path
+        down with it, and vice versa.
+
+        Never raises: collect_from_path()/collect_measurements() already
+        mark individual fields unavailable rather than raising; this is a
+        second net in case opening the read-only connection itself fails
+        outright (e.g. the file is gone or unreadable) — the whole line is
+        still emitted, this time with everything unavailable, and the
+        daemon keeps running."""
+        try:
+            runs_path = getattr(
+                self._core.memory, "runs_path", self._db_path.with_name("runs.db"))
+            measurements = await collect_from_path(
+                self._db_path, runs_path, self._history_path, now=self._now(),
+            )
+        except Exception as exc:
+            log.warning("self-report: could not open store read-only: %s", exc)
+            measurements = {}
+
+        # Unlike the external `--report` CLI, the daemon has the live core
+        # in hand: introspect() reads current affect without touching the
+        # store, so "current emotion/mood/temperament" doesn't have to wait
+        # for CognitiveCore.stop()'s once-per-shutdown persist to the facts
+        # table. Left through collect_from_path()'s own read, "current"
+        # affect is `unavailable` for the entire life of a daemon that
+        # hasn't yet been cleanly stopped once — see DECISIONS.md (CP-C).
+        try:
+            state = self._core.introspect()
+            mood = state.mood if state.mood is not None else AffectVector()
+            temperament = state.temperament if state.temperament is not None else AffectVector()
+            measurements.update({
+                "emotion_v": state.emotion.valence, "emotion_a": state.emotion.arousal,
+                "mood_v": mood.valence, "mood_a": mood.arousal,
+                "temperament_v": temperament.valence, "temperament_a": temperament.arousal,
+                "temperament_c": temperament.control if temperament.control is not None else UNAVAILABLE,
+            })
+        except Exception as exc:
+            log.warning("self-report: introspect() failed: %s", exc)
+
+        log.info(format_log_line(measurements))
+
+    async def _self_report_loop(self) -> None:
+        await self._emit_self_report()
+        while True:
+            await asyncio.sleep(self._report_interval)
+            await self._emit_self_report()
+
     async def stop(self) -> None:
+        if self._report_task is not None:
+            self._report_task.cancel()
+            try:
+                await self._report_task
+            except asyncio.CancelledError:
+                pass
+            self._report_task = None
         if self._server is not None:
             await self._server.stop()
         if self._core is not None:

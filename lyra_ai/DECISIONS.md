@@ -885,3 +885,262 @@ reading the code:
   it, and the full cold-start-through-`Runtime` path). Every other test's
   *assertions* are unchanged from before CP-B — only the schema they read
   against moved.
+
+---
+
+# CP-C — the system reports on itself
+
+Register: the memory redesign is built and live (CP-B). This checkpoint adds
+no new capability to the daemon — it adds a way to SEE what the daemon
+already does, because the last time nobody was looking (three months,
+`MemorySystem` disconnected, zero symptom) is exactly the failure mode this
+exists to catch before the intent loop closes at CP-D.
+
+## 1. `report.py` cannot read `context_log` for "assemblies performed" — it is always empty
+
+**Finding, not a bug in this checkpoint's code:** change 2c's natural
+reading is a historical tally — count real retrieval assemblies that
+happened during real turns, split by which path(s) contributed. `Store`
+already has a table built for exactly this (`context_log`: `atom_ids`,
+`fact_ids`, `dream_ids`, `budget_used`, `misses` — "written from day one,"
+per its own docstring). But `context_log` is written by exactly one method,
+`Store.ingest_turn()` (via `Store._log_context`), and CP-B's daemon wiring
+never calls it: `TurnHandler.system_prompt()` calls the free function
+`lyra_memory.store.context.build_context()` directly, and
+`CognitiveCore._ingest_sensory` writes atoms one at a time via
+`append_atom()`. Neither path touches `_log_context`. Verified live: a
+daemon that served real turns through this exact code for the entire
+duration of this checkpoint's testing has zero rows in `context_log`.
+
+This is a real gap in the daemon's wiring, discovered by trying to build the
+report change 2c asks for — precisely the class of "no symptom" failure
+CP-C's WHY names. **Not fixed here**: the fix is a turn-path behavior
+change (making `TurnHandler`/`CognitiveCore` log context assembly outcomes
+somewhere), and `runtime.py`'s entry in this checkpoint's FILES set is
+explicitly annotated `(periodic line emission)` — narrower than "wire
+retrieval provenance into the turn path." `interface.py`, where the other
+half of that fix would plausibly live, is not in this checkpoint's FILES
+set at all. Flagging for CP-D or a dedicated follow-up rather than
+expanding scope to fix it here.
+
+**Chosen instead:** `report.py` performs its own live, read-only retrieval
+self-test. It takes real atom text already sitting in the report's window
+(the most recent `wilson`-speaker atoms, capped at 20) as query strings and
+calls the same `build_context()` the daemon calls, through report.py's own
+mode=ro connection — genuinely read-only (`build_context()` only ever
+`SELECT`s), genuinely exercising the real retrieval code against real
+stored content, but a measurement performed AT REPORT TIME against current
+content, not a historical tally of turns that happened. `assemblies_total`
+counts how many queries this pass ran (bounded by how much real content is
+in the window — honestly 0 on an empty store, not fabricated), not how many
+times a real user turn triggered retrieval. This is disclosed in
+`report.py`'s own module docstring, not just here.
+
+## 2. "Current affect" needed two different answers for two different callers
+
+**Finding:** `CognitiveCore` persists `affect_state` to the `facts` table
+in exactly one place — `CognitiveCore.stop()` (CP-B, item 3). A daemon
+that has been running since it started and has not yet been cleanly
+stopped has **never written that fact at all**. `report.py`'s read-only
+connection (by design — a separate process, safe against a store a daemon
+is actively writing) has no way to see live in-memory state; it can only
+see what's on disk. Verified live: `python -m lyra_core --report` against
+an actively-running, never-yet-stopped daemon reported
+`emotion_v=unavailable` (and every other current-affect field) for the
+entire life of the process — accurate, not a bug, but not useful either.
+
+**Chosen:** the daemon's own periodic emission (`Runtime._emit_self_report`)
+overlays the current-affect fields with `self._core.introspect()` —
+already the exact port `interface.py`'s own docstring names for this:
+"the port the telemetry/dashboard and Lyra's own self-reading use," reading
+live affect without mutating anything. Everything else in the daemon's
+periodic line (atoms, retrievability, the retrieval self-test, candidates,
+outcomes, min/max, clamp stats, file sizes) still comes from
+`collect_from_path()` — the identical read-only path `--report` uses.
+
+This is a genuine, disclosed difference between the two callers for this
+one field group only, not an inconsistency: the external CLI cannot do
+better than "last persisted, possibly never," and the in-process daemon
+task can do better because it holds the live core, and change 5's "the
+same measurements... the same stable field names" is satisfied by both
+still reporting the same fields, meaning the same thing, through whichever
+source can actually answer them accurately. Verified live: the daemon's own
+`SELF_REPORT` log lines show real, changing `emotion_v`/`emotion_a`/
+`mood_v`/`mood_a` values turn over turn; a same-moment `--report` run
+against the same never-stopped daemon still (correctly) shows
+`unavailable` for those same fields.
+
+## 3. "Candidates created" has no timestamp to window by
+
+`Store`'s `candidates` table has `last_seen` but no creation timestamp —
+unlike `atoms` (`ts`) or `trait_history` (`ts`), there's no column that
+answers "created within the window." OUT OF SCOPE forbids changing Store's
+schema. Reported as `candidates_total` (the current row count, all-time)
+instead of a windowed "created" count, labeled as such in both the render
+and this note. `candidates_promoted_window` (from `trait_history WHERE
+event = 'promoted' AND ts >= window_start`) IS genuinely windowed —
+`trait_history` has the `ts` column `candidates` lacks.
+
+## 4. Ten turns write twenty atoms, not ten
+
+**Finding, contradicting the checkpoint's own done-when wording:** "Ten
+turns are taken. The report's atom count for today increases by ten."
+Measured live, twice (once here, once already in CP-B's own verification):
+ten `chat()` calls produce **twenty** atoms — `CognitiveCore._ingest_sensory`
+writes one atom per `Observation` tick, and `TurnHandler.handle()` ticks
+twice per exchange (`source="conversation"` for the user's message,
+`source="lyra"` for her reply — see `runtime.py`'s `TurnHandler.handle`).
+This is not new behavior CP-C introduced; it's how the daemon has ticked
+since CP-A, and CP-B's own DECISIONS.md already recorded the same 1:2
+ratio (`atoms=20` for ten `chat()` calls). Verified again here:
+`atoms_today` went from 62 to 82 after ten turns in this checkpoint's live
+run — +20, matching CognitiveCore's actual tick granularity rather than the
+checkpoint text's assumption. `report.py`'s field is honest either way
+(`atoms_today` just counts rows); this note exists so the delta a live
+verifier sees isn't mistaken for a bug.
+
+## 5. The retrieval split came out all-both — the reason, per the done-when's own allowance
+
+Live run (ten real atoms in the window, `report.py`'s self-test against
+them): `assemblies_total=11, retrieval_vector_only=0, retrieval_fts_only=0,
+retrieval_both=11, retrieval_neither=0`. The done-when explicitly allows
+this shape "with the reason stated": the self-test's queries are each
+atom's own verbatim text (item 1 above), which trivially satisfies BOTH
+paths at once — FTS matches on exact token overlap by construction, and
+cosine similarity against an identical string is ~1.0 regardless of
+embedder, nowhere near `SEMANTIC_SIMILARITY_FLOOR` (0.35). This is an
+artifact of the self-test's own query-sampling method (verbatim recent
+text), not evidence that the store's retrieval never disagrees across
+paths — CP-B's own live verification already demonstrated a genuine
+FTS-hit/vector-miss case by deliberately diluting a shared token in
+otherwise-unrelated filler text on both sides. Not "fixed" here — change
+2c asks for a split and a reason when it degenerates, not a query-sampling
+strategy engineered to always disagree.
+
+## 6. `pytest-asyncio`: already installed and configured (change 6)
+
+**Checked, not assumed, before writing anything:** `lyra_ai/pyproject.toml`
+already had `pytest-asyncio>=0.23` in `dev` and `asyncio_mode = "auto"` in
+`[tool.pytest.ini_options]` — `git blame` dates both to 2026-06-08/09,
+months before CP-A. The installed venv already carries `pytest-asyncio`
+1.4.0. `tests/test_development.py`'s five `async def test_*` functions
+(the only bare `async def test_` functions anywhere under `lyra_ai/tests/`)
+were already being collected and already passing before this checkpoint.
+
+**Collected count, before and after (change 6's actual ask):**
+- Before this checkpoint's changes: **272** collected, **272** passed.
+- After: **294** collected, **294** passed. The entire delta (+22) is
+  `tests/test_report.py`, written for this checkpoint's new module (not in
+  the FILES set, but the same "cover what you just built" precedent as
+  earlier checkpoints' incidental test additions) — not previously-dead
+  tests newly surfacing. `lyra_ai/pyproject.toml` and
+  `lyra_ai/tests/conftest.py` are both untouched: nothing was required.
+- **No async test needed fixing or `xfail`-ing.** The premise that async
+  tests exist somewhere in the tree collected-but-broken did not hold for
+  `lyra_ai` — checked directly (`pytest --collect-only`, `pytest
+  tests/test_development.py -v`) before concluding this, not inferred from
+  the pyproject.toml dates alone.
+
+## 7. Eval-set characterization (change 7)
+
+`lyra-memory/eval/retrieval_baseline.json` (not the ad-hoc 5-query set this
+session used in CP-B purely to prove `evaluate.py --store` reached a live
+store end to end — that one was never committed to the repo and is not
+"the" eval set the register's "1.00... NOT trusted" refers to; this one,
+already documented in `lyra-memory/eval/BASELINE.md`, is).
+
+Re-ran it live rather than trusting `BASELINE.md`'s numbers unread:
+
+```
+LYRA_EMBED_BACKEND=hashed python -m lyra_memory.store.evaluate eval/retrieval_baseline.json
+```
+
+- **42-atom corpus, 22 labeled turns.**
+- **20 turns expect a hit** (answerable); **2 expect a miss**
+  (`expect_miss: true`).
+- **coverage 1.00** — every labeled-relevant item surfaced on every
+  answerable turn.
+- **leak rate 0.00** — no turn injected anything labeled irrelevant.
+- **spurious miss rate 0.20** (4 of the 20 answerable turns) — the
+  *semantic* path alone reported nothing above the similarity floor on
+  those four; BM25 carried the answer instead, so coverage still hit 1.00.
+  Expected shape under the hashed offline stand-in, per `BASELINE.md`.
+- **spurious injection rate 0.50** (1 of the 2 unanswerable turns) — the
+  query "what did we decide about the harm gate in the combat sandbox"
+  still returned material: the corpus's "`sandbox_read` is excluded from
+  dream input" tokenizes to `sandbox` + `read` under FTS5, a genuine
+  lexical hit on `sandbox`. `BASELINE.md` already names this and
+  deliberately did not relabel it.
+- **Failed by the live store, by the render()'s own marks:** zero turns
+  marked `missing` or `leaked`; exactly **one** of 22 (the harm-gate query
+  above) marked "injected anyway" (spurious injection). Every other turn
+  renders `ok` or `correctly empty`.
+- Numbers match `BASELINE.md` exactly — nothing has drifted since it was
+  written. The baseline is real, reproducible, and — per the register and
+  `BASELINE.md` itself — still measured entirely on the hashed offline
+  embedder, so "1.00 unvalidated against real MiniLM" continues to be the
+  correct caveat, now with the actual composition behind it on record
+  rather than just the headline number.
+
+## Files touched outside the FILES set
+
+- `lyra_ai/tests/test_report.py` — new. Covers `_classify_misses`,
+  `format_log_line`/`render`'s field/gap coverage, and
+  `collect_measurements`/`collect_from_path` against a real tmp `Store`
+  (atom counts, the retrievability split, the retrieval self-test's
+  verbatim-match case, outcomes-is-zero, current-affect from a persisted
+  fact vs. `unavailable` when none was ever written, per-section failure
+  isolation via a monkeypatched section, and the read-only connection
+  genuinely rejecting a write). 22 tests, all passing under the
+  already-configured `asyncio_mode = "auto"`.
+
+## DONE-WHEN — evidence
+
+All run live against a real `Runtime` (fake LLM backend; everything else —
+sqlite, sqlite-vec, aiosqlite, the hashed embedder, the real event loop,
+the real default `~/.lyra/` paths so `python -m lyra_core --report` (run as
+an actual subprocess) reads the same store the in-process daemon was
+serving turns against):
+
+- **`python -m lyra_core --report` against a running, serving daemon:**
+  ran as a real subprocess while the daemon was actively up; printed every
+  field in change 2. Daemon's log showed no error, exactly one
+  `CORE_CONSTRUCTED` (the `--report` process never constructs a core —
+  it never imports `Runtime` at all), before and after the subprocess ran.
+  Daemon served another turn immediately afterward.
+- **Ten turns, atom count for today:** increased by **20**, not 10 — see
+  item 4 above for why that's the correct number, not a bug.
+- **Retrieval path split, nonzero, total = assemblies:** `11 = 11`
+  (`0+0+11+0`), all-both, reason stated (item 5 above).
+- **`REPORT_INTERVAL_SECONDS` set low (3s in this run):** daemon log
+  showed the startup `SELF_REPORT` line plus at least two more periodic
+  ones within 7 seconds, all parseable, all on the exact field names in
+  `report.FIELDS`.
+- **`store.db` made unreadable mid-run:** `chmod 000` on the live file
+  (blocks *new* opens; the daemon's own long-lived write connection, opened
+  before the `chmod`, is unaffected by a permission change on an already-open
+  fd — this is what makes the two failure domains genuinely separable, see
+  item 2's design note in `Runtime._emit_self_report`'s docstring). Next
+  periodic tick emitted with every store-derived field `unavailable`; the
+  daemon kept serving turns throughout and afterward, confirmed by an
+  actual `chat()` call succeeding both during and after the fault.
+- **`pytest --collect-only`:** 272 -> 294 (+22, `tests/test_report.py` —
+  see item 6).
+- **Eval-set characterization recorded as numbers:** see item 7.
+
+## A fix made along the way: `history_db_bytes` was always `unavailable` on the daemon's own line
+
+Found while verifying change 2h live: `Runtime._emit_self_report` was
+passing `self._history_path` straight through to `collect_from_path()`,
+but that attribute stays `None` whenever the daemon uses
+`ConversationMemory`'s own default (`lyra/memory.py`'s `DEFAULT_DB_PATH`)
+rather than an explicit override — `report.py`'s `_file_sizes_section`
+correctly treats `None` as "nothing to size," so the daemon's own periodic
+line reported `history_db_bytes=unavailable` even with a real, sized
+`history.db` sitting on disk (the external `--report` CLI didn't have this
+problem — `__main__.py`'s `_run_report` always resolves the real default
+explicitly). Fixed in `runtime.py`'s `Runtime.start()`: right after
+`ConversationMemory(self._history_path)` is constructed, `self._history_path`
+is reassigned to `history.db_path` (the object's own resolved path) — a
+one-line, in-scope fix squarely within "periodic line emission," not a
+change to `ConversationMemory` or the history store itself.

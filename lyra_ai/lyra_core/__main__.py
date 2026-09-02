@@ -8,6 +8,8 @@ if it cannot start or if the turn path fails.
     python -m lyra_core                     # auto-select backend from env
     python -m lyra_core --backend ollama --model llama3:latest
     python -m lyra_core --init-store        # create an empty store if none exists
+    python -m lyra_core --report            # read-only self-report; no daemon starts
+    python -m lyra_core --report --days 30
 """
 from __future__ import annotations
 
@@ -66,6 +68,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help=f"Also log to this file (default {LOG_PATH})")
     parser.add_argument("--list-backends", action="store_true",
                         help="Show which backends are available and exit")
+    parser.add_argument("--report", action="store_true",
+                        help="Render a read-only self-report to stdout and exit "
+                             "(starts no daemon, listener, or core)")
+    parser.add_argument("--days", type=int, default=None,
+                        help="Self-report window in days (default 7; only with --report)")
     return parser.parse_args(argv)
 
 
@@ -110,6 +117,26 @@ async def _serve(args: argparse.Namespace) -> int:
     return await rt.run_forever(stop)
 
 
+def _run_report(days: int | None) -> int:
+    """CP-C change 4: read-only, no daemon/listener/core touched — report.py
+    itself never imports Runtime, TurnHandler, or the transport, and this
+    branch does not either."""
+    from lyra.memory import DEFAULT_DB_PATH as HISTORY_PATH
+    from lyra_core.report import DEFAULT_WINDOW_DAYS, collect_from_path, render
+    from lyra_memory.config import RUNS_PATH, STORE_PATH
+
+    window = days if days is not None else DEFAULT_WINDOW_DAYS
+    try:
+        measurements = asyncio.run(
+            collect_from_path(STORE_PATH, RUNS_PATH, HISTORY_PATH, window_days=window)
+        )
+    except Exception as exc:
+        print(f"could not open store read-only at {STORE_PATH}: {exc}", file=sys.stderr)
+        return 1
+    print(render(measurements, window))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     _load_dotenv()
     args = _parse_args(argv)
@@ -121,6 +148,9 @@ def main(argv: list[str] | None = None) -> int:
         for name in BACKENDS:
             print(f"  [{'+' if name in avail else '-'}] {name}")
         return 0
+
+    if args.report:
+        return _run_report(args.days)
 
     _configure_logging(args.log_file)
     log.info("lyra_core starting pid=%d", os.getpid())
