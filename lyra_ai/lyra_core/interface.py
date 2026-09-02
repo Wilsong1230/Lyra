@@ -21,6 +21,14 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 
+# CP-D.0: module-level, not deferred like the affect-fact duck-typing below —
+# retrieve_context()/ingest_exchange() are inherently Store-shaped (they call
+# Store's own build_context()/ingest_turn()), not memory-implementation-
+# agnostic like the rest of CognitiveCore, so there is no genericity to
+# preserve by deferring this one. Cheap to import: store.context only
+# type-imports the heavy embedding model lazily, inside embed() itself.
+from lyra_memory.store.context import build_context as _build_context
+
 
 # ── Observation kinds ─────────────────────────────────────────────────────────
 
@@ -142,6 +150,15 @@ _DEFAULT_ATOM_SOURCE = "cli"
 # as a `facts` row instead, under a subject no real query will ever type. See
 # DECISIONS.md (CP-B, "affect_state has no table of its own").
 _AFFECT_STATE_FACT_SUBJECT = "_lyra_internal_affect_state"
+
+# CP-D.0: obs.source values whose text is NOT written here — they are the two
+# halves of one exchange, persisted together (with the retrieval that
+# informed them) by ingest_exchange() -> Store.ingest_turn(), not as two
+# separate, un-transacted append_atom() calls. See _ingest_sensory and
+# DECISIONS.md (CP-D.0, item on atomicity). Every OTHER sensory source
+# (vision, ...) is unaffected and still persists here, one atom per tick,
+# exactly as before.
+_EXCHANGE_OBS_SOURCES: frozenset[str] = frozenset(_ATOM_SPEAKER_BY_OBS_SOURCE)
 
 
 class CognitiveCore:
@@ -287,18 +304,82 @@ class CognitiveCore:
     # ── Ingest ───────────────────────────────────────────────────────────────
 
     async def _ingest_sensory(self, obs: Observation) -> None:
+        # CP-D.0: "conversation" and "lyra" text is NOT written here anymore
+        # — ingest_exchange() persists both halves of an exchange together,
+        # atomically, with the retrieval that informed them (see
+        # DECISIONS.md). Ticking one of these sources still advances drives
+        # and affect below exactly as before; only the atom write moved.
+        # This tick() call is still the caller's responsibility to pair with
+        # an eventual ingest_exchange() — nothing here does that for them,
+        # so a caller that ticks "conversation"/"lyra" without ever calling
+        # ingest_exchange() silently writes no atom. TurnHandler.handle() is
+        # currently the only such caller (see runtime.py).
+        if obs.source in _EXCHANGE_OBS_SOURCES:
+            return
+
+        # SKIPPED DELIBERATELY, not by accident (CP-D.0 change 5): vision
+        # observations still land here, via append_atom(), NOT ingest_turn().
+        # ingest_turn() is structurally a pair — exactly one "her
+        # interlocutor" atom and one "her" atom — and a vision description
+        # is a third, unpaired atom with no lyra_text counterpart at the
+        # moment it arrives (runtime.py's vision retry loop can fire zero or
+        # several times before a final reply exists). Forcing it through
+        # ingest_turn() would mean inventing a fake pairing OUT OF SCOPE has
+        # no room for. See DECISIONS.md.
+        #
         # Unguarded (CP-A; still true under CP-B's Store). A memory that is
         # not open, or a store that cannot take the write, is a turn that did
         # not happen; the daemon treats it as fatal rather than answering
         # over a store that is silently dropping her record.
-        #
-        # One atom per turn (CP-B change 2): obs.source names who/what this
-        # observation is FROM, which Store's append_atom splits into two
-        # different vocabularies — see _ATOM_SPEAKER_BY_OBS_SOURCE and
-        # DECISIONS.md for the mapping.
-        speaker = _ATOM_SPEAKER_BY_OBS_SOURCE.get(obs.source, "system")
+        speaker = "system"
         source = _ATOM_SOURCE_BY_OBS_SOURCE.get(obs.source, _DEFAULT_ATOM_SOURCE)
         await self._memory.append_atom(speaker=speaker, source=source, text=obs.content)
+
+    async def retrieve_context(self, query: str):
+        """What Store would inject for `query` right now (CP-D.0) — read-only,
+        against whatever atoms already exist. Call BEFORE the observations
+        this turn will eventually write (via ingest_exchange), so retrieval
+        never has to see — or exclude — its own turn's atoms.
+
+        Returns a lyra_memory.store.context.ContextResult; pass it straight
+        to ingest_exchange() afterward so what was actually retrieved is what
+        gets logged, not a second, possibly different, computation of it.
+        """
+        return await _build_context(self._memory, query=query)
+
+    async def ingest_exchange(
+        self, user_text: str, lyra_text: str, context, session_id, source: str = "cli",
+    ) -> tuple[int, int]:
+        """Persist one full exchange — both atoms and the context_log row
+        recording what retrieve_context() actually returned for it — in the
+        one transaction Store.ingest_turn() provides (CP-D.0 change 2).
+
+        `session_id` is the daemon's own per-connection session string
+        (TurnHandler.handle's `session` parameter) — Store's context_log
+        schema declares this column INTEGER (a future cold-pass FK into
+        `sessions`, which nothing populates yet), but SQLite's type affinity
+        stores whatever is given it without error or schema violation; see
+        DECISIONS.md for why reusing the session string here, rather than
+        minting a new integer, is the honest choice — no cold-pass session
+        row exists yet for this connection to reference.
+
+        Unguarded, like _ingest_sensory: a failed write is a turn that did
+        not happen, not a turn silently missing its record.
+
+        SKIPPED DELIBERATELY (CP-D.0 change 5): `ingest_turn(user_vec=...)`
+        exists to let the caller reuse an embedding it already computed
+        rather than paying to embed user_text twice. retrieve_context()
+        above has no way to hand one back — build_context() computes its
+        own query vector internally and OUT OF SCOPE forbids changing its
+        signature to expose it — so user_text is embedded again here. Not a
+        choice this checkpoint could avoid; recorded so it reads as known,
+        not missed. See DECISIONS.md.
+        """
+        injected = context.as_log_row()
+        injected["session_id"] = session_id
+        return await self._memory.ingest_turn(
+            user_text=user_text, lyra_text=lyra_text, source=source, injected=injected,
+        )
 
     async def _ingest_outcome(self, obs: Observation) -> None:
         if obs.predicted is None or obs.actual is None:
@@ -352,11 +433,13 @@ class CognitiveCore:
     async def tick(self, observations: list[Observation], dt: float = 0.1) -> tuple[list[Intent], AffectState]:
         """Ingest observations, advance affect and drives, return (intents, affect).
 
-        a. Sensory observations go to memory (add_turn for conversation/lyra
-           sources, add_observation otherwise); action_outcome observations
-           with predicted/actual feed CompetenceTracker, RelationalDrive (on
-           failure), and the OutcomeConsolidator — all using the affect-at-
-           the-time of this tick (before this tick's affect update).
+        a. Sensory observations from most sources persist one atom each
+           (_ingest_sensory -> append_atom); "conversation" and "lyra"
+           sourced text does not — see _ingest_sensory and ingest_exchange
+           (CP-D.0). action_outcome observations with predicted/actual feed
+           CompetenceTracker, RelationalDrive (on failure), and the
+           OutcomeConsolidator — all using the affect-at-the-time of this
+           tick (before this tick's affect update).
         b. Drives advance by dt; "engaged" means at least one observation
            arrived this tick.
         c. AffectEngine advances by dt using the summed drive AffectPushes.

@@ -125,7 +125,7 @@ async def test_collect_measurements_splits_retrievability_by_floor(store, tmp_pa
     assert m["atoms_above_floor"] == 1  # NULL retrievability counts as above
 
 
-async def test_collect_measurements_retrieval_self_test_finds_verbatim_match(store, tmp_path):
+async def test_collect_measurements_selftest_finds_verbatim_match(store, tmp_path):
     """Using an atom's own text as the query — both paths should hit
     (exact FTS match, and cosine ~1.0 under any embedder)."""
     await store.append_atom(speaker="wilson", source="cli", text="a distinctive sentence about retrieval")
@@ -134,10 +134,53 @@ async def test_collect_measurements_retrieval_self_test_finds_verbatim_match(sto
         store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
         log_path=tmp_path / "no_such_log.log",
     )
-    assert m["assemblies_total"] == 1
-    assert m["assemblies_with_hit"] == 1
-    assert m["retrieval_both"] == 1
-    assert m["retrieval_neither"] == 0
+    assert m["selftest_assemblies"] == 1
+    assert m["selftest_with_hit"] == 1
+    assert m["selftest_both"] == 1
+    assert m["selftest_neither"] == 0
+
+
+async def test_collect_measurements_context_log_empty_reports_zero_not_missing(store, tmp_path):
+    """CP-D.0: context_log has no rows yet on a fresh store — the logged_*
+    fields must be present as zeros, not absent."""
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["logged_assemblies_window"] == 0
+    assert m["logged_empty_window"] == 0
+
+
+async def test_collect_measurements_context_log_counts_a_real_ingest_turn_row(store, tmp_path):
+    user_id, lyra_id = await store.ingest_turn(
+        user_text="hello", lyra_text="hi there",
+        injected={"atom_ids": [], "fact_ids": [], "dream_ids": [], "budget_used": 0},
+    )
+    assert (user_id, lyra_id) != (None, None)
+
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["logged_assemblies_window"] == 1
+    assert m["logged_empty_window"] == 1, "no atom_ids were injected — an empty retrieval, visible as a row"
+    assert m["logged_with_hit_window"] == 0
+
+
+async def test_collect_measurements_context_log_nonempty_atom_ids_counts_as_with_hit(store, tmp_path):
+    await store.ingest_turn(
+        user_text="q", lyra_text="a",
+        injected={"atom_ids": [1, 2], "fact_ids": [], "dream_ids": [], "budget_used": 10},
+    )
+
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["logged_with_hit_window"] == 1
+    assert m["logged_empty_window"] == 0
+    # No misses recorded -> both paths counted as having contributed.
+    assert m["logged_both_window"] == 1
 
 
 async def test_collect_measurements_outcomes_zero_on_a_fresh_store(store, tmp_path):

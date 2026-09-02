@@ -69,7 +69,6 @@ from lyra_core.transport import TurnRejected, TurnServer
 from lyra_memory.config import DB_PATH, EMBED_MODEL, STORE_PATH
 from lyra_memory.embeddings import embed
 from lyra_memory.store import Store
-from lyra_memory.store.context import build_context
 
 log = logging.getLogger("lyra_core.runtime")
 
@@ -309,7 +308,14 @@ class TurnHandler:
 
     Exactly what Assistant.chat_with_tools did in the CLI process, now run
     where the core lives. Every write here — history.db, the atom store via
-    tick() — happens in the daemon.
+    tick()/ingest_exchange() — happens in the daemon.
+
+    CP-D.0: retrieval and the atom+context_log write are both owned by
+    CognitiveCore now (retrieve_context()/ingest_exchange() — see
+    interface.py), not called on Store directly from here. handle() fetches
+    context once per exchange, reuses it for the prompt across every vision
+    retry, and hands it back to ingest_exchange() at the end so what gets
+    logged is exactly what was used, not a second computation of it.
     """
 
     def __init__(
@@ -359,11 +365,17 @@ class TurnHandler:
             temperament.valence, temperament.arousal, temperament_c,
         )
 
-    async def system_prompt(self, query: str) -> str:
-        # Unguarded on purpose. A broken store and an empty store must not
-        # produce the same prompt; the failure surfaces as a fatal turn.
+    def _compose_system_prompt(self, context) -> str:
+        """LAYER1 + whatever retrieve_context() returned + the affect hint.
+
+        Takes an already-fetched ContextResult (CP-D.0) rather than a query
+        string and fetching it here: handle() needs that same ContextResult
+        again afterward, for ingest_exchange() — fetching it twice would
+        both double the retrieval cost and risk the two calls disagreeing.
+        Unguarded on purpose, same as before: a broken store and an empty
+        store must not produce the same prompt.
+        """
         parts = [self._system]
-        context = await build_context(self._core.memory, query=query)
         if context.text:
             parts.append(context.text)
         hint = prose_hint(self._core.introspect())
@@ -384,17 +396,25 @@ class TurnHandler:
             raise TurnRejected(f"backend {self._backend.name} failed: {exc}") from exc
 
     async def handle(self, message: str, session: str) -> str:
-        # The user turn is recorded BEFORE the prompt is assembled so that
-        # retrieval keys off this message and affect reflects it.
+        # The user turn is recorded to history BEFORE the prompt is
+        # assembled so that affect reflects it; retrieval (retrieve_context)
+        # runs before EITHER of this exchange's atoms exist in the store —
+        # CP-D.0: no self-matching to exclude, because there is nothing yet
+        # to match. tick("conversation", ...) still advances drives/affect
+        # for the user's message arriving; it no longer writes an atom
+        # (interface.py's _ingest_sensory) — ingest_exchange() at the end
+        # does, for both halves of the exchange, atomically.
         self._history.add(session, "user", message)
         await self.tick("conversation", message)
-        system = await self.system_prompt(message)
+        context = await self._core.retrieve_context(message)
+        system = self._compose_system_prompt(context)
         for _ in range(_VISION_ATTEMPTS):
             response = await self._complete(session, system)
             source = parse_tool_call(response)
             if source is None:
                 self._history.add(session, "assistant", response)
                 await self.tick("lyra", response)
+                await self._core.ingest_exchange(message, response, context, session_id=session)
                 return response
             self._history.add(session, "assistant", truncate_at_tool_call(response))
             description = await asyncio.to_thread(self._vision_fn, source)
@@ -402,6 +422,7 @@ class TurnHandler:
             self._history.add(session, "user", f"[Vision result: {description}]")
         self._history.add(session, "assistant", _VISION_FALLBACK)
         await self.tick("lyra", _VISION_FALLBACK)
+        await self._core.ingest_exchange(message, _VISION_FALLBACK, context, session_id=session)
         return _VISION_FALLBACK
 
 

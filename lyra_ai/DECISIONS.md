@@ -1144,3 +1144,262 @@ explicitly). Fixed in `runtime.py`'s `Runtime.start()`: right after
 is reassigned to `history.db_path` (the object's own resolved path) — a
 one-line, in-scope fix squarely within "periodic line emission," not a
 change to `ConversationMemory` or the history store itself.
+
+---
+
+# CP-D.0 — the daemon's turn path goes through Store.ingest_turn()
+
+Register: `context_log` was empty because the daemon called `build_context()`
+directly and never called `Store.ingest_turn()` (CP-C's finding). This
+checkpoint reads `ingest_turn()` end to end before touching anything, wires
+the daemon through it, and records every effect the daemon has been
+skipping — the deliverable is the list below, not just the wiring.
+
+## Change 1 — `Store.ingest_turn()`'s complete effect list
+
+Read end to end (`lyra-memory/lyra_memory/store/__init__.py`, the entire
+329-line file — nothing calls `ingest_turn()` or is called by it outside
+that file). Its own module docstring states the boundary directly: "No
+enrichment, no dream, no consolidation. Everything structural is derived
+later by a cold pass, from atoms that are already permanent." Verified by
+reading, not assumed from the docstring alone.
+
+`ingest_turn(user_text, lyra_text, source="cli", environment=None, instance=DEFAULT_INSTANCE, speaker="wilson", injected=None, ts=None, user_vec=None)`:
+
+1. **`append_atom(speaker, source, user_text, ...)`** — INSERT into `atoms`,
+   INSERT into `vec_atoms` (embeds `user_text` unless `user_vec` is given),
+   one `atoms_fts` row via trigger. **ALREADY DONE** — the daemon already
+   wrote this exact atom (CP-B, `_ingest_sensory` -> `append_atom`), but as
+   its own separate, un-transacted call, not as part of `ingest_turn()`.
+2. **`append_atom(speaker="lyra", source, lyra_text, ...)`** — same three
+   writes, embeds `lyra_text` fresh. **ALREADY DONE**, same caveat as #1.
+3. **`_log_context(injected or {})`** — INSERT into `context_log` (`ts`,
+   `session_id`, `atom_ids`, `fact_ids`, `dream_ids`, `budget_used`,
+   `misses`). **SKIPPED** — this is the CP-C finding; fixed by this
+   checkpoint (change 2).
+4. **Atomicity** — #1-#3 in ONE transaction (`append_atom(..., commit=False)`
+   twice, `_log_context(..., commit=False)` once, one `self.db.commit()`).
+   **SKIPPED**, and not the same gap as #3: even setting `context_log`
+   aside, the daemon's two atom writes were each their own commit. A crash
+   between them would have left a real, live exchange half-landed — the
+   user's atom on disk, Lyra's never written — which is precisely what
+   `ingest_turn()`'s own docstring says the design exists to prevent ("a
+   turn that half-lands is worse than a turn that fails, because only the
+   second is visible"). CP-C never surfaced this because it only checked
+   whether `context_log` had rows; this was found by reading `ingest_turn()`
+   itself for this change, not inferred from the register.
+5. **`user_vec` reuse** (skip embedding `user_text` twice — once for
+   retrieval, once for the atom write). **SKIPPED**, and stays skipped after
+   this checkpoint (see change 5 below) — not a choice available within
+   scope.
+6. **`environment`/`instance` parameters** — defaults (`None` /
+   `DEFAULT_INSTANCE`) are exactly what the daemon's own `append_atom` calls
+   already used. **ALREADY DONE** — no behavior difference either way.
+7. **`run_id`** — not a parameter `ingest_turn()` exposes at all; always
+   `NULL` through this call, same as every atom the daemon has ever written.
+   Not an effect of `ingest_turn()` to mark done or skipped — noted so it
+   reads as checked, not missed.
+8. **Segmentation, salience scoring, clustering, entity extraction, fact
+   extraction, dream cycles, forgetting, candidate/trait promotion** — NONE
+   of these are reachable from `ingest_turn()`, confirmed by the full read
+   above, not assumed from the docstring. Not an `ingest_turn()` effect at
+   all (cold-pass-only, a completely separate call path in
+   `store/passes/`), so there is nothing here to mark ALREADY DONE or
+   SKIPPED — recorded so the absence is a checked fact, not an unexamined
+   gap.
+
+## Change 2/3 — wiring, and the atom-count regression check
+
+Two new `CognitiveCore` methods (`interface.py`) replace the daemon's direct
+`build_context()` call and its two separate `append_atom()` calls:
+
+- **`retrieve_context(query)`** — calls `build_context()` (moved here from
+  `runtime.py`; see the grep note below). Read-only, called BEFORE either of
+  this exchange's atoms exist, so retrieval never has to see — or exclude —
+  its own turn's atoms (a nicety `store/context.py`'s recall dedup already
+  handled either way, but this ordering is cleaner and matches how
+  `ingest_turn()` is meant to be used: retrieve first, then persist what was
+  retrieved for).
+- **`ingest_exchange(user_text, lyra_text, context, session_id, source="cli")`**
+  — calls `Store.ingest_turn()`, feeding it `context.as_log_row()` plus the
+  session id (change 4).
+
+`interface.py`'s `_ingest_sensory` no longer writes an atom for
+`obs.source in {"conversation", "lyra"}` — that text is now persisted only
+by `ingest_exchange()`. Every other sensory source (vision) is unaffected
+and still writes its own atom exactly as before (CP-B). `runtime.py`'s
+`TurnHandler.handle()` now: ticks "conversation" (drives/affect only, no
+atom) -> `retrieve_context()` once -> composes the prompt from that result
+-> runs the vision loop as before -> ticks the final "lyra" text
+(drives/affect only) -> `ingest_exchange()` once, pairing the ORIGINAL
+message with whatever text it took (a vision-assisted answer or the
+fallback) to conclude the exchange.
+
+**Verified live** (ten real exchanges through a real `Runtime`, real
+`LyraClient`, real sqlite): `SELECT COUNT(*) FROM atoms` = **20**, not 40 —
+the daemon's atom count is unchanged from CP-B/CP-C's own measurement of the
+SAME ten-exchange scenario, confirming `ingest_turn()` replaced the two
+separate writes rather than adding a third path alongside them (the CP-A
+defect change 3 warns against, in a new shape, did not recur).
+
+**A disclosed, deliberate behavior change**, not asked for by name but a
+direct consequence of "wire it as built": a turn REJECTED by the backend
+(`TurnRejected`) used to still leave the user's message as an orphaned atom
+(written before the backend call, with no `lyra` atom ever following it).
+Under `ingest_turn()`'s two-texts-required shape, `ingest_exchange()` is
+only reachable after a real reply exists, so a rejected turn now writes
+**no** atom at all for it — consistent with `ingest_turn()`'s own stated
+purpose (no half-landed turns), and arguably the more correct behavior (an
+orphaned atom with no reply was already a symptom of the same problem #4
+above names), but a real, observable change from before this checkpoint.
+`history.db` is unaffected — the user's message is still recorded there
+unconditionally, before the backend is ever called; only the `atoms` table
+changed. Updated `test_backend_failure_is_rejected_not_fatal` to assert the
+new behavior explicitly rather than silently losing coverage of it.
+
+**grep, for the done-when's "no direct build_context() call":**
+`grep -n "build_context(" lyra_core/runtime.py lyra_core/interface.py` finds
+**zero** matches in `runtime.py` and exactly **one** in `interface.py`
+(inside `retrieve_context()`, the one method that owns it). Retrieval still
+has to happen somewhere — `ingest_turn()` doesn't retrieve anything, only
+writes and logs — so "no direct call" is read as "no longer a bare,
+unaccounted-for call sitting in the transport-facing turn handler,
+disconnected from what gets persisted," not "retrieval no longer happens
+anywhere," which OUT OF SCOPE ("wire the path as built") would make
+impossible to achieve regardless.
+
+## Change 4 — the session id `context_log` needed
+
+**Finding:** `context_log.session_id` is declared `INTEGER` in
+`store/schema.py` — read as a future cold-pass FK into the `sessions` table
+(`sessions.id INTEGER PRIMARY KEY AUTOINCREMENT`, populated by a
+segmentation pass that doesn't exist yet; OUT OF SCOPE confirms
+"forgetting"/retrieval/etc. stay as built, and no cold pass runs on the hot
+path per change 1's own finding #8). The daemon has no such integer at
+ingest time — no session row has ever been created for any connection, cold
+or otherwise.
+
+**Chosen:** reuse the daemon's own per-connection session string —
+`TurnHandler.handle(self, message, session)`'s existing `session` parameter,
+already "stable across a connection" (it is the CLI's own session
+identifier, already used for `ConversationMemory`) — passed straight into
+`injected["session_id"]`. SQLite's column type affinity does not reject a
+TEXT value in an INTEGER-affinity column; it stores it as given, with no
+error and no change to the column's own declared type — confirmed against
+`store/integrity.py`'s `assert_schema()`, which compares declared
+`(name, type, notnull, pk)` from `PRAGMA table_info`, not what a column
+currently holds, so this does not trip the structural check.
+
+**Not chosen:** minting a new integer (e.g. a per-process connection
+counter) purely to satisfy the column's declared type. That would be a
+fabricated foreign key pointing at a `sessions` table that has no
+corresponding row — worse than an honestly-typed string, which reads
+exactly as what it is when someone inspects the column later. Verified live:
+ten exchanges over one client connection produced ten `context_log` rows,
+every one carrying the same session string the daemon actually used.
+
+## Change 5 — SKIPPED effects, recorded in code, not silently omitted
+
+Both are commented at their exact site, not just here:
+
+- **`user_vec` reuse** (`interface.py`, `ingest_exchange`'s docstring) —
+  `build_context()` computes its own query embedding internally and does
+  not return it; OUT OF SCOPE forbids changing its signature to expose one.
+  `ingest_exchange()` therefore cannot pass `user_vec`, and `user_text` is
+  embedded a second time inside `ingest_turn()`'s own `append_atom` call.
+  Not a choice — there is no vector available to hand it.
+- **Vision's solo atom** (`interface.py`, `_ingest_sensory`) — `ingest_turn()`
+  is structurally a pair (exactly one interlocutor atom, one Lyra atom); a
+  vision description is a third, unpaired atom with no `lyra_text`
+  counterpart at the moment it arrives. Kept on the old `append_atom()`
+  path, unchanged from CP-B, because forcing it through `ingest_turn()`
+  would mean inventing a fake pairing — not "wiring the path as built."
+
+## Change 6 — `report.py`: two distinct retrieval measurements
+
+`context_log`-derived (`logged_*`, new) and the CP-C live self-test
+(`selftest_*`, kept, renamed for the distinction) are both computed and both
+labeled in `render()`'s output under one "2c. retrieval" section, in two
+clearly headed sub-blocks. `logged_empty_window` counts `context_log` rows
+in the window whose `atom_ids` is empty — the done-when's "a retrieval that
+returns nothing appears... rather than being absent."
+
+**Verified live** (same ten-exchange run as above): `logged_assemblies_window
+= 10`, split `9 both + 0 vector-only + 0 fts-only + 1 neither = 10` (the
+`neither`/`empty` one is the very first exchange, retrieved against a store
+that had zero atoms yet — nothing to find, correctly recorded as a row, not
+skipped). `selftest_assemblies = 10`, split `10 both + 0/0/0` — different
+from `logged_*` in both method and result, exactly the distinction change 6
+asks for (the self-test's verbatim-text queries against a now-populated
+store trivially hit; the `logged_*` numbers reflect what the real,
+differently-worded exchange queries actually found at the time, including
+the one that legitimately found nothing).
+
+## Change 7 — was `ingest_turn()` usable without an out-of-scope change?
+
+**Yes**, for the daemon's primary (message, reply) pair — the case the
+done-when's own test scenario (ten CLI exchanges) exercises. Not blocked;
+proceeded per change 2/3. The one place it could NOT represent the daemon's
+existing behavior without inventing something is the vision solo atom
+(change 5) — handled by leaving that one case outside `ingest_turn()`
+explicitly, not by reimplementing part of `ingest_turn()`'s own logic
+in the daemon to work around it.
+
+## Files touched outside the FILES set
+
+- `lyra_ai/tests/test_core.py` — `_RecordingMemory` gained `ingest_turn`
+  (recording calls) alongside `append_atom`; the two conversation/lyra
+  ingest-routing tests were rewritten to assert NO atom is written by
+  ticking those sources anymore (renamed to say so); new tests for
+  `ingest_exchange` (calls `ingest_turn` with both texts, threads
+  `session_id` into `injected`, carries the `ContextResult`'s `as_log_row()`
+  through, returns the two atom ids) and `retrieve_context` (calls through
+  to `build_context`, via `monkeypatch.setattr` on `interface._build_context`).
+- `lyra_ai/tests/test_runtime.py` — `_FakeCore` gained `retrieve_context`
+  (returns a fixed `ContextResult`, or raises if configured to, for the
+  propagation test) and `ingest_exchange` (records calls). Every
+  `_no_context()`/`patch("lyra_core.runtime.build_context", ...)` call site
+  removed — there is nothing left to patch in `runtime.py` (the whole
+  point of the grep check above) — replaced with `_FakeCore`'s own fixed
+  return values. `test_system_prompt_is_layer1_*` renamed and rewritten
+  against the new `_compose_system_prompt()` (a pure formatter over an
+  already-fetched `ContextResult`, no longer a fetch-and-compose method —
+  `system_prompt()` itself was removed as dead code once nothing in
+  production called it). `test_backend_failure_is_rejected_not_fatal`
+  updated for the disclosed atom-write behavior change above. New tests:
+  `test_handle_ingests_the_exchange_once_with_both_texts_and_the_session`
+  (the daemon-side half of change 3's atom-count check — exactly one
+  `ingest_exchange` call, both texts, right session), and vision-path
+  assertions that the ORIGINAL question pairs with the FINAL answer in
+  exactly one `ingest_exchange` call regardless of how many vision
+  round-trips it took.
+- `lyra_ai/tests/test_report.py` — renamed the self-test assertions to the
+  `selftest_*` fields; added tests for `logged_*` reading real
+  `context_log` rows (zero on a fresh store, a real `ingest_turn()` row
+  counted correctly, an empty-`atom_ids` row counted as
+  `logged_empty_window` rather than absent).
+
+## DONE-WHEN — evidence
+
+All run live against a real `Runtime` (tmp-path store; fake LLM backend;
+everything else real — sqlite, sqlite-vec, aiosqlite, the hashed embedder,
+the real event loop, a real `LyraClient` over a real loopback socket):
+
+- **Change-1 effect list, every entry marked:** see "Change 1" above.
+- **Ten exchanges; `context_log` rows carry the session id:** 10 rows,
+  every one's `session_id` equal to the single session string the client
+  used for all ten exchanges.
+- **Ten exchanges, twenty atoms, not forty:** `SELECT COUNT(*) FROM atoms`
+  = 20.
+- **`python -m lyra_core --report` shows the two splits, populated,
+  distinct, labeled:** rendered output's "2c. retrieval" section — see
+  change 6 above for the actual numbers from this run.
+- **An empty retrieval is visible, not absent:** the first exchange's
+  `context_log` row has `atom_ids = []` — a real row, counted in
+  `logged_empty_window`, not a missing row.
+- **grep shows no direct `build_context()` call on the daemon path:** see
+  change 2/3 above — zero in `runtime.py`, one in `interface.py`.
+- **Both test suites green:** `lyra_ai` 303 passed (was 294 at the end of
+  CP-C; +9 net — see "Files touched outside the FILES set" above for what
+  changed); `lyra-memory` 283 passed, 4 skipped, unchanged from CP-C (this
+  checkpoint touched nothing under `lyra-memory/`).

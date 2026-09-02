@@ -235,11 +235,20 @@ def test_tick_clock_passes_small_gaps_through_and_clamps_large_ones():
 # ── turn handler ─────────────────────────────────────────────────────────────
 
 class _FakeCore:
-    """Records ticks; introspects a fixed affect; has no memory to retrieve from."""
+    """Records ticks and ingest_exchange calls; introspects a fixed affect;
+    retrieve_context() returns a fixed (default empty) ContextResult — CP-D.0
+    moved both retrieval and the atom+context_log write onto CognitiveCore,
+    so the fake now stands in for both."""
 
-    def __init__(self, affect: AffectState | None = None) -> None:
+    def __init__(
+        self, affect: AffectState | None = None, context: "ContextResult | None" = None,
+        retrieve_context_error: Exception | None = None,
+    ) -> None:
         self.ticks: list[tuple[str, str, float]] = []
+        self.exchanges: list[tuple[str, str, object, object]] = []
         self._affect = affect or AffectState()
+        self._context = context if context is not None else _context_result("")
+        self._retrieve_context_error = retrieve_context_error
         self.memory = MagicMock()
 
     async def tick(self, observations, dt=0.1):
@@ -249,6 +258,15 @@ class _FakeCore:
 
     def introspect(self) -> AffectState:
         return self._affect
+
+    async def retrieve_context(self, query):
+        if self._retrieve_context_error is not None:
+            raise self._retrieve_context_error
+        return self._context
+
+    async def ingest_exchange(self, user_text, lyra_text, context, session_id, source="cli"):
+        self.exchanges.append((user_text, lyra_text, context, session_id))
+        return (1, 2)
 
 
 def _handler(backend, core=None, vision=None, history=None, now=None):
@@ -263,54 +281,69 @@ def _context_result(text: str) -> ContextResult:
         text=text, blocks={}, atom_ids=[], fact_ids=[], dream_ids=[], budget_used=0, misses=[])
 
 
-def _no_context():
-    return patch(
-        "lyra_core.runtime.build_context", new=AsyncMock(return_value=_context_result("")))
-
-
 def test_handle_writes_history_and_ticks_user_then_lyra():
     backend = _FakeBackend(["hi there"])
     handler, core, history = _handler(backend)
-    with _no_context():
-        reply = asyncio.run(handler.handle("hello", "s1"))
+    reply = asyncio.run(handler.handle("hello", "s1"))
     assert reply == "hi there"
     assert history.add.call_args_list == [call("s1", "user", "hello"), call("s1", "assistant", "hi there")]
     assert [(s, c) for s, c, _ in core.ticks] == [("conversation", "hello"), ("lyra", "hi there")]
+
+
+def test_handle_ingests_the_exchange_once_with_both_texts_and_the_session():
+    """CP-D.0: one ingest_exchange() call per handle(), not two atom writes —
+    change 3's "verify the per-exchange atom count is unchanged at two" is
+    interface.py's job (Store.ingest_turn always writes exactly two); this
+    is the daemon-side half: exactly one call, carrying both texts."""
+    backend = _FakeBackend(["hi there"])
+    handler, core, history = _handler(backend)
+    asyncio.run(handler.handle("hello", "s1"))
+    assert len(core.exchanges) == 1
+    user_text, lyra_text, context, session_id = core.exchanges[0]
+    assert user_text == "hello"
+    assert lyra_text == "hi there"
+    assert session_id == "s1"
+    assert context is core._context, "the exact ContextResult retrieve_context() returned, not a second one"
 
 
 def test_handle_calls_vision_and_reprompts():
     backend = _FakeBackend(["[TOOL:see:screen]", "You have a Python file open."])
     vision = MagicMock(return_value="A code editor with Python open.")
     handler, core, history = _handler(backend, vision=vision)
-    with _no_context():
-        reply = asyncio.run(handler.handle("what's on my screen?", "s1"))
+    reply = asyncio.run(handler.handle("what's on my screen?", "s1"))
     assert reply == "You have a Python file open."
     vision.assert_called_once_with("screen")
     history.add.assert_any_call("s1", "assistant", "[TOOL:see:screen]")
     history.add.assert_any_call("s1", "user", "[Vision result: A code editor with Python open.]")
     assert ("vision", "A code editor with Python open.", 0.1) in [(s, c, round(d, 3)) for s, c, d in core.ticks] or \
         any(s == "vision" for s, _, _ in core.ticks)
+    # The vision detour writes its own atom (interface.py's _ingest_sensory,
+    # unchanged); ingest_exchange still pairs the ORIGINAL question with the
+    # FINAL answer, once.
+    assert len(core.exchanges) == 1
+    assert core.exchanges[0][0] == "what's on my screen?"
+    assert core.exchanges[0][1] == "You have a Python file open."
 
 
 def test_handle_webcam_source():
     backend = _FakeBackend(["[TOOL:see:webcam]", "I see you."])
     vision = MagicMock(return_value="A person at a desk.")
     handler, _, _ = _handler(backend, vision=vision)
-    with _no_context():
-        assert asyncio.run(handler.handle("what do you see?", "s1")) == "I see you."
+    assert asyncio.run(handler.handle("what do you see?", "s1")) == "I see you."
     vision.assert_called_once_with("webcam")
 
 
 def test_handle_caps_vision_at_three_attempts():
     backend = _FakeBackend(["[TOOL:see:screen]"] * 3)
     vision = MagicMock(return_value="still a screen")
-    handler, _, history = _handler(backend, vision=vision)
-    with _no_context():
-        reply = asyncio.run(handler.handle("what's on my screen?", "s1"))
+    handler, core, history = _handler(backend, vision=vision)
+    reply = asyncio.run(handler.handle("what's on my screen?", "s1"))
     assert len(backend.calls) == 3 and vision.call_count == 3
     assert "unable to determine" in reply
     assert history.add.call_args_list.count(call("s1", "assistant", "[TOOL:see:screen]")) == 3
     history.add.assert_any_call("s1", "assistant", reply)
+    # The fallback still gets ingested as the exchange's "lyra" half.
+    assert core.exchanges[0][1] == reply
 
 
 def test_handle_discards_confabulated_text_after_the_tool_call_and_keeps_preamble():
@@ -320,8 +353,7 @@ def test_handle_discards_confabulated_text_after_the_tool_call_and_keeps_preambl
     ])
     vision = MagicMock(return_value="A terminal window.")
     handler, _, history = _handler(backend, vision=vision)
-    with _no_context():
-        assert asyncio.run(handler.handle("look", "s1")) == "Done."
+    assert asyncio.run(handler.handle("look", "s1")) == "Done."
     stored = [c.args[2] for c in history.add.call_args_list]
     assert "Let me look.\n[TOOL:see:screen]" in stored
     assert not any("Hello Lyra" in s for s in stored)
@@ -330,43 +362,44 @@ def test_handle_discards_confabulated_text_after_the_tool_call_and_keeps_preambl
 def test_backend_failure_is_rejected_not_fatal():
     backend = _FakeBackend(fail=ConnectionRefusedError("ollama down"))
     handler, core, history = _handler(backend)
-    with _no_context():
-        with pytest.raises(TurnRejected, match="ollama down"):
-            asyncio.run(handler.handle("hello", "s1"))
-    # The user turn was still recorded before the model was asked.
+    with pytest.raises(TurnRejected, match="ollama down"):
+        asyncio.run(handler.handle("hello", "s1"))
+    # The user turn was still recorded to history (a separate store) before
+    # the model was asked; the drive/affect tick for it still happened.
     history.add.assert_called_once_with("s1", "user", "hello")
     assert [s for s, _, _ in core.ticks] == ["conversation"]
+    # CP-D.0: a rejected turn is not a completed exchange — ingest_turn()
+    # requires both texts, and a turn that half-lands is exactly what it
+    # exists to prevent (Store's own docstring). No atom is written for it.
+    assert core.exchanges == []
 
 
 def test_context_failure_propagates_instead_of_degrading_to_layer1():
     """The old _get_system swallowed build_context errors and quietly served
-    Layer 1 alone. Now the failure is the turn's failure."""
-    handler, _, _ = _handler(_FakeBackend(["never"]))
-    with patch("lyra_core.runtime.build_context", new=AsyncMock(side_effect=RuntimeError("store gone"))):
-        with pytest.raises(RuntimeError, match="store gone"):
-            asyncio.run(handler.handle("hello", "s1"))
+    Layer 1 alone. Now the failure is the turn's failure — retrieve_context()
+    is unguarded (interface.py), and handle() calls it before ever asking
+    the backend for a reply."""
+    core = _FakeCore(retrieve_context_error=RuntimeError("store gone"))
+    handler, _, _ = _handler(_FakeBackend(["never"]), core=core)
+    with pytest.raises(RuntimeError, match="store gone"):
+        asyncio.run(handler.handle("hello", "s1"))
 
 
-def test_system_prompt_is_layer1_plus_context_plus_hint():
+def test_compose_system_prompt_is_layer1_plus_context_plus_hint():
     negative = AffectEngine.from_dict({
         "accum_rate": 1.0, "emotion_decay": 2.0, "mood_drift": 0.2,
         "emotion_v": -0.6, "emotion_a": 0.6, "mood_v": 0.0, "mood_a": 0.0,
     }).state
     handler, _, _ = _handler(_FakeBackend(), core=_FakeCore(affect=negative))
-    with patch(
-        "lyra_core.runtime.build_context",
-        new=AsyncMock(return_value=_context_result("## Persona Traits\n- curiosity")),
-    ):
-        system = asyncio.run(handler.system_prompt("hello"))
+    system = handler._compose_system_prompt(_context_result("## Persona Traits\n- curiosity"))
     assert system.startswith(LAYER1_FACTS)
     assert "curiosity" in system
     assert "Keep responses brief and direct. Don't soften or elaborate." in system
 
 
-def test_system_prompt_is_layer1_alone_when_neutral_and_empty():
+def test_compose_system_prompt_is_layer1_alone_when_neutral_and_empty():
     handler, _, _ = _handler(_FakeBackend())
-    with _no_context():
-        assert asyncio.run(handler.system_prompt("hello")) == LAYER1_FACTS
+    assert handler._compose_system_prompt(_context_result("")) == LAYER1_FACTS
 
 
 def test_tick_logs_the_clamp_with_the_raw_gap(caplog):

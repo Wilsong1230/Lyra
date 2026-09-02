@@ -228,15 +228,18 @@ def test_tick_observations_without_signal_match_empty_tick():
 # ── Ingest routing: source threading ──────────────────────────────────────────
 
 class _RecordingMemory:
-    """Fake memory whose append_atom records calls (no errors).
+    """Fake memory whose append_atom/ingest_turn record calls (no errors).
 
     CP-B: the daemon writes one Store atom per turn instead of calling
     add_turn/add_observation on a MemorySystem — see interface.py's
-    _ingest_sensory and DECISIONS.md.
+    _ingest_sensory and DECISIONS.md. CP-D.0: "conversation"/"lyra" text no
+    longer goes through append_atom at all — see ingest_turn below and
+    DECISIONS.md (CP-D.0).
     """
 
     def __init__(self) -> None:
         self.atoms: list[tuple[str, str, str]] = []  # (speaker, source, text)
+        self.ingest_calls: list[dict] = []
         self.candidate_pool = None
         self.identity_engine = None
         self.structured_state = None
@@ -245,28 +248,45 @@ class _RecordingMemory:
         self.atoms.append((speaker, source, text))
         return len(self.atoms)
 
+    async def ingest_turn(
+        self, user_text: str, lyra_text: str, source: str = "cli", injected: dict | None = None,
+        **_: object,
+    ) -> tuple[int, int]:
+        self.ingest_calls.append({
+            "user_text": user_text, "lyra_text": lyra_text, "source": source,
+            "injected": injected or {},
+        })
+        return (len(self.ingest_calls) * 2 - 1, len(self.ingest_calls) * 2)
 
-def test_ingest_routes_conversation_source_to_wilson_speaker():
+
+def test_ingest_no_longer_writes_an_atom_for_conversation_source():
+    """CP-D.0: "conversation"/"lyra" text is persisted by ingest_exchange()
+    (via Store.ingest_turn, bundled with the lyra half and the retrieval
+    provenance), not by ticking a sensory observation through
+    _ingest_sensory — see DECISIONS.md."""
     memory = _RecordingMemory()
     core = CognitiveCore(memory=memory)
     obs = Observation(kind=ObservationKind.sensory, source="conversation", content="hello")
 
     asyncio.run(core.tick([obs]))
 
-    assert memory.atoms == [("wilson", "cli", "hello")]
+    assert memory.atoms == []
+    assert memory.ingest_calls == []
 
 
-def test_ingest_routes_lyra_source_to_lyra_speaker():
+def test_ingest_no_longer_writes_an_atom_for_lyra_source():
     memory = _RecordingMemory()
     core = CognitiveCore(memory=memory)
     obs = Observation(kind=ObservationKind.sensory, source="lyra", content="hi there")
 
     asyncio.run(core.tick([obs]))
 
-    assert memory.atoms == [("lyra", "cli", "hi there")]
+    assert memory.atoms == []
 
 
 def test_ingest_routes_vision_source_to_vision_channel():
+    """Vision is not part of an "exchange" pair — it still writes its own
+    solo atom the old way, unaffected by CP-D.0."""
     memory = _RecordingMemory()
     core = CognitiveCore(memory=memory)
     obs = Observation(kind=ObservationKind.sensory, source="vision", content="a terminal window")
@@ -274,6 +294,79 @@ def test_ingest_routes_vision_source_to_vision_channel():
     asyncio.run(core.tick([obs]))
 
     assert memory.atoms == [("system", "vision", "a terminal window")]
+
+
+# ── ingest_exchange / retrieve_context (CP-D.0) ────────────────────────────────
+
+class _FakeContextResult:
+    def __init__(self, row: dict) -> None:
+        self._row = row
+
+    def as_log_row(self) -> dict:
+        return dict(self._row)
+
+
+def test_ingest_exchange_calls_store_ingest_turn_with_both_texts():
+    memory = _RecordingMemory()
+    core = CognitiveCore(memory=memory)
+    context = _FakeContextResult({"atom_ids": [1, 2], "fact_ids": [], "dream_ids": [], "budget_used": 40})
+
+    asyncio.run(core.ingest_exchange("hello", "hi there", context, session_id="s1"))
+
+    assert len(memory.ingest_calls) == 1
+    call = memory.ingest_calls[0]
+    assert call["user_text"] == "hello"
+    assert call["lyra_text"] == "hi there"
+    assert call["source"] == "cli"
+
+
+def test_ingest_exchange_threads_session_id_into_injected():
+    memory = _RecordingMemory()
+    core = CognitiveCore(memory=memory)
+    context = _FakeContextResult({"atom_ids": [], "fact_ids": [], "dream_ids": [], "budget_used": 0})
+
+    asyncio.run(core.ingest_exchange("hello", "hi there", context, session_id="session-xyz"))
+
+    assert memory.ingest_calls[0]["injected"]["session_id"] == "session-xyz"
+
+
+def test_ingest_exchange_carries_the_context_result_as_log_row():
+    memory = _RecordingMemory()
+    core = CognitiveCore(memory=memory)
+    row = {"atom_ids": [3], "fact_ids": [4], "dream_ids": [], "budget_used": 12, "misses": ["lexical: no BM25 match"]}
+    context = _FakeContextResult(row)
+
+    asyncio.run(core.ingest_exchange("q", "a", context, session_id=1))
+
+    injected = memory.ingest_calls[0]["injected"]
+    for key, value in row.items():
+        assert injected[key] == value
+
+
+def test_ingest_exchange_returns_the_two_atom_ids():
+    memory = _RecordingMemory()
+    core = CognitiveCore(memory=memory)
+    context = _FakeContextResult({"atom_ids": [], "fact_ids": [], "dream_ids": [], "budget_used": 0})
+
+    result = asyncio.run(core.ingest_exchange("q", "a", context, session_id="s1"))
+
+    assert result == (1, 2)
+
+
+def test_retrieve_context_calls_through_to_build_context(monkeypatch):
+    memory = _RecordingMemory()
+    core = CognitiveCore(memory=memory)
+
+    async def _fake_build_context(store, query):
+        assert store is memory
+        assert query == "what's the plan"
+        return "SENTINEL"
+
+    import lyra_core.interface as interface_module
+    monkeypatch.setattr(interface_module, "_build_context", _fake_build_context)
+
+    result = asyncio.run(core.retrieve_context("what's the plan"))
+    assert result == "SENTINEL"
 
 
 def test_ingest_routes_other_sources_to_system_speaker_over_cli():

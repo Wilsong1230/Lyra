@@ -22,23 +22,31 @@ Two callers share every measurement and every field name below:
     read-only requirement (the daemon already owns exclusive legitimate
     write access to its own store).
 
-Retrieval provenance (change 2c) is NOT read from Store's `context_log`
-table: the daemon's turn path (CP-B) calls `lyra_memory.store.context.
-build_context()` directly rather than through `Store.ingest_turn()`, which
-is the only thing that ever writes `context_log` — so on every daemon this
-checkpoint has run against, that table has zero rows. See DECISIONS.md
-(CP-C) for the finding and why fixing the turn path is out of this
-checkpoint's FILES set. Instead, "assemblies performed" here means a live,
-read-only retrieval self-test this module performs itself: it takes real
-atom text already sitting in the window as query strings and calls the
-same `build_context()` the daemon calls, read-only, and classifies each
-result by which of {vector, FTS} paths actually contributed. This is a
-measurement of retrieval health against real content, not a historical
-tally of turns — a real and disclosed difference from what "assemblies
-performed" would mean if `context_log` were populated.
+CP-C found `context_log` always empty: the daemon's turn path called
+`lyra_memory.store.context.build_context()` directly rather than through
+`Store.ingest_turn()`, the only thing that ever writes it. CP-D.0 fixed the
+wiring (interface.py's CognitiveCore.ingest_exchange -> Store.ingest_turn)
+— `context_log` now has real rows, and this module reports on it in two
+genuinely distinct ways, per change 6, each labeled separately in the
+output:
+
+  - `logged_*`: read directly from `context_log` rows in the window — a
+    historical tally of what real turns actually retrieved (and how each
+    one split across {vector, FTS}), including turns where retrieval found
+    nothing at all (an empty `atom_ids` shows up as a row with
+    `logged_empty_window` counted, not as an absent row).
+  - `selftest_*`: the live, read-only self-test this module has always
+    performed (CP-C) — real atom text from the window used as query
+    strings against the current store, right now, at report time. Kept
+    deliberately (change 6): it answers "is retrieval healthy against
+    current content", which a historical tally can't — a store that has
+    only ever been queried with bad search terms would show clean
+    `logged_*` numbers (every real query got what it asked for) while
+    `selftest_*` against the same content might reveal it.
 """
 from __future__ import annotations
 
+import json
 import re
 import time
 from dataclasses import dataclass
@@ -83,9 +91,15 @@ KNOWN_GAPS: list[str] = [
 FIELDS: tuple[str, ...] = (
     "atoms_today", "atoms_window_total", "atoms_total",
     "atoms_below_floor", "atoms_above_floor",
-    "assemblies_total", "assemblies_with_hit",
-    "retrieval_vector_only", "retrieval_fts_only",
-    "retrieval_both", "retrieval_neither",
+    # CP-D.0: two distinct retrieval measurements, not one — see module
+    # docstring. "logged_*" is a historical tally read from context_log;
+    # "selftest_*" is the live, read-only self-test (CP-C).
+    "logged_assemblies_window", "logged_with_hit_window", "logged_empty_window",
+    "logged_vector_only_window", "logged_fts_only_window",
+    "logged_both_window", "logged_neither_window",
+    "selftest_assemblies", "selftest_with_hit",
+    "selftest_vector_only", "selftest_fts_only",
+    "selftest_both", "selftest_neither",
     "candidates_total", "candidates_promoted_window",
     "trait_count", "trait_confidence_mean",
     "outcomes_total",
@@ -175,11 +189,11 @@ def _classify_misses(misses: list[str]) -> tuple[bool, bool]:
     return not vector_missed, not fts_missed
 
 
-async def _retrieval_section(
+async def _selftest_retrieval_section(
     store_like: _ReadOnlyStore, db: aiosqlite.Connection, window_start: float
 ) -> dict:
-    """Live, read-only retrieval self-test — see module docstring for why
-    this isn't a historical context_log tally."""
+    """Live, read-only retrieval self-test (CP-C) — see module docstring for
+    how this differs from _context_log_section's historical tally."""
     async with db.execute(
         "SELECT DISTINCT text FROM atoms WHERE ts >= ? AND speaker = 'wilson'"
         " AND length(text) > 0 ORDER BY id DESC LIMIT ?",
@@ -203,9 +217,46 @@ async def _retrieval_section(
             with_hit += 1
 
     return {
-        "assemblies_total": len(queries), "assemblies_with_hit": with_hit,
-        "retrieval_vector_only": vector_only, "retrieval_fts_only": fts_only,
-        "retrieval_both": both, "retrieval_neither": neither,
+        "selftest_assemblies": len(queries), "selftest_with_hit": with_hit,
+        "selftest_vector_only": vector_only, "selftest_fts_only": fts_only,
+        "selftest_both": both, "selftest_neither": neither,
+    }
+
+
+async def _context_log_section(db: aiosqlite.Connection, window_start: float) -> dict:
+    """A historical tally read straight from context_log (CP-D.0, change 6)
+    — what CognitiveCore.ingest_exchange actually logged for real turns in
+    the window, not a measurement performed now. An assembly that returned
+    nothing is a row with an empty atom_ids list, not a missing row — that
+    row is what logged_empty_window counts."""
+    async with db.execute(
+        "SELECT atom_ids, misses FROM context_log WHERE ts >= ?", (window_start,)
+    ) as cur:
+        rows = await cur.fetchall()
+
+    vector_only = fts_only = both = neither = with_hit = empty = 0
+    for atom_ids_json, misses_json in rows:
+        atom_ids = json.loads(atom_ids_json) if atom_ids_json else []
+        misses = json.loads(misses_json) if misses_json else []
+        vector_hit, fts_hit = _classify_misses(misses)
+        if vector_hit and fts_hit:
+            both += 1
+        elif vector_hit:
+            vector_only += 1
+        elif fts_hit:
+            fts_only += 1
+        else:
+            neither += 1
+        if atom_ids:
+            with_hit += 1
+        else:
+            empty += 1
+
+    return {
+        "logged_assemblies_window": len(rows), "logged_with_hit_window": with_hit,
+        "logged_empty_window": empty,
+        "logged_vector_only_window": vector_only, "logged_fts_only_window": fts_only,
+        "logged_both_window": both, "logged_neither_window": neither,
     }
 
 
@@ -245,7 +296,6 @@ async def _affect_section(db: aiosqlite.Connection, log_path: Path, window_start
 
     result: dict = {}
     if row is not None:
-        import json
         state = json.loads(row[0])
         result.update({
             "emotion_v": state.get("emotion_v"), "emotion_a": state.get("emotion_a"),
@@ -395,10 +445,17 @@ async def collect_measurements(
         _retrievability_section(db),
     )
     await _section(
-        "retrieval",
-        ("assemblies_total", "assemblies_with_hit", "retrieval_vector_only",
-         "retrieval_fts_only", "retrieval_both", "retrieval_neither"),
-        _retrieval_section(store_like, db, window_start),
+        "context_log",
+        ("logged_assemblies_window", "logged_with_hit_window", "logged_empty_window",
+         "logged_vector_only_window", "logged_fts_only_window",
+         "logged_both_window", "logged_neither_window"),
+        _context_log_section(db, window_start),
+    )
+    await _section(
+        "selftest_retrieval",
+        ("selftest_assemblies", "selftest_with_hit", "selftest_vector_only",
+         "selftest_fts_only", "selftest_both", "selftest_neither"),
+        _selftest_retrieval_section(store_like, db, window_start),
     )
     await _section(
         "candidates_traits",
@@ -489,13 +546,22 @@ def render(measurements: dict, window_days: int) -> str:
     lines.append(f"  below floor ({FORGET_THRESHOLD})   {measurements.get('atoms_below_floor', UNAVAILABLE)}")
     lines.append(f"  above floor         {measurements.get('atoms_above_floor', UNAVAILABLE)}")
 
-    lines.append("\n2c. retrieval (live self-test against window content — see module docstring)")
-    lines.append(f"  assemblies          {measurements.get('assemblies_total', UNAVAILABLE)}")
-    lines.append(f"  with >=1 atom       {measurements.get('assemblies_with_hit', UNAVAILABLE)}")
-    lines.append(f"  vector only         {measurements.get('retrieval_vector_only', UNAVAILABLE)}")
-    lines.append(f"  fts only            {measurements.get('retrieval_fts_only', UNAVAILABLE)}")
-    lines.append(f"  both                {measurements.get('retrieval_both', UNAVAILABLE)}")
-    lines.append(f"  neither             {measurements.get('retrieval_neither', UNAVAILABLE)}")
+    lines.append("\n2c. retrieval — two distinct measurements (see module docstring)")
+    lines.append("  logged (context_log rows in the window — what real turns actually retrieved):")
+    lines.append(f"    assemblies        {measurements.get('logged_assemblies_window', UNAVAILABLE)}")
+    lines.append(f"    with >=1 atom     {measurements.get('logged_with_hit_window', UNAVAILABLE)}")
+    lines.append(f"    empty (0 atoms)   {measurements.get('logged_empty_window', UNAVAILABLE)}")
+    lines.append(f"    vector only       {measurements.get('logged_vector_only_window', UNAVAILABLE)}")
+    lines.append(f"    fts only          {measurements.get('logged_fts_only_window', UNAVAILABLE)}")
+    lines.append(f"    both              {measurements.get('logged_both_window', UNAVAILABLE)}")
+    lines.append(f"    neither           {measurements.get('logged_neither_window', UNAVAILABLE)}")
+    lines.append("  selftest (live, read-only probe against current window content, run now):")
+    lines.append(f"    assemblies        {measurements.get('selftest_assemblies', UNAVAILABLE)}")
+    lines.append(f"    with >=1 atom     {measurements.get('selftest_with_hit', UNAVAILABLE)}")
+    lines.append(f"    vector only       {measurements.get('selftest_vector_only', UNAVAILABLE)}")
+    lines.append(f"    fts only          {measurements.get('selftest_fts_only', UNAVAILABLE)}")
+    lines.append(f"    both              {measurements.get('selftest_both', UNAVAILABLE)}")
+    lines.append(f"    neither           {measurements.get('selftest_neither', UNAVAILABLE)}")
 
     lines.append("\n2d. candidates / traits")
     lines.append(f"  candidates total    {measurements.get('candidates_total', UNAVAILABLE)}")
