@@ -32,10 +32,12 @@ cd lyra_ai
 pip install -e ".[dev]" -e ../lyra-memory   # install with dev deps
 python -m pytest              # run tests
 python -m pytest tests/test_assistant.py  # run a single test file
-lyra                          # run the assistant (auto-selects backend)
-lyra --backend anthropic      # use a specific backend
-lyra --list-backends          # show which backends are available
-lyra --list-models            # list models for chosen backend
+python -m lyra_core --init-store          # first run only: create an empty memory store, then serve
+python -m lyra_core                       # the daemon: one core, one store, listens on 127.0.0.1:8010
+python -m lyra_core --backend anthropic   # use a specific backend
+python -m lyra_core --list-backends       # show which backends are available
+lyra                          # attach to the running daemon (exits nonzero if none is listening)
+lyra --session <id>           # resume a session
 ```
 
 ### Services (each is the same pattern)

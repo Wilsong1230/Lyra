@@ -208,15 +208,16 @@ class CognitiveCore:
     # ── Ingest ───────────────────────────────────────────────────────────────
 
     async def _ingest_sensory(self, obs: Observation) -> None:
-        try:
-            if obs.source == "conversation":
-                await self._memory.add_turn("user", obs.content)
-            elif obs.source == "lyra":
-                await self._memory.add_turn("lyra", obs.content)
-            else:
-                await self._memory.add_observation(obs.content, source=obs.source)
-        except RuntimeError:
-            pass
+        # Unguarded (CP-A). A memory that is not started, or a store that
+        # cannot take the write, is a turn that did not happen; the daemon
+        # treats it as fatal rather than answering over a store that is
+        # silently dropping her record.
+        if obs.source == "conversation":
+            await self._memory.add_turn("user", obs.content)
+        elif obs.source == "lyra":
+            await self._memory.add_turn("lyra", obs.content)
+        else:
+            await self._memory.add_observation(obs.content, source=obs.source)
 
     async def _ingest_outcome(self, obs: Observation) -> None:
         if obs.predicted is None or obs.actual is None:

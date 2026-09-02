@@ -164,7 +164,7 @@ def test_affect_state_mood_and_temperament_accept_affect_vector():
 
 def test_tick_returns_correct_types():
     async def _run():
-        core = CognitiveCore()
+        core = CognitiveCore(memory=_RecordingMemory())
         obs = Observation(kind=ObservationKind.sensory, source="test", content="x")
         return await core.tick([obs])
 
@@ -200,7 +200,7 @@ def test_tick_with_no_observations_affect_stays_near_neutral():
 
 def test_tick_observations_without_signal_match_empty_tick():
     """Observations that carry no competence/memory signal — a sensory obs
-    from a non-conversation source (memory not started, so it's dropped),
+    from a non-conversation source (recorded by the fake memory, no drive signal),
     an action_outcome with no predicted/actual, and the reserved
     external_affect kind — leave the core in the same state as an empty tick."""
     observations = [
@@ -215,8 +215,8 @@ def test_tick_observations_without_signal_match_empty_tick():
     ]
 
     async def _run():
-        with_obs = await CognitiveCore().tick(observations)
-        without_obs = await CognitiveCore().tick([])
+        with_obs = await CognitiveCore(memory=_RecordingMemory()).tick(observations)
+        without_obs = await CognitiveCore(memory=_RecordingMemory()).tick([])
         return with_obs, without_obs
 
     (intents_a, affect_a), (intents_b, affect_b) = asyncio.run(_run())
@@ -327,7 +327,7 @@ from lyra_core.harness import Harness, Script, TickRecord, failures, outcome, se
 
 def test_run_produces_one_record_per_tick():
     async def _run():
-        h = Harness()
+        h = Harness(core=CognitiveCore(memory=_RecordingMemory()))
         script: Script = [
             [sensory("frame 0")],
             [sensory("frame 1"), sensory("frame 2")],
@@ -341,7 +341,7 @@ def test_run_produces_one_record_per_tick():
 
 def test_tick_records_have_sequential_indices():
     async def _run():
-        h = Harness()
+        h = Harness(core=CognitiveCore(memory=_RecordingMemory()))
         return await h.run([[sensory("a")], [sensory("b")], [sensory("c")]])
 
     trace = asyncio.run(_run())
@@ -354,7 +354,7 @@ def test_tick_record_observations_match_input():
     script: Script = [[obs0], [obs1]]
 
     async def _run():
-        h = Harness()
+        h = Harness(core=CognitiveCore(memory=_RecordingMemory()))
         return await h.run(script)
 
     trace = asyncio.run(_run())
@@ -366,7 +366,7 @@ def test_tick_record_intents_are_allowed_kinds():
     """Every intent the live core proposes must be within ALLOWED_KINDS —
     the selector never has a path to a blocked kind."""
     async def _run():
-        h = Harness()
+        h = Harness(core=CognitiveCore(memory=_RecordingMemory()))
         return await h.run([[sensory("x")], [sensory("y")]])
 
     trace = asyncio.run(_run())
@@ -377,7 +377,7 @@ def test_tick_record_intents_are_allowed_kinds():
 
 def test_tick_record_affect_is_bounded_and_typed():
     async def _run():
-        h = Harness()
+        h = Harness(core=CognitiveCore(memory=_RecordingMemory()))
         return await h.run([[sensory("x")], [sensory("y")], []])
 
     trace = asyncio.run(_run())
@@ -395,10 +395,13 @@ def test_run_empty_script_returns_empty_trace():
 
 
 def test_harness_constructs_own_core_when_none_given():
-    """Harness() with no argument must build its own CognitiveCore and run."""
+    """Harness() with no argument must build its own CognitiveCore and run.
+
+    An empty tick: the self-constructed core owns an unstarted MemorySystem,
+    and since CP-A a sensory observation into one is an error, not a no-op."""
     async def _run():
         h = Harness()
-        return await h.run([[sensory("self-constructed core")]])
+        return await h.run([[]])
 
     trace = asyncio.run(_run())
     assert len(trace) == 1
@@ -406,7 +409,7 @@ def test_harness_constructs_own_core_when_none_given():
 
 def test_harness_accepts_injected_core():
     async def _run():
-        core = CognitiveCore()
+        core = CognitiveCore(memory=_RecordingMemory())
         h = Harness(core=core)
         return await h.run([[sensory("injected")]])
 

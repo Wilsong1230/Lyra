@@ -10,7 +10,6 @@ import asyncio
 from lyra_core.actuators import SpeechActuator, default_utterance
 from lyra_core.action_selection import ActionSelector
 from lyra_core.interface import AffectState, AffectVector, Intent, IntentKind
-from lyra_core.runtime import CoreSink
 
 
 class _RecordingSend:
@@ -121,34 +120,3 @@ def test_frustration_override_still_suppresses_both():
     frustrated = AffectState(emotion=AffectVector(valence=-2.0, arousal=0.0))
     kinds = [i.kind for i in sel.select({"boredom": 1.5}, frustrated)]
     assert kinds == [IntentKind.noop]
-
-
-# ── CoreSink binds tick() and forwards to the actuator ────────────────────────
-
-class _FakeCore:
-    def __init__(self, intents):
-        self._intents = intents
-        self.ticks: list[tuple] = []
-
-    async def tick(self, observations, dt=0.1):
-        self.ticks.append((observations, dt))
-        return self._intents, _neutral()
-
-
-def test_coresink_binds_intents_and_forwards_to_actuator():
-    send = _RecordingSend()
-    act = SpeechActuator(send_fn=send)
-    core = _FakeCore([_speak()])
-    sink = CoreSink(core, dt=2.0, actuator=act)
-
-    asyncio.run(sink([]))
-
-    assert core.ticks == [([], 2.0)]
-    assert len(send.sent) == 1, "bound intents must reach the actuator"
-
-
-def test_coresink_without_actuator_still_ticks():
-    core = _FakeCore([_speak()])
-    sink = CoreSink(core, dt=2.0, actuator=None)
-    asyncio.run(sink([]))
-    assert core.ticks == [([], 2.0)]
