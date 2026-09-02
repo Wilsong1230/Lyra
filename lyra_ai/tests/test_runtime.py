@@ -309,8 +309,33 @@ def test_tick_logs_the_clamp_with_the_raw_gap(caplog):
     with caplog.at_level(logging.INFO, logger="lyra_core.runtime"):
         asyncio.run(handler.tick("conversation", "morning"))
     line = next(l for l in caplog.text.splitlines() if DT_CLAMP_ENGAGED in l)
-    assert "elapsed=28800.0s" in line and "dt=0.100" in line
-    assert "valence=" in line and "arousal=" in line
+    assert "elapsed=28800.000000" in line and "dt=0.100000" in line
+    assert "clamped=True" in line
+    assert "emotion_v=" in line and "emotion_a=" in line
+    assert "mood_v=" in line and "mood_a=" in line
+    assert "boredom_pressure=" in line and "relational_pressure=" in line
+
+
+def test_tick_logs_one_stable_line_per_tick_whether_or_not_clamped(caplog):
+    """CP-A.1: a single unified per-tick line, clamped or not — same field
+    names either way, so a log can be grepped without special-casing."""
+    now = [1000.0]
+    handler, _, _ = _handler(_FakeBackend(), now=lambda: now[0])
+    with caplog.at_level(logging.INFO, logger="lyra_core.runtime"):
+        now[0] += 0.05  # under the 0.1 clamp: not clamped
+        asyncio.run(handler.tick("conversation", "hi"))
+    lines = [l for l in caplog.text.splitlines() if "source=conversation" in l]
+    assert len(lines) == 1
+    line = lines[0]
+    assert DT_CLAMP_ENGAGED not in line
+    assert "clamped=False" in line
+    assert "elapsed=0.050000" in line and "dt=0.050000" in line
+    for field in (
+        "boredom_pressure=", "relational_pressure=",
+        "emotion_v=", "emotion_a=", "mood_v=", "mood_a=",
+        "temperament_v=", "temperament_a=", "temperament_c=",
+    ):
+        assert field in line
 
 
 # ── runtime over a real socket ───────────────────────────────────────────────

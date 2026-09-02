@@ -17,6 +17,13 @@ since the previous tick, clamped to config.MAX_TICK_DT_SECONDS — see the
 note there for why the clamp is what it is. tick() still returns intents;
 they are bound and left unconsumed, as CP-A requires.
 
+Every tick logs one structured INFO line (TurnHandler.tick): raw elapsed,
+applied dt, whether the clamp engaged, both drives' pressure, and the
+emotion/mood/temperament axes — key=value, stable field names, `grep
+DT_CLAMP_ENGAGED` still finds the clamped ones (CP-A.1: instrumentation
+only, see tools/affect_probe.py and docs/AFFECT_CHARACTERIZATION.md for
+what the numbers mean offline).
+
 Failure policy: a missing store, a store whose schema cannot be made right,
 a sqlite-vec that will not load, a backend that cannot be selected — each
 ends the process with a nonzero exit and a log line naming the cause. On
@@ -42,7 +49,7 @@ from lyra.backends import Backend
 from lyra.memory import ConversationMemory
 from lyra_core.config import DAEMON_HOST, DAEMON_PORT, MAX_TICK_DT_SECONDS
 from lyra_core.expression import prose_hint
-from lyra_core.interface import CognitiveCore, Observation, ObservationKind
+from lyra_core.interface import AffectVector, CognitiveCore, Observation, ObservationKind
 from lyra_core.transport import TurnRejected, TurnServer
 from lyra_memory import MemorySystem, retrieval
 from lyra_memory.config import DB_PATH
@@ -273,16 +280,30 @@ class TurnHandler:
         obs = Observation(kind=ObservationKind.sensory, source=source, content=content)
         elapsed, dt, clamped = self._clock.next_dt()
         self.last_intents, affect = await self._core.tick([obs], dt)
-        if clamped:
-            log.info(
-                "%s elapsed=%.1fs dt=%.3f | tick source=%s valence=%.3f arousal=%.3f",
-                DT_CLAMP_ENGAGED, elapsed, dt, source, affect.valence, affect.arousal,
-            )
-        else:
-            log.info(
-                "tick source=%s dt=%.3f valence=%.3f arousal=%.3f",
-                source, dt, affect.valence, affect.arousal,
-            )
+
+        # CognitiveCore.tick() returns only (intents, affect) — interface.py
+        # is outside this checkpoint's closed file set, so drive pressure is
+        # read off the core's own drive objects rather than adding a new
+        # accessor there. See DECISIONS.md (CP-A.1).
+        boredom_pressure = getattr(getattr(self._core, "_boredom", None), "pressure", float("nan"))
+        relational_pressure = getattr(getattr(self._core, "_relational", None), "pressure", float("nan"))
+
+        emotion = affect.emotion
+        mood = affect.mood if affect.mood is not None else AffectVector()
+        temperament = affect.temperament if affect.temperament is not None else AffectVector()
+        temperament_c = temperament.control if temperament.control is not None else float("nan")
+
+        log.info(
+            "%s source=%s elapsed=%.6f dt=%.6f clamped=%s "
+            "boredom_pressure=%.6f relational_pressure=%.6f "
+            "emotion_v=%.6f emotion_a=%.6f mood_v=%.6f mood_a=%.6f "
+            "temperament_v=%.6f temperament_a=%.6f temperament_c=%.6f",
+            DT_CLAMP_ENGAGED if clamped else "tick",
+            source, elapsed, dt, clamped,
+            boredom_pressure, relational_pressure,
+            emotion.valence, emotion.arousal, mood.valence, mood.arousal,
+            temperament.valence, temperament.arousal, temperament_c,
+        )
 
     async def system_prompt(self, query: str) -> str:
         # Unguarded on purpose. A broken store and an empty store must not
