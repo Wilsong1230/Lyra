@@ -354,3 +354,185 @@ covering the unclamped branch and the full new field set, following the
 CP-A precedent of updating tests outside the closed set as the direct,
 minimal consequence of an in-set behavior change — no other test in the
 file changed.
+
+---
+
+# CP-A.2 — exact coupling, bounded pressure, a measured clamp
+
+Correction checkpoint, built directly on CP-A.1's measurements. Register
+correction carried in: temperament is static under `tick()` — two dynamic
+timescales (emotion, mood) and one constant, not three.
+
+## The exact 2x2 solve (item 1)
+
+**Ambiguous:** "replace the Jacobi update... with the exact solution of the
+2x2 system" specifies the destination, not the derivation.
+
+**Derivation, recorded here because it is not obvious from the code:** for
+`e' = forcing + k_e(m-e)`, `m' = k_m(e-m)`, decompose into `S = k_m*e + k_e*m`
+and `D = e - m`. `S` has no restoring term (`k_m*e' + k_e*m' = k_m*forcing`
+identically, for any `e`, `m`), so it is exactly conserved when
+`forcing = 0` and integrates a constant forcing exactly over any interval:
+`S(dt) = S0 + k_m*forcing*dt`. `D` decouples into a single ordinary
+relaxation, `D' = forcing - r*D` with `r = k_e + k_m` (the register's
+`1/tau_e + 1/tau_m`), whose exact solution is `D(dt) = D0*(1-relax) +
+(forcing/r)*relax` with `relax = 1 - e^(-r*dt)` — the same
+never-overshoots-at-any-dt form CP-A already used for a single variable,
+now applied to the pair's own difference channel. `e` and `m` are read back
+off `(S, D)` algebraically. No substep; `_step()` is one closed-form
+evaluation regardless of how large `dt` is. Implemented in `affect.py`
+(`AffectEngine._step`), full derivation in that method's docstring.
+
+**Verified exact:** `docs/AFFECT_CHARACTERIZATION.md` 3a — the same span at
+dt=0.1, 2.0, 60.0, and one single tick agree to ~1e-15 (float noise), down
+from CP-A.1's measured 0.4-0.5 spread with the Jacobi split.
+
+## Reading pressure as forcing, not as a second Euler input (item 3)
+
+**Ambiguous:** "pressure enters affect as a rate, integrated once over the
+step, not accumulated by dt and then integrated by dt again" describes a
+symptom (dt appearing to scale a quantity twice), not a specific code
+change distinct from item 1.
+
+**Finding:** there is no separate literal bug to remove beyond item 1 —
+`BoredomDrive.update` advancing pressure by `dt` and `AffectEngine.update`
+advancing emotion by `dt` are two different state variables each correctly
+integrated once; that is ordinary cascaded-ODE structure, not a double
+integration of the same quantity. What made it *look* and *behave* like a
+dt² blowup was the combination CP-A.1 measured: pressure unbounded (so the
+forcing kept growing across the whole trajectory) feeding the *broken*
+Jacobi coupling (whose own error compounds badly at large dt). Item 1 (this
+checkpoint) makes the affect side exact; item 2 (below) bounds the forcing.
+Together, the drive-to-affect path now treats `push.valence_delta` as
+`forcing`, held constant across one step and integrated exactly by `_step`
+(`S(dt) = S0 + k_m*forcing*dt`, not `push*dt` bolted onto a Jacobi update) —
+which is the literal reading of "pressure enters affect as a rate,
+integrated once." No further code beyond item 1's `_step` was needed to
+satisfy item 3; there is no line left in `affect.py` or `drives.py` that
+scales a state variable by `dt` twice for the same conceptual quantity (see
+the "dt consumption sites" table in the regenerated document).
+
+**Residual, disclosed rather than hidden:** the *coupled* measurements (3c)
+do not agree across tick rates to floating-point precision the way the
+uncoupled ones (3a, 3b) do — a small, constant, non-growing residual
+(~5.6e-05 valence at `_BOREDOM_PRESSURE_CEILING = 0.02`) remains, because
+pressure ramps from 0 to its ceiling over `ceiling/idle_rate` seconds and a
+coarse dt resolves that one ramp less precisely than a fine dt does; since
+`S` never decays, that resolution difference is never erased. This is
+qualitatively different from CP-A.1's finding (bounded and flat vs.
+unbounded and accelerating) and is exactly what item 5's agreement check
+measures and reports rather than asserting away.
+
+## Bounding pressure: the ceiling is sized to `prose_hint`, not to `|value| < 1` (item 2)
+
+**Ambiguous:** "bound drive pressure... approach a ceiling... record the
+ceiling as a named constant" gives no value. The done-whens name two
+different bars: "affect values in range, not saturated" (8h-idle scenario)
+and "does not turn her terse" (six-exchange scenario) — these are not the
+same threshold.
+
+**First attempt, and why it was wrong:** `_BOREDOM_PRESSURE_CEILING = 0.5`
+(exact exponential approach, `dPressure/dt = idle_rate*(1-pressure/ceiling)`,
+so `idle_rate` is preserved as the slope at pressure=0) keeps a single
+worst-case tick at the new clamp comfortably under `|value| < 1`. But the
+six-exchange conversation done-when isn't measured against `|value| < 1` —
+it's measured against whether the daemon actually goes terse, which is
+`lyra_core.expression.prose_hint`'s `_VALENCE_THRESHOLD = 0.3` on the
+*blended* `emotion.valence + mood.valence`, a threshold three times
+tighter, on a summed (not single-axis) quantity. At ceiling=0.5 the probe's
+six-exchange scenario produced blended valence -4.46 — deep in
+`prose_hint`'s terse region, failing the done-when outright despite passing
+the naive saturation check.
+
+**Chosen:** `_BOREDOM_PRESSURE_CEILING = 0.02`, found by probing candidate
+ceilings against the *actual* `prose_hint` output on the six-exchange
+scenario (not against a hand-derived proxy threshold) until the hint
+stopped firing with margin: blended valence -0.18 at ceiling=0.02, vs. the
+-0.3 trigger. `docs/AFFECT_CHARACTERIZATION.md` 3e now calls `prose_hint`
+directly on the final state and reports the actual hint string, so this is
+checked against the real function, not reimplemented in the probe.
+
+**Reversal:** the constant is named and isolated (`drives.py`); changing it
+is a one-line edit plus a probe re-run, no integrator change required.
+
+## `MAX_TICK_DT_SECONDS = 600.0` (item 4)
+
+**Chosen:** 600 s (10 minutes), against two measured constraints in
+`docs/AFFECT_CHARACTERIZATION.md` ("Clamp safety"):
+1. It must cover every gap this checkpoint's done-when calls "ordinary"
+   (5 s, 60 s, 10 min) without clamping — verified against a live daemon,
+   not just the probe (three ticks, `clamped=false` on all three).
+2. A single worst-case tick at this dt — pressure already at its ceiling
+   from prior idling, applied for the whole 600 s — must not saturate
+   (`|value| >= 1`) either affect axis. Measured: valence -0.22, arousal
+   0.11, both well inside range.
+
+With `_BOREDOM_PRESSURE_CEILING` sized to the tighter `prose_hint`
+constraint (above), the `|value| < 1` constraint on a single clamped tick
+turned out not to bind until much larger clamp values (the "Clamp safety"
+table shows candidates well past 600 s before `saturated?` flips to
+`True`), so 600 s was chosen directly against "ordinary gaps never clamp"
+rather than pushed up against a saturation ceiling. Verified against a live
+daemon: 8h+ idle then one turn — `elapsed=28800.000000 dt=600.000000
+clamped=True`, `emotion_v=-0.461763 emotion_a=0.230882`, both in range.
+
+**Not derived analytically:** the coupled forcing's `S` channel has no
+restoring term (see item 1's derivation) — under *sustained* nonzero
+forcing there is no dt or ceiling that keeps it bounded forever, only
+values that keep it small over the specific, finite scenarios this
+checkpoint's done-when actually names. 600 s is evidence-based for those
+scenarios, not a proof for arbitrary future ones; a future checkpoint
+retuning the drives or extending the clamp further should re-run the probe
+against whatever new scenarios it needs to cover, the same way this one
+did.
+
+## What CP-A.2 did not touch
+
+`RelationalDrive` needed no change: CP-A.1 already found it bounded to
+`[0, 1]` by construction (a function of elapsed time since last recurrence,
+not an accumulator) and tick-rate invariant. `BoredomDrive`'s relief branch
+(`pressure -= relief_rate*dt`, floor-clamped at 0) is unchanged — item 2
+named only idle accumulation, and the floor plus the new ceiling already
+bound it on both sides. `encourage_remaining`'s countdown is unchanged — a
+state-independent linear decrement, exact at any dt on its own, not part of
+the emotion/mood coupling or the drive-to-affect path either item 1 or item
+3 touches. Temperament is untouched per OUT OF SCOPE.
+
+## Reading "(add the agreement check only)" against a regenerated document
+
+**Ambiguous:** the FILES set annotates `tools/affect_probe.py` with "(add
+the agreement check only)", but change 4 requires "a value the probe
+shows is safe" and `docs/AFFECT_CHARACTERIZATION.md` is separately listed
+as "(regenerated)". The existing narrative text (e.g. 3a's "the four do
+NOT agree", 3b's "Bounded: no", the DT_SITES table's line numbers and
+classifications) describes the pre-CP-A.2 code; left as-is, a regenerated
+document produced by re-running the same script would state things about
+the *current* code that are now false.
+
+**Chosen:** added `agreement_checks()`/`measure_clamp_safety()` (the two
+new pieces of evidence items 4 and 5 require) and updated the surrounding
+prose and the `DT_SITES` table to describe what the current code actually
+does — not a restructuring of the measurement methodology (same spans,
+same rates, same scenario functions throughout). The alternative — leaving
+stale text in place — would make the regenerated document self-
+contradicting (numbers from the new code next to prose describing the old
+code's bugs as current). "Add the agreement check only" is read as scoping
+*new measurement machinery*, not as license to publish a document that
+misdescribes the code it just measured.
+
+## Files touched outside the FILES set
+
+- `lyra_ai/tests/test_affect.py` — one test
+  (`test_encouragement_expires_after_duration_then_full_rate_resumes`) hand-
+  derived its expected value from the old per-variable Jacobi formula; it
+  now derives the same expectation from the exact 2x2 solve (same
+  discrimination — full rate vs. half rate — different closed form). Two
+  new tests added: `test_relaxation_agrees_across_tick_granularities` (3a as
+  a unit test) and `test_coarse_dt_converges_toward_mood_not_starting_value`
+  (the swap-case fix, directly). All other tests passed unmodified — the
+  new integrator is qualitatively closer to the old one's intent (monotonic
+  convergence, no oscillation), not a behavior change most tests could see.
+- `lyra_ai/tests/test_drives.py` — no changes. Every existing test asserts
+  qualitative properties (monotonic increase, bounded comparisons) that the
+  bounded exponential-approach still satisfies; none hard-coded a specific
+  pressure value that the ceiling would change.

@@ -29,6 +29,52 @@ def test_neutral_start_no_drift_under_zero_input():
     assert engine.state.arousal == pytest.approx(0.0)
 
 
+# ── CP-A.2: tick-rate invariance ────────────────────────────────────────────
+#
+# CP-A.1 measured that the coupled emotion/mood pair, integrated as two
+# independent single-variable relaxations, does NOT agree across tick rates
+# (docs/AFFECT_CHARACTERIZATION.md 3a: at dt=60 the pair nearly swaps every
+# step instead of converging). The exact 2x2 solve is provably tick-rate
+# invariant: the same wall-clock span, at any dt, is the same evaluation of
+# the same closed-form solution.
+
+def test_relaxation_agrees_across_tick_granularities():
+    """Zero input, non-neutral start: dt=0.1, 2.0, 60.0 and one single tick
+    spanning the whole interval must land on the same terminal state."""
+    start = dict(
+        accum_rate=1.0, emotion_decay=2.0, mood_drift=0.2,
+        emotion_v=-0.6, emotion_a=0.6, mood_v=-0.2, mood_a=0.1,
+        encourage_strength=0.0, encourage_remaining=0.0,
+    )
+    span = 3600.0
+    finals = []
+    for dt in (0.1, 2.0, 60.0, span):
+        engine = AffectEngine.from_dict(dict(start))
+        for _ in range(round(span / dt)):
+            engine.update(dt)
+        s = engine.state
+        finals.append((s.emotion.valence, s.emotion.arousal, s.mood.valence, s.mood.arousal))
+    for axis in zip(*finals):
+        assert max(axis) - min(axis) < 1e-6, finals
+
+
+def test_coarse_dt_converges_toward_mood_not_starting_value():
+    """At dt=60 (CP-A.1's swap case) a one-hour idle run must move emotion
+    substantially away from where it started, toward the shared equilibrium
+    — not land back within noise of the start value."""
+    engine = AffectEngine.from_dict(dict(
+        accum_rate=1.0, emotion_decay=2.0, mood_drift=0.2,
+        emotion_v=-0.6, emotion_a=0.6, mood_v=-0.2, mood_a=0.1,
+        encourage_strength=0.0, encourage_remaining=0.0,
+    ))
+    for _ in range(60):  # 60 steps of dt=60 -> 3600s
+        engine.update(60.0)
+    s = engine.state
+    equilibrium = (0.2 * -0.6 + 2.0 * -0.2) / 2.2
+    assert s.emotion.valence == pytest.approx(equilibrium, abs=1e-6)
+    assert abs(s.emotion.valence - -0.6) > 0.3, "should have moved well off the start value"
+
+
 # ── Fast response + decay toward mood ─────────────────────────────────────────
 
 def test_negative_burst_drops_emotion_sharply():
@@ -261,13 +307,22 @@ def test_encouragement_expires_after_duration_then_full_rate_resumes():
     engine.update(dt, valence_input=-1.0)
     ev_after = engine.state.emotion.valence
 
-    # Decay is integrated exactly, not by an explicit Euler step: the state
-    # moves a fraction (1 - e^(-decay·dt)) of the way toward mood. The
-    # discrimination this test exists for — full rate vs half rate — is
-    # unaffected; only the decay term's form changed.
-    relax = 1.0 - math.exp(-2.0 * dt)
-    full_rate_expected = ev + 1.0 * (-1.0) * dt + (mv - ev) * relax
-    half_rate_expected = ev + 0.5 * (-1.0) * dt + (mv - ev) * relax
+    # CP-A.2: emotion/mood are integrated as the exact solution of the
+    # coupled 2x2 system (see AffectEngine._step), not two independent
+    # single-variable relaxations. The discrimination this test exists for
+    # — full rate vs half rate — is unaffected; only the closed form used to
+    # compute the expected value changed.
+    def exact_step(e0: float, m0: float, forcing: float) -> float:
+        k_e, k_m = 2.0, 0.2
+        r = k_e + k_m
+        relax = 1.0 - math.exp(-r * dt)
+        d0, s0 = e0 - m0, k_m * e0 + k_e * m0
+        d1 = d0 * (1.0 - relax) + (forcing / r) * relax
+        s1 = s0 + k_m * forcing * dt
+        return (s1 + k_e * d1) / r
+
+    full_rate_expected = exact_step(ev, mv, 1.0 * -1.0)
+    half_rate_expected = exact_step(ev, mv, 0.5 * -1.0)
 
     assert ev_after == pytest.approx(full_rate_expected)
     assert ev_after != pytest.approx(half_rate_expected)
