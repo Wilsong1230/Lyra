@@ -539,6 +539,83 @@ class CognitiveCore:
         )
         return trait_name, trait_value
 
+    async def promote_traits(self) -> list[dict]:
+        """Run promotion against the live Store connection (CP-F change 2).
+
+        Before this method existed, `lyra_memory.identity_engine.
+        IdentityEngine.consolidate()` — the ONLY code in this repo that ever
+        writes to `traits`/`trait_history` — had exactly two callers, and
+        the live daemon's turn path was not one of them:
+
+          - `store/passes/dream.py`'s DreamPass.consolidate(), itself only
+            reachable through DreamPass.execute(), a ColdPass. Nothing in
+            this build ever constructs or runs a ColdPass automatically —
+            there is no scheduler for it (grep the tree: the only
+            constructors of DreamPass are its own tests and this docstring's
+            own review). It exists, is tested, and is simply never invoked
+            outside a test.
+          - `lyra_memory/__init__.py`'s legacy `MemorySystem`/`DreamingLoop`
+            pairing, which does schedule itself (a poll loop against
+            DB_PATH/memory.db) — but the live daemon's CognitiveCore is
+            constructed with a `lyra_memory.store.Store` (STORE_PATH,
+            CP-B), never a MemorySystem. MemorySystem's identity_engine is
+            real but attached to a database and a working-memory instance
+            the running daemon never opens.
+
+        So "unwired" was not a bug in IdentityEngine (it is fully correct —
+        see lyra-memory/tests/test_trait_history.py) and not a missing
+        threshold — it is that literally no code path connected the daemon's
+        actual per-turn database connection to IdentityEngine at all.
+        CP-E already had this exact problem for CandidatePool.add_observation
+        and fixed it the same way `consolidate_retrieval_outcome` does:
+        construct fresh against `self._memory.db`, the Store connection this
+        process actually opened, rather than going through either dead path.
+        This method does the same for promotion.
+
+        Called once per turn from runtime.py's `_finish_exchange`, after
+        `consolidate_retrieval_outcome` (the daemon's only source of
+        candidate evidence today) — "after consolidation" per CHANGES item
+        2. Returns IdentityEngine.consolidate()'s own return value: a list
+        of dicts, one per candidate that crossed into `traits` for the
+        first time this call (empty when nothing crossed, e.g. this turn's
+        consolidation only added evidence to a candidate already promoted,
+        or memory has no `.db`).
+
+        Read-only exposure back to Lyra deliberately does NOT go through a
+        new method here. OUT OF SCOPE forbids "changing retrieval", and
+        `lyra_memory/store/context.py` already has a `traits` context block
+        (`_traits_block`, budget `CONTEXT_BUDGETS["traits"]`) that SELECTs
+        `traits WHERE confidence >= TRAIT_CONFIDENCE_FLOOR` and folds the
+        result into the same `context.text` the facts/commitments/recall
+        blocks use — wired into the live daemon already via
+        `CognitiveCore.retrieve_context` -> `TurnHandler._compose_system_
+        prompt`, unchanged by CP-F. The first promoted trait therefore
+        becomes visible to her on the next turn that retrieves, through the
+        exact mechanism the codebase already built for it, without this
+        checkpoint touching retrieval at all. One measured consequence
+        worth recording (see DECISIONS.md, CP-F change 2): confidence is
+        `evidence_count / TRAIT_THRESHOLDS["core"]` (= evidence/50), so a
+        surface-tier trait (evidence_count 5-14) has confidence 0.10-0.28 —
+        always below TRAIT_CONFIDENCE_FLOOR (0.3) — and is promoted
+        (exists in `traits`) without yet being visible to her; visibility
+        starts at evidence_count=15 (character tier, confidence exactly
+        0.30).
+
+        No path from her own output reaches this method or anything it
+        calls: `runtime.py`'s only inspection of her response is
+        `parse_tool_call`/`_TOOL_TOKENS`, a fixed two-entry vision-only
+        dict; `promote_traits` is invoked by `_finish_exchange` itself,
+        never by anything keyed off her text. See DECISIONS.md for the
+        grep that confirms `traits`/`trait_history` are written nowhere
+        else in the tree.
+        """
+        db = getattr(self._memory, "db", None)
+        if db is None:
+            return []
+        from lyra_memory.identity_engine import IdentityEngine
+        pool = CandidatePool(db)
+        return await IdentityEngine(db, pool).consolidate()
+
     async def _ingest_outcome(self, obs: Observation) -> None:
         if obs.predicted is None or obs.actual is None:
             return

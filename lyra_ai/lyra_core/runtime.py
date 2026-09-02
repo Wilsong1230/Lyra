@@ -96,6 +96,10 @@ INTENT_DECLINED = "INTENT_DECLINED"
 OUTCOME_RECORDED = "OUTCOME_RECORDED"
 CONSOLIDATOR_FIRED = "CONSOLIDATOR_FIRED"
 CANDIDATE_CREATED = "CANDIDATE_CREATED"
+# CP-F: promotion is a write to identity — "must never be silent" (change
+# 4). Fires once per candidate that crosses into `traits` for the first
+# time this turn, zero or more times per turn (usually zero).
+TRAIT_PROMOTED = "TRAIT_PROMOTED"
 
 # Tables the hot path and the current retrieval queries reference (CP-B —
 # Store's schema, lyra_memory/store/schema.py, not the older db.py):
@@ -520,6 +524,19 @@ class TurnHandler:
         if consolidated is not None:
             trait_name, _trait_value = consolidated
             log.info("%s turn=%d trait_name=%r", CANDIDATE_CREATED, turn_id, trait_name)
+
+        # CP-F change 2: promotion runs after consolidation, every turn —
+        # IdentityEngine.consolidate() is cheap (one SELECT over candidates
+        # plus, at most, the handful of rows that actually changed) and
+        # idempotent when nothing crosses a threshold, so there is no
+        # reason to gate it behind consolidated being non-None.
+        promotions = await self._core.promote_traits()
+        for promotion in promotions:
+            log.info(
+                "%s turn=%d trait_name=%r evidence_count=%d threshold=%d",
+                TRAIT_PROMOTED, turn_id, promotion["trait_name"],
+                promotion["evidence_count"], promotion["threshold"],
+            )
 
 
 def parse_tool_call(response: str) -> str | None:

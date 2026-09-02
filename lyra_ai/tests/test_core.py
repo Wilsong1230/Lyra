@@ -866,3 +866,80 @@ async def test_consolidate_retrieval_outcome_never_writes_to_traits(store):
     async with store.db.execute("SELECT COUNT(*) FROM traits") as cur:
         count = (await cur.fetchone())[0]
     assert count == 0
+
+
+# ── promote_traits (CP-F) ────────────────────────────────────────────────────
+
+def test_promote_traits_returns_empty_list_without_a_db():
+    memory = _RecordingMemory()
+    core = CognitiveCore(memory=memory)
+
+    result = asyncio.run(core.promote_traits())
+
+    assert result == []
+
+
+async def test_promote_traits_is_a_noop_below_the_surface_threshold(store):
+    core = CognitiveCore(memory=store)
+    for _ in range(4):
+        await core.consolidate_retrieval_outcome(had_context=True)
+
+    promotions = await core.promote_traits()
+
+    assert promotions == []
+    async with store.db.execute("SELECT COUNT(*) FROM traits") as cur:
+        assert (await cur.fetchone())[0] == 0
+
+
+async def test_promote_traits_promotes_once_evidence_crosses_surface(store):
+    """5 identical closed-vocabulary retrieval outcomes strengthen one
+    candidate to evidence_count=5 (TRAIT_THRESHOLDS['surface']); the next
+    promote_traits() call must cross it into `traits`."""
+    core = CognitiveCore(memory=store)
+    for _ in range(5):
+        await core.consolidate_retrieval_outcome(had_context=True)
+
+    promotions = await core.promote_traits()
+
+    assert promotions == [{
+        "trait_name": "retrieval finds relevant context",
+        "evidence_count": 5,
+        "threshold": 5,
+        "stability": "surface",
+    }]
+    async with store.db.execute(
+        "SELECT name, stability, evidence_count FROM traits"
+    ) as cur:
+        rows = await cur.fetchall()
+    assert rows == [("retrieval finds relevant context", "surface", 5)]
+
+
+async def test_promote_traits_returns_empty_on_the_second_call_for_the_same_trait(store):
+    """A candidate that already promoted stays a no-op promotion (event
+    becomes confidence_change/tier_change, never a second "promoted") until
+    it crosses the NEXT threshold — see identity_engine.py's `_upsert_trait`.
+    """
+    core = CognitiveCore(memory=store)
+    for _ in range(5):
+        await core.consolidate_retrieval_outcome(had_context=True)
+    first = await core.promote_traits()
+    assert len(first) == 1
+
+    await core.consolidate_retrieval_outcome(had_context=True)  # evidence_count=6, still surface
+    second = await core.promote_traits()
+
+    assert second == []
+
+
+async def test_promote_traits_writes_a_trait_history_row(store):
+    core = CognitiveCore(memory=store)
+    for _ in range(5):
+        await core.consolidate_retrieval_outcome(had_context=True)
+
+    await core.promote_traits()
+
+    async with store.db.execute(
+        "SELECT trait_label, event, evidence_count FROM trait_history"
+    ) as cur:
+        rows = await cur.fetchall()
+    assert rows == [("retrieval finds relevant context", "promoted", 5)]

@@ -389,3 +389,55 @@ async def test_collect_measurements_candidates_created_window_from_db(store, tmp
     )
     assert m["candidates_created_window"] == 1
     assert m["candidates_total"] == 1
+
+
+# ── candidate evidence-vs-threshold gap (CP-F change 7) ────────────────────────
+
+async def test_collect_measurements_candidate_gap_before_any_promotion(store, tmp_path):
+    from lyra_core.interface import CognitiveCore
+
+    core = CognitiveCore(memory=store)
+    for _ in range(3):
+        await core.consolidate_retrieval_outcome(had_context=True)  # evidence_count=3
+
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["_candidate_gaps"] == [("retrieval finds relevant context", 3, 2)]
+
+
+async def test_collect_measurements_candidate_gap_reflects_next_untouched_threshold(store, tmp_path):
+    """Once evidence_count crosses TRAIT_THRESHOLDS['surface'] (5), the gap
+    reported is to 'character' (15), not to 'surface' again."""
+    from lyra_core.interface import CognitiveCore
+
+    core = CognitiveCore(memory=store)
+    for _ in range(6):
+        await core.consolidate_retrieval_outcome(had_context=True)  # evidence_count=6
+
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["_candidate_gaps"] == [("retrieval finds relevant context", 6, 9)]
+
+
+async def test_collect_measurements_candidate_gap_zero_at_or_above_core(store, tmp_path):
+    from lyra_core.interface import CognitiveCore
+
+    core = CognitiveCore(memory=store)
+    for _ in range(50):
+        await core.consolidate_retrieval_outcome(had_context=True)
+
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["_candidate_gaps"] == [("retrieval finds relevant context", 50, 0)]
+
+
+def test_render_includes_candidate_gap_line():
+    m = {"_candidate_gaps": [("retrieval finds relevant context", 3, 2)]}
+    text = render(m, window_days=7)
+    assert "retrieval finds relevant context: evidence=3  gap=2" in text

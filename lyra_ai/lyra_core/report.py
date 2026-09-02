@@ -56,7 +56,7 @@ from pathlib import Path
 import aiosqlite
 
 from lyra_core.config import LOG_PATH
-from lyra_memory.config import FORGET_THRESHOLD
+from lyra_memory.config import FORGET_THRESHOLD, TRAIT_THRESHOLDS
 from lyra_memory.store import load_vec_extension
 from lyra_memory.store.context import build_context
 
@@ -339,6 +339,24 @@ async def _candidates_traits_section(db: aiosqlite.Connection, window_start: flo
         rows = await cur.fetchall()
     confidences = [r[2] for r in rows if r[2] is not None]
     mean_conf = sum(confidences) / len(confidences) if confidences else 0.0
+
+    # CP-F change 7: "make an impending promotion visible before it
+    # happens" — for every candidate, how far its evidence_count sits from
+    # the next threshold it has not yet crossed (TRAIT_THRESHOLDS is
+    # surface/character/core, ascending). 0 means already at or above the
+    # highest tier (core) — nothing left to cross.
+    _sorted_thresholds = sorted(TRAIT_THRESHOLDS.values())
+
+    def _gap(evidence_count: int) -> int:
+        remaining = [t - evidence_count for t in _sorted_thresholds if t > evidence_count]
+        return remaining[0] if remaining else 0
+
+    async with db.execute(
+        "SELECT trait_name, evidence_count FROM candidates ORDER BY evidence_count DESC"
+    ) as cur:
+        cand_rows = await cur.fetchall()
+    candidate_gaps = [(name, ec, _gap(ec)) for name, ec in cand_rows]
+
     return {
         "candidates_total": candidates_total,
         "candidates_total_evidence": total_evidence,
@@ -349,6 +367,7 @@ async def _candidates_traits_section(db: aiosqlite.Connection, window_start: flo
         "trait_count": len(rows),
         "trait_confidence_mean": mean_conf,
         "_traits": [(r[0], r[1], r[2]) for r in rows],
+        "_candidate_gaps": candidate_gaps,
     }
 
 
@@ -703,6 +722,12 @@ def render(measurements: dict, window_days: int) -> str:
     for name, value, conf in measurements.get("_traits", []):
         lines.append(f"    {name}: {value} (confidence={conf:.2f})" if conf is not None
                       else f"    {name}: {value} (confidence=?)")
+    lines.append("  candidates — evidence vs. next threshold not yet crossed (CP-F):")
+    for name, evidence_count, gap in measurements.get("_candidate_gaps", []):
+        if gap == 0:
+            lines.append(f"    {name}: evidence={evidence_count} (at or above the highest tier)")
+        else:
+            lines.append(f"    {name}: evidence={evidence_count}  gap={gap}")
 
     lines.append("\n2e. outcomes")
     lines.append(f"  outcomes total      {measurements.get('outcomes_total', UNAVAILABLE)}")

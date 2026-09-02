@@ -263,6 +263,8 @@ class _FakeCore:
         self.exchanges: list[tuple[str, str, object, object]] = []
         self.retrieval_outcomes: list[tuple] = []
         self.consolidations: list[tuple] = []
+        self.promote_traits_calls: int = 0
+        self._promotions: list[dict] = []
         self._affect = affect or AffectState()
         self._context = context if context is not None else _context_result("")
         self._retrieve_context_error = retrieve_context_error
@@ -296,6 +298,10 @@ class _FakeCore:
     async def consolidate_retrieval_outcome(self, had_context, outcome_id=None):
         self.consolidations.append((had_context, outcome_id))
         return ("retrieval finds relevant context", "...") if had_context else ("retrieval finds nothing", "...")
+
+    async def promote_traits(self):
+        self.promote_traits_calls += 1
+        return self._promotions
 
 
 def _handler(backend, core=None, vision=None, history=None, now=None):
@@ -430,6 +436,41 @@ def test_handle_logs_candidate_created_when_consolidator_returns_one(caplog):
         asyncio.run(handler.handle("hello", "s1"))
 
     assert any(CANDIDATE_CREATED in l for l in caplog.text.splitlines())
+
+
+def test_handle_calls_promote_traits_every_retrieval_turn():
+    backend = _FakeBackend(["hi there"])
+    handler, core, _ = _handler(backend)
+    asyncio.run(handler.handle("hello", "s1"))
+
+    assert core.promote_traits_calls == 1
+
+
+def test_handle_logs_trait_promoted_when_promote_traits_returns_one(caplog):
+    from lyra_core.runtime import TRAIT_PROMOTED
+
+    backend = _FakeBackend(["hi there"])
+    handler, core, _ = _handler(backend)
+    core._promotions = [{"trait_name": "curiosity", "evidence_count": 5, "threshold": 5}]
+    with caplog.at_level(logging.INFO, logger="lyra_core.runtime"):
+        asyncio.run(handler.handle("hello", "s1"))
+
+    lines = [l for l in caplog.text.splitlines() if TRAIT_PROMOTED in l]
+    assert len(lines) == 1
+    assert "trait_name='curiosity'" in lines[0]
+    assert "evidence_count=5" in lines[0]
+    assert "threshold=5" in lines[0]
+
+
+def test_handle_logs_no_trait_promoted_when_promote_traits_returns_none(caplog):
+    from lyra_core.runtime import TRAIT_PROMOTED
+
+    backend = _FakeBackend(["hi there"])
+    handler, core, _ = _handler(backend)
+    with caplog.at_level(logging.INFO, logger="lyra_core.runtime"):
+        asyncio.run(handler.handle("hello", "s1"))
+
+    assert not any(TRAIT_PROMOTED in l for l in caplog.text.splitlines())
 
 
 def test_two_turns_get_two_different_turn_ids(caplog):

@@ -2141,3 +2141,422 @@ socket client reaches — this checkpoint's scope is `CandidatePool`/
   skipped (unchanged count — `candidate_pool.py`'s existing evidence-text
   tests did not assert on the text this checkpoint changed the handling of,
   so all pass unmodified against the new append behavior).
+
+# CP-F — promotion is wired
+
+Register corrections carried in verbatim by CP-F: the "~70 historical
+candidates" figure is struck (unverified — CP-E measured 0 in the actual
+archive file in this container); dedup for closed vocabularies uses exact
+label match, not description embedding (CP-E, measured L2 0.524 vs
+threshold 0.860); `evidence_text` accumulates instead of discarding after
+the first merge (CP-E fix, third silent-discard path found); the live
+store's 20-turn run produced 2 candidates, max evidence_count 19, fully
+traceable; promotion was an unwired mechanism, not an unreached threshold —
+trait count has always been 0.
+
+## Change 1 — the promotion path, read end to end, before touching anything
+
+**`IdentityEngine`** (`lyra-memory/lyra_memory/identity_engine.py`) is the
+only code in this repository that ever writes to `traits` or
+`trait_history`. `consolidate(dream_id=None)`:
+
+1. Reads every row from `candidates` with `evidence_count >= 1`
+   (`CandidatePool.get_candidates`).
+2. For each, `_stability_for(evidence_count)` maps it against
+   `TRAIT_THRESHOLDS = {"surface": 5, "character": 15, "core": 50}`
+   (`lyra_memory/config.py`) — `None` (skip) below 5, else the highest tier
+   crossed.
+3. `confidence = min(evidence_count / TRAIT_THRESHOLDS["core"], 1.0)` —
+   i.e. evidence measured as a fraction of the CORE threshold specifically,
+   not the tier just reached. A brand-new surface trait (evidence_count=5)
+   therefore starts at confidence 0.10, not some tier-relative 1.0.
+4. `_upsert_trait` writes or updates the `traits` row and, in the same
+   aiosqlite transaction (asserted by `assert_trait_history_integrity`),
+   an accompanying `trait_history` row — INSERT+INSERT on first sight of a
+   name (`event="promoted"`), UPDATE+INSERT on a later call whose
+   evidence_count/confidence/stability changed (`event="confidence_change"`
+   or `"tier_change"`), or nothing at all when the trait is core-tier and
+   `confidence >= CORE_CONFIDENCE_LOCK` (0.8, write-protected) or the
+   computed state is identical to what is already stored (a true no-op).
+
+This is fully correct and was already covered by
+`lyra-memory/tests/test_trait_history.py` before this checkpoint touched
+anything — the promotion arithmetic was never the problem.
+
+**What caller was supposed to invoke it, and why it doesn't, for the live
+daemon:** `IdentityEngine.consolidate()` has exactly two production
+callers in the tree, and neither one is reachable from the process that
+actually runs `python -m lyra_core`:
+
+- `store/passes/dream.py`'s `DreamPass.consolidate()` — itself only called
+  from `DreamPass.execute()`, a `ColdPass`. `grep -rn "DreamPass(" --
+  include="*.py"` across the whole repository finds exactly two
+  constructors: `DreamPass`'s own module and
+  `lyra-memory/tests/test_dream.py`. There is no scheduler, cron, or
+  daemon-side call that ever constructs a `DreamPass` (or any `ColdPass`
+  subclass) against a live store — cold passes in this build are library
+  code, exercised only by their own tests. (`review_facts.py` runs
+  `FactPass`, a different cold pass, as a manual review tool — not evidence
+  of a general scheduler; there is no analogous tool for `DreamPass`.)
+- `lyra_memory/__init__.py`'s legacy `MemorySystem.start()` constructs a
+  real `IdentityEngine` and a `DreamingLoop` that DOES poll itself on a
+  timer — but `MemorySystem` opens `DB_PATH` (`~/.lyra/memory.db`), and the
+  live daemon's `CognitiveCore` is always constructed with a
+  `lyra_memory.store.Store` opened against `STORE_PATH`
+  (`~/.lyra/store.db`) instead (CP-B). `CognitiveCore._get_promoted_traits`
+  already does `getattr(self._memory, "identity_engine", None)` — `Store`
+  has no such attribute, so this has always returned `None` and therefore
+  `[]` for the live daemon, exactly as `getattr(self._memory,
+  "candidate_pool", None)` did before CP-E fixed the analogous gap for
+  candidates.
+
+So "unwired" means precisely this: the live daemon's Store connection and
+`IdentityEngine` had never been introduced to each other by any code path,
+in either direction. Not a threshold question, not a bug in the promotion
+arithmetic — a missing wire, exactly as the register states.
+
+**A second, blocking finding, only surfaced by actually wiring it (not
+visible from reading the code alone):** `CandidatePool.get_candidates()`
+validates every `candidates` row into a `lyra_memory.models.Candidate`
+pydantic model, whose `category` field was `Literal["behavioral",
+"emotional", "relational", "cognitive"]`. CP-D/CP-E's
+`consolidate_retrieval_outcome()` (`interface.py`) has written
+`category="retrieval"` into `candidates` since CP-D. Nothing had ever
+called `get_candidates()` against a store containing a `category=
+"retrieval"` row before this checkpoint's live verification, so the
+mismatch was invisible — the first attempt raised
+`pydantic_core.ValidationError` inside `IdentityEngine.consolidate()`,
+which would have made ALL candidates unreadable (dream-derived ones
+included, not just retrieval's), not merely the retrieval branch. Fixed in
+`lyra_memory/models.py` by adding `"retrieval"` to the `Literal` — one
+value, no new abstraction. `models.py` is not literally named in CP-F's
+FILES, but the `Candidate.category` vocabulary is the candidate pool
+module's own data contract, and promotion cannot be wired at all without
+this fix (every `IdentityEngine.consolidate()` call against a store
+containing a retrieval candidate would raise) — a structurally-unavoidable
+companion touch under the same standard CP-E used for `runtime.py`.
+
+## Change 2 — wiring, and why exposure doesn't go through a new introspect() method
+
+`CognitiveCore.promote_traits()` (`interface.py`) is the new method:
+constructs `CandidatePool(db)` / `IdentityEngine(db, pool)` fresh against
+`self._memory.db` — the same Store connection `consolidate_retrieval_
+outcome()` already uses, not `self._memory.identity_engine` (which stays
+`None` for a Store, per Change 1) — and returns `IdentityEngine.
+consolidate()`'s own result: a list of dicts, one per candidate that
+crossed into `traits` for the first time this call.
+
+Called from `runtime.py`'s `_finish_exchange`, once per turn, right after
+`consolidate_retrieval_outcome` — "after consolidation" per CHANGES item 2
+— and only on turns where a retrieval intent actually executed (the same
+guard `consolidate_retrieval_outcome` is already behind; a declined turn
+produces no new evidence, so there is nothing new to promote, though
+`promote_traits` would also be a no less correct no-op if called there —
+not changed, to keep this turn identical in shape to CP-D/E's).
+
+**Read-only exposure to Lyra deliberately does NOT touch `introspect()` or
+add a new method for it.** OUT OF SCOPE forbids "changing retrieval," and
+`lyra_memory/store/context.py` already has a `traits` context block
+(`_traits_block`, budget `CONTEXT_BUDGETS["traits"] = 100`) that SELECTs
+`traits WHERE confidence >= TRAIT_CONFIDENCE_FLOOR ORDER BY confidence
+DESC` and folds the result into `context.text` under a `## Traits` heading
+— alongside facts/commitments/recall, in the same pinned block order the
+module's own docstring has documented since before this checkpoint. This
+is already wired into the live daemon path, unmodified, via
+`CognitiveCore.retrieve_context()` -> `TurnHandler._compose_system_prompt`
+(`context.text` is appended to the system prompt whenever retrieval
+executed). A promoted trait therefore becomes visible to her on the next
+turn that retrieves — through the mechanism this codebase already built
+for exactly this purpose — without CP-F touching retrieval at all. This
+was verified live, not assumed (see DONE-WHEN evidence below): after 20
+turns, `CognitiveCore.retrieve_context()` returned a `context.text`
+containing:
+```
+## Traits
+- retrieval finds relevant context: an assembled context contained at least one atom above the retrievability floor
+```
+`introspect()` itself is untouched — still `AffectState` only, still sync,
+still non-mutating. Overloading its signature to also return traits would
+mean either bolting non-affect data onto the Phase-0-frozen `AffectState`
+dataclass (interface.py's own docstring warns this "requires touching
+every peripheral") or making `introspect()` async (a second real signature
+change, disruptive to `_compose_system_prompt`/`_emit_self_report`,
+neither of which needed touching for this checkpoint). Both are larger,
+riskier changes than CP-F's SCOPE calls for, and neither is necessary: the
+`_traits_block` path already satisfies "her access stays read-only" (it is
+a `SELECT`, reachable only from her own context assembly, and writes
+nothing) and already satisfies "expose any promoted trait" (verified
+above) without them.
+
+**A measured consequence of the confidence formula, worth recording
+because it changes what "wired" means in practice:** `confidence =
+evidence_count / 50` (Change 1, point 3) means a surface-tier trait
+(evidence_count 5-14) has confidence 0.10-0.28 — always below
+`TRAIT_CONFIDENCE_FLOOR` (0.3) — so it exists in `traits` (a real
+promotion, `trait_history` says so) without yet being visible to her via
+`_traits_block`. Visibility starts at evidence_count=15 (character tier,
+confidence exactly 0.30). Live-verified: the run below promoted at
+evidence_count=5 (turn 6) but the trait did not appear in `context.text`
+until evidence_count reached 15-19 (character tier, confidence 0.30-0.38)
+by turn 20. This is not a bug CP-F introduces or a threshold CP-F is
+tuning (OUT OF SCOPE forbids that either way) — it is an existing
+interaction between two independently-designed, pre-existing constants
+(`TRAIT_THRESHOLDS["core"]` in the confidence denominator, and
+`TRAIT_CONFIDENCE_FLOOR` in the visibility gate) that nothing had ever
+observed together before, because nothing had ever promoted a trait
+against the live Store before this checkpoint.
+
+## Change 3 — trait_history explicability, without a schema change
+
+`lyra_memory/store/schema.py` states its own constraint plainly: **"There
+is no migration path and there will not be one: the version below is
+asserted at boot... a mismatch crashes on start."** `SCHEMA_VERSION` is
+compared exactly (`store/integrity.py`'s `assert_schema`, structural diff
+included) against every store this code opens — a live column addition
+would crash every existing `store.db` in the field on next boot, with no
+repair path by design. `schema.py` is also not in CP-F's FILES. Both
+things point the same way: do not touch it unless truly unavoidable, and
+it is not.
+
+`trait_history`'s existing columns already carry what change 3 asks for,
+read together with `candidates`:
+
+- **"the candidate"**: `trait_history.trait_label` is the trait's `name` —
+  the same string as the promoted candidate's `candidates.trait_name`.
+  `candidates.trait_name` has no UNIQUE constraint in the schema (unlike
+  `traits.name`, which does), so this join is not schema-enforced — but
+  `IdentityEngine._upsert_trait` itself already treats `traits.name` as
+  the sole identity key for a trait (`SELECT ... WHERE name = ?`), and for
+  the closed vocabularies actually promoted so far (frustration's four
+  names, retrieval's two), `_add_exact` keeps to exactly one row per exact
+  name by construction. An open-vocabulary (dream-generated) name is
+  free text and could in principle collide with another open-vocabulary
+  candidate's name without colliding semantically — a preexisting
+  ambiguity in this schema's design (the same one CP-E's `dedup_probe.py`
+  measured for description-vs-label grouping), not one CP-F introduces or
+  can resolve within a no-migration constraint.
+- **"its evidence count at promotion"**: `trait_history.evidence_count`,
+  already written on every mutation including the promoting one.
+- **"the threshold in force"**: not a stored column, but reconstructible
+  from `trait_history.tier_after` (already written) plus
+  `TRAIT_THRESHOLDS[tier_after]` — the fixed dict CP-F's own change 5
+  forbids tuning this checkpoint, and confirmed unchanged below. A future
+  checkpoint that DOES tune `TRAIT_THRESHOLDS` would make this
+  reconstruction wrong for historical rows promoted under the old values —
+  a real, known limitation, explicitly punted by DEFERRED ("Promotion
+  threshold tuning") and OUT OF SCOPE ("do not tune them... this
+  checkpoint") to whichever future checkpoint actually changes the
+  constant, not solved here.
+- **"the outcome rows that constituted the evidence"**: `trait_label` ->
+  `candidates.trait_name` -> `candidates.evidence_text` (CP-E's
+  newline-joined `outcome_id=N` list, already built for exactly this) ->
+  `outcomes` rows by id. No new column — this reuses CP-E's provenance
+  mechanism as-is; CP-F does not modify `candidate_pool.py`'s evidence
+  handling at all.
+
+No schema change was made anywhere in this checkpoint's diff (verified:
+`git diff` over `lyra-memory/lyra_memory/store/schema.py` for this
+checkpoint is empty).
+
+## Change 4 — TRAIT_PROMOTED, never silent
+
+Two log lines, one per layer, both live-verified below:
+
+- `identity_engine.py`'s `_upsert_trait`, on the INSERT (first-crossing)
+  branch only — NOT on `confidence_change`/`tier_change` for an
+  already-promoted trait, which is a real mutation but not "a candidate...
+  becomes a trait" (SCOPE's own wording): `print(f"...[IdentityEngine]
+  TRAIT_PROMOTED name={name!r} evidence_count={evidence_count}
+  threshold={threshold} stability={stability!r}")`, where `threshold =
+  TRAIT_THRESHOLDS[stability]`. This fires regardless of caller (DreamPass,
+  a test, or the live daemon), matching lyra_memory's existing print-based
+  convention (`CandidatePool`, `DreamPass`, `DreamingLoop` all log this
+  way, not via `logging`).
+- `runtime.py`, matching its own established convention (`CORE_CONSTRUCTED`
+  ... `CANDIDATE_CREATED`, a module-level tag + `log.info("%s ...", TAG,
+  ...)`): a new `TRAIT_PROMOTED = "TRAIT_PROMOTED"` constant, logged once
+  per promotion dict `promote_traits()` returns, in `_finish_exchange`,
+  with `turn=`, `trait_name=`, `evidence_count=`, `threshold=`.
+
+`_upsert_trait`'s return value changed from `None` to `bool` (True only on
+the first-crossing branch) and `IdentityEngine.consolidate()`'s from `None`
+to `list[dict]` (one entry per candidate that crossed) so `promote_traits`
+— and therefore `runtime.py` — can know what happened without re-querying
+`traits` before and after. No existing caller (`DreamPass.consolidate`,
+every `test_trait_history.py`/`test_memory.py` call site) inspects the
+return value, so this is additive, not breaking; confirmed by both test
+suites passing unmodified at those call sites.
+
+## Change 5 — the threshold constant
+
+`TRAIT_THRESHOLDS: dict[str, int] = {"surface": 5, "character": 15,
+"core": 50}` and `CORE_CONFIDENCE_LOCK = 0.8` (`lyra_memory/config.py`)
+were already named constants before this checkpoint — nothing inlined
+needed naming. Recorded here, unchanged: `git diff` over `config.py` for
+this checkpoint is empty. Every threshold and confidence value referenced
+anywhere in this section (5 / 15 / 50 / 0.8 / 0.3-for-`TRAIT_CONFIDENCE_
+FLOOR`) is the value already in the tree before CP-F, read, not edited.
+
+## Change 6 — reversible by hand
+
+Two variants, both executed against a scratch copy of the live
+verification store (`cpf_verify/store.db`, never the original) via a plain
+`sqlite3` connection — SQLite's per-connection default is
+`PRAGMA foreign_keys=OFF` (confirmed: `PRAGMA foreign_keys` on a bare
+`sqlite3.connect()` reports `0`), unlike `Store.open()`, which explicitly
+turns it `ON` for its own aiosqlite connection. `trait_history.trait_id
+REFERENCES traits(id)` with no `ON DELETE` clause would raise under FK
+enforcement; run by hand via plain `sqlite3` (as change 6 specifies — "by
+hand", not through `Store`), it does not.
+
+**Minimal — removes the trait, trait_history stays exactly as it was:**
+```sql
+DELETE FROM traits WHERE name = 'retrieval finds relevant context';
+```
+Executed and verified: `traits` went from 1 row to 0; `trait_history`'s 15
+rows were byte-for-byte unchanged (same count, same `trait_id=1` on every
+row, now orphaned rather than deleted) — the trajectory the schema.py
+comment calls "the primary artifact" survives exactly as it was, including
+the record of the promotion that is being undone.
+
+**Caveat, found by testing rather than assumed: this alone does not
+stick.** The candidate's `evidence_count` is untouched by the DELETE, so
+the very next `IdentityEngine.consolidate()` call (which runs every turn
+via `promote_traits()`) re-promotes it immediately — verified: calling
+`engine.consolidate()` against the rolled-back scratch copy re-inserted
+the trait at `evidence_count=19, stability='character'` (its current,
+unrolled-back evidence), logging a second `TRAIT_PROMOTED` line. A
+first-promotion rollback that must survive the next turn needs a second
+statement:
+```sql
+DELETE FROM traits WHERE name = 'retrieval finds relevant context';
+UPDATE candidates SET evidence_count = 4
+  WHERE trait_name = 'retrieval finds relevant context';  -- below TRAIT_THRESHOLDS['surface']
+```
+Executed and verified on a second scratch copy: `traits` stayed empty
+across a subsequent `consolidate()` call (`promotions == []`),
+`trait_history`'s 15 rows again untouched. This second statement is
+presented as the operator's explicit choice, not a system feature — DEFERRED
+excludes "demotion, decay of traits, or trait revision" as a built-in
+mechanism; lowering a candidate's evidence_count by hand, once, to make a
+by-hand rollback durable, is a human undoing their own action via raw SQL,
+not a new automated demotion path, and nothing in this checkpoint's code
+performs it.
+
+## Change 7 — report.py: gap to the next threshold, per candidate
+
+Added to `_candidates_traits_section` (no new flat `FIELDS` entry — a list,
+like the existing `_traits`/`_atoms_by_day`, not a scalar): for every
+`candidates` row, `_gap(evidence_count)` returns the distance to the
+smallest `TRAIT_THRESHOLDS` value still above it, or `0` once
+evidence_count is at or above the highest tier (core, 50) — nothing left
+to cross. `render()` prints one line per candidate under the existing "2d.
+candidates / traits" section: `"{name}: evidence={n}  gap={g}"`, or "(at or
+above the highest tier)" at gap 0. The other two things change 7 asks for
+— "traits promoted in the window" and "current trait count with names and
+confidences" — were already present from CP-E's own report.py work
+(`candidates_promoted_window`, `trait_count` + the `_traits` render loop)
+and needed no change.
+
+## Files touched outside the FILES set
+
+- **`lyra_ai/lyra_core/runtime.py`** — `TRAIT_PROMOTED` constant + the
+  `promote_traits()` call site in `_finish_exchange`. Structurally
+  unavoidable: CHANGES item 2 asks for promotion to run "on the daemon
+  path", and `runtime.py` is the only file that drives a real turn — the
+  same standard CP-E applied to this same file for the same reason.
+- **`lyra_ai/tests/test_runtime.py`** — `_FakeCore.promote_traits` (a
+  bare method the fake needed once `_finish_exchange` started calling it
+  unconditionally on every retrieval-executed turn) plus three new tests
+  for the call and its logging. Without this addition every existing test
+  that drives `handler.handle()` against a `_FakeCore` would raise
+  `AttributeError`.
+- **`lyra-memory/lyra_memory/models.py`** — `Candidate.category`'s
+  `Literal` gained `"retrieval"` (Change 1's second finding). Not
+  structurally optional the way the two touches above are stylistic
+  consistency — without it, `IdentityEngine.consolidate()` raises on any
+  store containing a retrieval candidate, i.e. promotion cannot run at all
+  against this checkpoint's own live store.
+- **`lyra_ai/tests/test_core.py`, `lyra_ai/tests/test_report.py`,
+  `lyra-memory/tests/test_trait_history.py`** — new tests for
+  `promote_traits()`, the report.py gap section, and `consolidate()`'s new
+  return value, respectively. No existing test in any of the three files
+  was changed in a way that altered its assertions (test_trait_history.py's
+  two edits only add a new assertion on the now-meaningful return value
+  alongside the pre-existing ones).
+
+## DONE-WHEN — evidence
+
+Twenty turns through a real `Runtime` (tmp-path store,
+`LYRA_EMBED_BACKEND=hashed`, the same fake backend/message set as CP-E's
+verification, driven via `rt._handler.handle()`), then inspected directly
+and via `collect_from_path()`:
+
+- **Trait count before/after:** 0 -> 1.
+- **A trait promoted.** Candidate: `"retrieval finds relevant context"`.
+  Evidence count at promotion: 5. Threshold crossed: `TRAIT_THRESHOLDS
+  ["surface"] = 5`. Turn 6 of 20 (the fifth turn whose retrieval intent
+  executed and found context — turns interleave "context found"/"nothing
+  found" replies).
+  ```
+  2026-09-02T23:47:02.435172 [IdentityEngine] TRAIT_PROMOTED name='retrieval finds relevant context' evidence_count=5 threshold=5 stability='surface'
+  2026-09-02 23:47:02,435 INFO lyra_core.runtime: TRAIT_PROMOTED turn=6 trait_name='retrieval finds relevant context' evidence_count=5 threshold=5
+  ```
+  By turn 20: `evidence_count=19`, `stability='character'`,
+  `confidence=0.38`. `trait_history` has 15 rows for this one trait: 1
+  `promoted`, 9 `confidence_change`, 1 `tier_change` (surface->character at
+  evidence_count=15), 4 more `confidence_change`.
+- **sqlite shows the trait row, its trait_history row(s), and the outcome
+  rows named as its evidence:**
+  ```
+  traits:   (1, 'retrieval finds relevant context', '...at least one atom...', 0.38, 'character', 19)
+  trait_history: 15 rows, trait_id=1 throughout, event history exactly as above
+  candidates: (2, 'retrieval finds relevant context', 19)  -- evidence_text: 19 lines of outcome_id=N (CP-E's mechanism, unmodified)
+  ```
+- **The trait's name and description, verbatim** (the first emergent
+  trait — nobody authored this string, it was assembled by `_retrieval_
+  trait_from_outcome` in CP-D and never written to `traits` until this
+  checkpoint):
+  - name: `retrieval finds relevant context`
+  - description: `an assembled context contained at least one atom above the retrievability floor`
+- **`python -m lyra_core --report`-equivalent output** (via
+  `collect_from_path`/`render` against the verification store):
+  ```
+  2d. candidates / traits (grouped — a row is a distinct, post-dedup candidate)
+    distinct candidates 2
+    total evidence      20
+    largest evidence    19
+    singletons          1
+    created/strengthened (window)  2
+    promoted (window)   1
+    trait count         1
+      retrieval finds relevant context: an assembled context contained at least one atom above the retrievability floor (confidence=0.38)
+    candidates — evidence vs. next threshold not yet crossed (CP-F):
+      retrieval finds relevant context: evidence=19  gap=31
+      retrieval finds nothing: evidence=1  gap=4
+  ```
+- **The rollback statements executed against a scratch copy**, both
+  variants, evidence above under Change 6.
+- **Traits visible to Lyra, read-only, verified by calling
+  `retrieve_context()` after the 20th turn:**
+  ```
+  context.text contains '## Traits': True
+  ## Traits
+  - retrieval finds relevant context: an assembled context contained at least one atom above the retrievability floor
+  ```
+  **No write path reachable from her side** — `grep -rn "INSERT INTO
+  traits\|UPDATE traits\|INSERT INTO trait_history" --include="*.py" .`
+  (excluding `venv`/`__pycache__`) finds writers only in
+  `identity_engine.py` (production) and test fixtures that seed state
+  directly (`test_context.py`, `test_inspect_state.py`,
+  `test_trait_history.py`); `promote_traits()`'s only production caller is
+  `runtime.py`'s `_finish_exchange`, itself never conditioned on anything
+  in her response — the only inspection of her output anywhere in
+  `runtime.py` is `_TOOL_TOKENS`, a fixed two-entry dict
+  (`[TOOL:see:screen]`, `[TOOL:see:webcam]`) with no trait-shaped or
+  candidate-shaped entry.
+- **Both test suites green:** `lyra_ai` 351 passed (339 + 12 new: 3 in
+  `test_runtime.py`, 5 in `test_core.py`, 4 in `test_report.py`);
+  `lyra-memory` 283 passed, 4 skipped (unchanged count — `test_trait_
+  history.py`'s two edits added assertions to existing tests rather than
+  new tests).
