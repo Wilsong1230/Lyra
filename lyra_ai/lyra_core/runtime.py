@@ -5,12 +5,20 @@ one memory store and the one history store, and answers turns that arrive
 over lyra_core.transport. The `lyra` CLI is a client of this process and
 constructs no cognition of its own.
 
+CP-B: the one memory store is lyra_memory.store.Store (store.db + runs.db),
+not the older lyra_memory.MemorySystem (memory.db). MemorySystem,
+lyra_memory.retrieval, and lyra_memory.db keep working and keep their tests —
+they are simply never imported on this path again. See DECISIONS.md.
+
 Lifecycle:
-  start : prepare the store (present? right schema? archive-and-recreate if
-          not) -> construct the core (CORE_CONSTRUCTED) -> start it (memory,
-          dreaming loop, affect restore) -> open history -> listen
-  stop  : stop listening (no new turns) -> stop the core (affect persisted,
-          store closed)
+  start : archive any leftover pre-CP-B memory.db (one-time courtesy) ->
+          prepare the store (present? right schema? archive-and-recreate if
+          not) -> open it (Store.open) -> warm the embedder (fatal if the
+          model is missing and no offline opt-in is set) -> construct the
+          core (CORE_CONSTRUCTED) -> start it (affect restore) -> open
+          history -> listen
+  stop  : stop listening (no new turns) -> stop the core (affect persisted)
+          -> close the store
 
 Ticks happen when a turn arrives, not on a timer. dt is wall-clock seconds
 since the previous tick, clamped to config.MAX_TICK_DT_SECONDS — see the
@@ -51,9 +59,10 @@ from lyra_core.config import DAEMON_HOST, DAEMON_PORT, MAX_TICK_DT_SECONDS
 from lyra_core.expression import prose_hint
 from lyra_core.interface import AffectVector, CognitiveCore, Observation, ObservationKind
 from lyra_core.transport import TurnRejected, TurnServer
-from lyra_memory import MemorySystem, retrieval
-from lyra_memory.config import DB_PATH
-from lyra_memory.db import init_db
+from lyra_memory.config import DB_PATH, EMBED_MODEL, STORE_PATH
+from lyra_memory.embeddings import embed
+from lyra_memory.store import Store
+from lyra_memory.store.context import build_context
 
 log = logging.getLogger("lyra_core.runtime")
 
@@ -61,13 +70,26 @@ log = logging.getLogger("lyra_core.runtime")
 CORE_CONSTRUCTED = "CORE_CONSTRUCTED"
 DT_CLAMP_ENGAGED = "DT_CLAMP_ENGAGED"
 
-# Tables the hot path and the current retrieval queries reference:
-#   facts     — affect_state restore/persist (CognitiveCore.start/stop)
-#   atoms     — every turn is written here (MemorySystem.add_turn)
-#   vec_atoms — its embedding, and retrieval.search_episodes' KNN
-#   traits    — retrieval.build_context via IdentityEngine.get_top_traits
-# A store missing any of these is on a schema this code does not write to.
-REQUIRED_TABLES: frozenset[str] = frozenset({"atoms", "vec_atoms", "facts", "traits"})
+# Tables the hot path and the current retrieval queries reference (CP-B —
+# Store's schema, lyra_memory/store/schema.py, not the older db.py):
+#   atoms       — every turn is written here (CognitiveCore._ingest_sensory)
+#   atoms_fts   — its lexical index, store.context._lexical_hits
+#   vec_atoms   — its embedding, store.context._semantic_hits
+#   facts       — affect_state restore/persist AND store.context._facts_block
+#   commitments — store.context._commitments_block
+#   outcomes    — CognitiveCore._ingest_outcome's eventual home (unwritten
+#                 this checkpoint; required so a mismatch is caught early)
+#   traits      — store.context._traits_block
+#   candidates  — where trait promotion would write (inert without an
+#                 identity_engine against Store — OUT OF SCOPE; see
+#                 DECISIONS.md)
+# Named, not the old memory.db's table names verbatim, so a pre-CP-B
+# memory.db (which lacks atoms_fts, commitments, and outcomes) can never
+# satisfy this check by accident — see DECISIONS.md (CP-B, change 3).
+REQUIRED_TABLES: frozenset[str] = frozenset({
+    "atoms", "atoms_fts", "vec_atoms", "facts", "commitments", "outcomes",
+    "traits", "candidates",
+})
 
 VISION_URL = os.getenv("VISION_URL", "http://localhost:8003")
 
@@ -150,17 +172,42 @@ def archive_store(path: Path) -> Path:
 
 
 async def _create_empty_store(path: Path) -> None:
-    conn = await init_db(path)
-    await conn.close()
+    store = await Store.open(path)
+    await store.close()
 
 
-async def prepare_store(path: Path, init_if_missing: bool = False) -> None:
+def archive_legacy_memory_db(legacy_path: Path = DB_PATH) -> Path | None:
+    """One-time courtesy (CP-B): a leftover pre-CP-B memory.db is archived by
+    rename so it cannot be mistaken for the live store. Never opened again.
+
+    Idempotent: after the first call renames it away, legacy_path.is_file()
+    is False and every later call is a no-op. Independent of the store path
+    itself — DB_PATH and STORE_PATH are always different files.
+
+    `legacy_path` defaults to the real DB_PATH but is a parameter, not a
+    hardcoded read of Path.home(), specifically so a test using a tmp_path
+    store can point this at a tmp_path memory.db instead — a hardcoded
+    Path.home() here would let any test that exercises prepare_store rename
+    a real user's actual ~/.lyra/memory.db out from under them.
+    """
+    if not legacy_path.is_file():
+        return None
+    archived = archive_store(legacy_path)
+    log.warning("archived legacy memory.db (pre-CP-B, no longer opened) to %s", archived)
+    return archived
+
+
+async def prepare_store(
+    path: Path, init_if_missing: bool = False, legacy_path: Path = DB_PATH
+) -> None:
     """Make `path` a store the core can own, or raise StartupError saying why not.
 
     Missing store: fatal, unless `init_if_missing` (the --init-store flag),
     which is the one deliberate way to bring a store into existence.
     Wrong schema: archive by rename, create a fresh empty store, re-check.
     """
+    archive_legacy_memory_db(legacy_path)
+
     if not path.is_file() and init_if_missing:
         path.parent.mkdir(parents=True, exist_ok=True)
         await _create_empty_store(path)
@@ -183,7 +230,7 @@ async def prepare_store(path: Path, init_if_missing: bool = False) -> None:
 _core_constructions = 0
 
 
-def construct_core(memory: MemorySystem) -> CognitiveCore:
+def construct_core(memory: Store) -> CognitiveCore:
     """Construct THE CognitiveCore. A second call in the same process is a bug."""
     global _core_constructions
     if _core_constructions >= 1:
@@ -192,7 +239,7 @@ def construct_core(memory: MemorySystem) -> CognitiveCore:
         )
     core = CognitiveCore(memory=memory)
     _core_constructions += 1
-    log.info("%s pid=%d store=%s", CORE_CONSTRUCTED, os.getpid(), memory._db_path)
+    log.info("%s pid=%d store=%s", CORE_CONSTRUCTED, os.getpid(), memory.path)
     return core
 
 
@@ -309,9 +356,9 @@ class TurnHandler:
         # Unguarded on purpose. A broken store and an empty store must not
         # produce the same prompt; the failure surfaces as a fatal turn.
         parts = [self._system]
-        context = await retrieval.build_context(self._core.memory, query=query)
-        if context:
-            parts.append(context)
+        context = await build_context(self._core.memory, query=query)
+        if context.text:
+            parts.append(context.text)
         hint = prose_hint(self._core.introspect())
         if hint:
             parts.append(hint)
@@ -386,6 +433,7 @@ class Runtime:
         backend: Backend,
         *,
         db_path: Path | None = None,
+        legacy_db_path: Path = DB_PATH,
         history_path: Path | None = None,
         host: str = DAEMON_HOST,
         port: int = DAEMON_PORT,
@@ -394,7 +442,8 @@ class Runtime:
         now: Callable[[], float] = time.time,
     ) -> None:
         self._backend = backend
-        self._db_path = db_path or DB_PATH
+        self._db_path = db_path or STORE_PATH
+        self._legacy_db_path = legacy_db_path
         self._history_path = history_path
         self._host = host
         self._port = port
@@ -418,10 +467,27 @@ class Runtime:
         return self._server
 
     async def start(self) -> None:
-        await prepare_store(self._db_path, init_if_missing=self._init_store)
+        await prepare_store(
+            self._db_path, init_if_missing=self._init_store, legacy_path=self._legacy_db_path
+        )
 
-        self._core = construct_core(MemorySystem(db_path=self._db_path))
-        await self._core.start()  # init_db, dreaming loop, embed warm-up, affect restore; raises on any failure
+        store = await Store.open(self._db_path)
+        try:
+            await embed("warmup")
+        except Exception as exc:
+            # Fatal, not a fallback (CP-B change 8): a daemon that silently
+            # switched embedders would write vectors no later query can find,
+            # with no symptom until retrieval quietly returns nothing.
+            await store.close()
+            raise StartupError(
+                f"embedding model unavailable ({EMBED_MODEL}): {exc}. Cache the "
+                "real model before starting the daemon, or set "
+                "LYRA_EMBED_BACKEND=hashed to run offline deliberately."
+            ) from exc
+        log.info("runs store open at %s", store.runs_path)
+
+        self._core = construct_core(store)
+        await self._core.start()  # affect restore; raises on any failure
         log.info("core started; store open at %s", self._db_path)
 
         history = ConversationMemory(self._history_path)
@@ -445,7 +511,8 @@ class Runtime:
         if self._server is not None:
             await self._server.stop()
         if self._core is not None:
-            await self._core.stop()
+            await self._core.stop()  # persists affect
+            await self._core.memory.close()
             log.info("store closed cleanly: %s", self._db_path)
 
     async def run_forever(self, stop: asyncio.Event | None = None) -> int:

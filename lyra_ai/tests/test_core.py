@@ -228,53 +228,62 @@ def test_tick_observations_without_signal_match_empty_tick():
 # ── Ingest routing: source threading ──────────────────────────────────────────
 
 class _RecordingMemory:
-    """Fake memory whose add_turn/add_observation record calls (no errors)."""
+    """Fake memory whose append_atom records calls (no errors).
+
+    CP-B: the daemon writes one Store atom per turn instead of calling
+    add_turn/add_observation on a MemorySystem — see interface.py's
+    _ingest_sensory and DECISIONS.md.
+    """
 
     def __init__(self) -> None:
-        self.turns: list[tuple[str, str]] = []
-        self.observations: list[tuple[str, str | None]] = []
+        self.atoms: list[tuple[str, str, str]] = []  # (speaker, source, text)
         self.candidate_pool = None
         self.identity_engine = None
         self.structured_state = None
 
-    async def add_turn(self, role: str, content: str) -> None:
-        self.turns.append((role, content))
-
-    async def add_observation(self, content: str, source: str | None = None) -> None:
-        self.observations.append((content, source))
+    async def append_atom(self, speaker: str, source: str, text: str, **_: object) -> int:
+        self.atoms.append((speaker, source, text))
+        return len(self.atoms)
 
 
-def test_ingest_routes_conversation_source_to_add_turn_user():
+def test_ingest_routes_conversation_source_to_wilson_speaker():
     memory = _RecordingMemory()
     core = CognitiveCore(memory=memory)
     obs = Observation(kind=ObservationKind.sensory, source="conversation", content="hello")
 
     asyncio.run(core.tick([obs]))
 
-    assert memory.turns == [("user", "hello")]
-    assert memory.observations == []
+    assert memory.atoms == [("wilson", "cli", "hello")]
 
 
-def test_ingest_routes_lyra_source_to_add_turn_lyra():
+def test_ingest_routes_lyra_source_to_lyra_speaker():
     memory = _RecordingMemory()
     core = CognitiveCore(memory=memory)
     obs = Observation(kind=ObservationKind.sensory, source="lyra", content="hi there")
 
     asyncio.run(core.tick([obs]))
 
-    assert memory.turns == [("lyra", "hi there")]
-    assert memory.observations == []
+    assert memory.atoms == [("lyra", "cli", "hi there")]
 
 
-def test_ingest_routes_other_sources_to_add_observation_with_source():
+def test_ingest_routes_vision_source_to_vision_channel():
+    memory = _RecordingMemory()
+    core = CognitiveCore(memory=memory)
+    obs = Observation(kind=ObservationKind.sensory, source="vision", content="a terminal window")
+
+    asyncio.run(core.tick([obs]))
+
+    assert memory.atoms == [("system", "vision", "a terminal window")]
+
+
+def test_ingest_routes_other_sources_to_system_speaker_over_cli():
     memory = _RecordingMemory()
     core = CognitiveCore(memory=memory)
     obs = Observation(kind=ObservationKind.sensory, source="ears", content="ambient sound: rain")
 
     asyncio.run(core.tick([obs]))
 
-    assert memory.observations == [("ambient sound: rain", "ears")]
-    assert memory.turns == []
+    assert memory.atoms == [("system", "cli", "ambient sound: rain")]
 
 
 # ── CognitiveCore.introspect() ────────────────────────────────────────────────
@@ -397,8 +406,9 @@ def test_run_empty_script_returns_empty_trace():
 def test_harness_constructs_own_core_when_none_given():
     """Harness() with no argument must build its own CognitiveCore and run.
 
-    An empty tick: the self-constructed core owns an unstarted MemorySystem,
-    and since CP-A a sensory observation into one is an error, not a no-op."""
+    An empty tick only: since CP-B the self-constructed core has no memory
+    injected at all (Store can't be default-constructed — opening one is
+    async), and a sensory observation into one is an error, not a no-op."""
     async def _run():
         h = Harness()
         return await h.run([[]])

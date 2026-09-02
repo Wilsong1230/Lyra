@@ -536,3 +536,352 @@ misdescribes the code it just measured.
   qualitative properties (monotonic increase, bounded comparisons) that the
   bounded exponential-approach still satisfies; none hard-coded a specific
   pressure value that the ceiling would change.
+
+---
+
+# CP-B — the memory swap
+
+Register: `lyra_memory.store.Store` (`store.db` + `runs.db`, hybrid FTS5 +
+vector retrieval, retrievability-based forgetting) was already built and
+already tested against itself (`store/evaluate.py`, `lyra-memory/tests/`),
+but nothing in the daemon process ever constructed one. The daemon ran on
+`lyra_memory.MemorySystem` (`memory.db`, vector-only retrieval, no
+forgetting) the whole time. This checkpoint's only job is the wiring: make
+`Store` the daemon's one memory, leave `MemorySystem` alone in the tree.
+
+## 1. Removing `interface.py`'s `MemorySystem` default
+
+**Ambiguous:** `CognitiveCore.__init__`'s `memory=None` fallback constructed
+`MemorySystem()` — cheap and synchronous. `Store.open()` is async and does
+real I/O (schema assertion, WAL pragmas, `runs.db`), so it cannot replace
+that fallback in kind: `CognitiveCore.__init__` is a plain `__init__`, not a
+coroutine.
+
+**Options:** (a) make `memory` a required constructor argument; (b) default
+to `None` and make every place that touches `self._memory` tolerate it being
+absent; (c) keep a *different* free default (e.g. a tiny in-process stub
+built just for this).
+
+**Chosen:** (b). `_ingest_sensory`, `_ingest_outcome` (via the consolidator's
+existing `getattr(self._memory, "candidate_pool", None)` guard), and
+`_get_promoted_traits` (`getattr(..., "identity_engine", None)`) were
+already either the only places that touch memory or already duck-typed
+against its absence. Checked every current bare `CognitiveCore()` /
+`Harness()` call site in `tests/test_core.py` before making this change:
+every one of them either never ticks, or only ticks empty observation
+lists — none exercises `_ingest_sensory` on the no-memory default. So (b)
+costs nothing on the existing suite and is honest about what changed: a
+core built with nothing injected has no memory, full stop, rather than
+silently reaching for a store the daemon process never opens. (a) would
+have broken `Harness()`'s and several tests' no-arg construction for no
+functional gain (they never rely on there being a *working* memory, only
+on there being *something* that doesn't crash on `introspect()`/empty
+`tick()`); (c) invents a class this checkpoint doesn't need.
+
+`tests/test_core.py`'s `_RecordingMemory`/`_FakeMemory` and the
+`test_harness_constructs_own_core_when_none_given` docstring were updated to
+match (see "Files touched outside the FILES set" below) — not in the closed
+FILES set, but the fakes exist to speak whatever protocol `interface.py`
+actually calls, and the docstring said something no longer true.
+
+## 2. `obs.source` → Store's `speaker`/`source` (change 2)
+
+**Ambiguous:** the checkpoint says "one atom per turn," which the existing
+tick structure already delivers (`TurnHandler.tick` calls `core.tick()` once
+per user turn, once per Lyra turn, once per vision result — one
+`Observation` per call, so one atom per call maps directly onto
+`Store.append_atom`). What it doesn't say is how `obs.source` (`"conversation"`
+| `"lyra"` | `"vision"`, a "who produced this" label local to `lyra_core`)
+maps onto Store's two *separate* enforced vocabularies: `speaker` (`wilson`
+| `lyra` | `system`) and `source` (`cli` | `wakeword` | `ambient` | `vision`
+| `sandbox_read`, a channel).
+
+**Chosen:**
+| obs.source      | speaker  | source |
+|-----------------|----------|--------|
+| `"conversation"`| `wilson` | `cli`  |
+| `"lyra"`        | `lyra`   | `cli`  |
+| `"vision"`      | `system` | `vision` |
+| anything else   | `system` | `cli`  |
+
+`"cli"` because the daemon's one transport today is the `lyra` CLI talking
+over `lyra_core.transport` — there is no other channel to name. A vision
+result is attributed to `system`, not `wilson`: it's Lyra's own tool call
+seeing the world, not something Wilson said, and it wasn't `wilson` in the
+old `MemorySystem` path either (`add_observation`, not `add_turn`, kept it
+out of the user/lyra turn pair). The catch-all row exists because
+`validate_atom` raises loudly on an out-of-vocabulary `source`
+(`SOURCES`), not because any current caller sends anything else — `TurnHandler`
+only ever emits `"conversation"`, `"lyra"`, `"vision"`.
+
+## 3. `affect_state` has no table of its own
+
+**Not named by the checkpoint text, but forced by "no calls into `structured_state`."**
+The old `CognitiveCore.start()`/`stop()` persisted `affect_state` through
+`MemorySystem.structured_state` (`StructuredState.get_fact`/`set_fact`,
+backed by `db.py`'s `facts(key, value, updated_at)` — a genuine key-value
+table). `Store` has no `structured_state` and no key-value table:
+`store/schema.py`'s `facts` table is `subject + free text`, a table of
+semantic facts about the world, and `schema_meta` is explicitly the store's
+own bookkeeping (schema version, embedder id) — OUT OF SCOPE forbids adding
+a table, and repurposing `schema_meta` for application state would be
+misusing a table documented as "what the schema looks like," not "what she
+last felt."
+
+**Chosen:** persist `affect_state` as a row in Store's own `facts` table,
+under `subject = "_lyra_internal_affect_state"` — a subject no real query
+will ever type (`_facts_block`'s subject match requires the literal token
+in the user's message), `source_kind = "inferred"` (the closest fit among
+the four allowed values: it's Lyra's own internal state, not something
+anyone told her), and the same "supersede by `valid_until`, current row has
+`valid_until IS NULL`" pattern the `facts` table already uses for everything
+else. `CognitiveCore.start()`/`stop()` reach this via
+`getattr(self._memory, "db", None)` — the same duck-typing style already
+used for `structured_state` — so a `structured_state`-bearing fake still
+takes that path unchanged, and only a `Store` (or anything exposing `.db`
+with the same schema) takes the new one. Verified live: three chat turns,
+`stop()`, restart against the same `store.db`, affect matched to float
+precision (`test_affect_persists_across_daemon_restarts`, unmodified from
+before this checkpoint).
+
+## 4. Trait promotion and outcome consolidation go inert under Store (not a regression to fix here)
+
+`_get_promoted_traits` reads `identity_engine`; the consolidator's
+`record_outcome` reads `candidate_pool`. Both are `getattr(..., None)`
+already — `Store` has neither attribute, so both silently stop doing
+anything the moment `MemorySystem` stops being the daemon's memory. This is
+exactly what OUT OF SCOPE means by "trait dedup, salience scoring,
+consolidator behavior" and "intent execution" being out of scope: nothing
+in `Store`'s own tree (`store/`) builds an equivalent of `IdentityEngine` or
+`CandidatePool` against it, so there is nothing this checkpoint could wire
+even if it wanted to. `Store`'s schema still has `traits` and `candidates`
+tables (REQUIRED_TABLES enforces their presence) — they just stay empty
+until a later checkpoint gives something a reason to write to them.
+
+## 5. REQUIRED_TABLES: distinguishing names, not exhaustive validation (change 3)
+
+**Chosen:** `{atoms, atoms_fts, vec_atoms, facts, commitments, outcomes,
+traits, candidates}` — Store's tables the daemon's own code paths touch,
+named specifically so a store shaped like the *old* `memory.db` schema can
+never satisfy the check by accident: the old schema has no `atoms_fts`,
+`commitments`, or `outcomes` table at all, so any of the three alone is
+enough to catch it. This is a coarse, name-only gate (matching CP-A's
+existing `store_tables()`/`sqlite_master` mechanism) — the *real*,
+structural validation is `Store.open()`'s own `assert_schema()`
+(`store/integrity.py`), which diffs columns, triggers, indexes, schema
+version, and embedder id, and which this checkpoint does not touch (OUT OF
+SCOPE: "Store is the spec; wire it as built"). `prepare_store()`'s job is
+only to decide *whether to archive-and-recreate* before that stricter check
+ever runs — it does not need to duplicate it.
+
+## 6. Archiving a leftover `memory.db` on cold start (change 4)
+
+**A real hazard caught before it shipped:** the daemon's *checked* path is
+now `STORE_PATH` (`store.db`), a different file from the legacy `DB_PATH`
+(`memory.db`) entirely — `prepare_store()` never looks at `memory.db` as
+part of validating the store it's about to open. But the done-when is
+explicit that a machine with *only* `memory.db` present must have it
+archived on cold start, specifically so it can't be mistaken for the live
+store by a human poking around `~/.lyra/`. That needs its own step,
+`archive_legacy_memory_db()`, called at the top of `prepare_store()`,
+independent of and before the `STORE_PATH` check.
+
+**A second hazard, caught in review before running any test:** a first
+draft read the legacy path from the module-level `DB_PATH` constant
+directly (`Path.home() / ".lyra" / "memory.db"`) with no way to override it.
+Every test that exercises `prepare_store()` or constructs a `Runtime` would
+then have reached into the *real* `~/.lyra/memory.db` on whatever machine
+runs the suite — on a real dev machine or this container alike, silently
+renaming actual daemon data as a side effect of running `pytest`. Fixed by
+making the legacy path a parameter (`prepare_store(..., legacy_path=DB_PATH)`,
+`Runtime(..., legacy_db_path=DB_PATH)`) that defaults to the real constant
+for production use but that every test points at a `tmp_path` file instead.
+Confirmed live in this container: an actual `/root/.lyra/memory.db` left
+over from an earlier bootstrap/test run *did* exist, and running
+`python -m lyra_core` for real (no test, no override) archived it correctly
+to `/root/.lyra/memory.db.2026-09-02.archive` — nothing lost, nothing
+deleted, exactly the intended behavior when it's really the production path
+being exercised.
+
+## 7. `runs.db` (change 5)
+
+No code needed: `Store.open()` already opens/creates `runs.db` alongside
+`store.db` as part of its own `_connect()`. Nothing here writes to it (no
+telemetry added, per OUT OF SCOPE) — its existence is a side effect of
+opening the store, not a step this checkpoint performs. `Runtime.start()`
+logs its path explicitly (`"runs store open at %s"`) so the done-when's
+"all three paths appear in the log" has something to point at beyond
+`Store.open()`'s own silence.
+
+## 8. `trait_history`: the checkpoint's premise was wrong (change 6)
+
+**Finding:** `db.py` has `trait_history`; so does `store/schema.py`'s
+`COLD_SQL` (same intent — ts, trait_id, trait_label, event,
+conf_before/after, tier_before/after, evidence_count, dream_id — referencing
+`traits(id)` and `dreams(id)` instead of a bare integer). Nothing is
+missing. The register's "db.py has the table, Store does not" is incorrect
+as written; corrected here per the checkpoint's own instruction to record
+the finding either way. The table sits empty under `Store` for the same
+reason `traits`/`candidates` do (see item 4 above): nothing writes to it
+without an `IdentityEngine` wired against `Store`, which is out of scope.
+
+## 9. `DB_PATH` stays (change 9)
+
+**Checked, not assumed:** grepped every importer of
+`lyra_memory.config.DB_PATH` before deciding. It is not "`memory_bridge.py`
+is the only remaining importer" — `MemorySystem` (`lyra_memory/__init__.py`),
+`retrieval.py` (both `search_episodes`'s default path and `get_fact`), and
+`inspect_state.py` all import it directly, on top of `memory_bridge.py` and
+`lyra-memory`'s own test suite. All of those are explicitly staying in the
+tree unchanged (OUT OF SCOPE: "Deleting MemorySystem, retrieval.py, or
+db.py from lyra_memory... they stay in the tree"), so change 9's stated
+condition for deletion never holds. Left `DB_PATH` in place with a comment
+explaining why (`lyra-memory/lyra_memory/config.py`); no code deleted.
+
+## 10. `evaluate.py`'s live-store mode (change 7)
+
+Added `--store PATH` to the CLI (`store/evaluate.py`'s `main()`), which
+skips seeding a throwaway corpus and scores `labeled["turns"]` against
+whatever the given `store.db` already has — exactly what `evaluate()`
+already did whenever it was called with a `store=` argument (`owned =
+store is None` gates the seeding step; that branch was already there,
+unused by the CLI). No change to `TurnResult`, `Report`, or any scoring
+logic — "harness wiring only," per the FILES annotation.
+
+**Baseline recorded, evidence not aspiration:** ran it for real against a
+`Store` populated by ten real chat turns through a live `Runtime` (the same
+one exercised for the done-when's atom-count and forgetting checks — see
+below), with a five-query labeled set covering four real topics from those
+turns plus one deliberately unanswerable query (`expect_miss: true`):
+
+```
+coverage                 1.00
+leak rate                0.00
+spurious miss rate       0.00
+spurious injection rate  0.00
+5 turns
+```
+
+This is a wiring proof, not a tuned baseline: five hand-written queries
+against a ten-turn corpus, under the hashed offline embedder (this
+container has no path to huggingface.co — see item 11). The number to
+compare future retrieval changes against should be re-measured against a
+larger, real-conversation corpus with the real MiniLM embedder before it's
+trusted as a regression gate; what's proven here is that `--store` reaches
+the daemon's actual schema and actual accumulated turns end to end, per
+change 7's ask.
+
+## 11. `conftest.py` opt-in only, and the daemon's own fatal warmup (change 8)
+
+**Chosen:** `tests/conftest.py`'s cache-miss probe (`_real_model_is_cached()`,
+auto-setting `LYRA_EMBED_BACKEND=hashed` whenever MiniLM wasn't cached) is
+removed outright rather than replaced with a different auto-detection —
+`lyra_memory.embeddings._backend()` already reads `LYRA_EMBED_BACKEND` from
+the environment at call time with no help from `conftest.py`, so "opt-in by
+explicit env var" needs nothing beyond *not auto-setting it*. The file is
+now doc-comment only. Every test invocation in this checkpoint (and every
+one going forward, in this container) sets `LYRA_EMBED_BACKEND=hashed`
+explicitly on the command line, which is the opt-in the checkpoint asks for.
+
+The daemon side needed an actual code change, not just a deletion:
+`MemorySystem.start()` used to call `embed("warmup")` itself, which is how
+a missing/uncached MiniLM used to become a startup failure. `Store.open()`
+has no equivalent warmup — embedding only happens lazily, on the first real
+`append_atom`. Added an explicit `await embed("warmup")` to
+`Runtime.start()` right after `Store.open()` succeeds and before
+`construct_core()`, wrapped to close the just-opened store and re-raise a
+`StartupError` naming `EMBED_MODEL` explicitly (rather than trusting
+whatever exception text `sentence_transformers`/`huggingface_hub` happens to
+raise to "name the cause") — `__main__.py`'s existing `except Exception as
+exc: log.critical("FATAL: %s", exc)` then makes that the final log line, as
+the done-when requires.
+
+**Verified live, in this container** (no test mock — a real attempted
+network call, actually blocked by the proxy): `Runtime.start()` with
+`LYRA_EMBED_BACKEND` unset and a fresh store raised
+`StartupError: embedding model unavailable (all-MiniLM-L6-v2): ...`
+before `construct_core()` ever ran (`CORE_CONSTRUCTED` does not appear in
+the log for that run) — exits nonzero, names the model, no fallback.
+
+## What CP-B did not touch
+
+`Store`'s own files (`store/schema.py`, `store/context.py`,
+`store/__init__.py`, `store/passes/*`, `store/integrity.py`) — zero edits,
+per OUT OF SCOPE. `MemorySystem`, `lyra_memory/retrieval.py`, `lyra_memory/db.py`,
+`lyra_memory/atoms.py` — zero edits; still imported by
+`lyra_ai/lyra/memory_bridge.py` (CLI-only path, untouched) and by
+`lyra-memory`'s own test suite, both of which pass unmodified (283 passed,
+4 skipped — pre-existing skips, unrelated to this checkpoint). Intent
+execution, the perception loop, `OutcomeConsolidator` behavior, trait dedup,
+salience scoring — all still exactly as inert/unwired as they were before
+(see item 4).
+
+## DONE-WHEN — evidence
+
+All of the following were run live against real `Store`/`Runtime` instances
+(a fake LLM backend; everything else — sqlite, sqlite-vec, aiosqlite, the
+hashed embedder, the real async event loop — real), not asserted from
+reading the code:
+
+- **Cold start, only `memory.db` present:** a pre-atoms-era `memory.db` was
+  placed at a fresh `Runtime`'s `legacy_db_path`, nothing at its `db_path`.
+  `Runtime.start()` archived the legacy file to
+  `memory.db.<date>.archive`, created `store.db` and `runs.db`, and
+  started; all three paths appeared in the log
+  (`test_runtime_cold_start_archives_legacy_memory_db_and_logs_all_three_paths`,
+  plus the same sequence run standalone outside pytest).
+- **Ten turns through the CLI:** a real `LyraClient` sent ten `chat()` calls
+  through a real `Runtime` over a real loopback socket. Live count:
+  `atoms=20 atoms_fts=20 vec_atoms=20` (ten user + ten Lyra atoms; every
+  count matches, as the done-when requires).
+- **Lexical hit, vector miss:** an atom burying the token `atoms_fts` in
+  otherwise-unrelated text, queried with a differently-worded question
+  sharing only that token. Live: `_lexical_hits` found it (BM25 match on
+  the exact token); `_semantic_hits` did not (cosine similarity fell under
+  `SEMANTIC_SIMILARITY_FLOOR = 0.35` — the hashed embedder still rewards
+  exact token overlap enough that a short, mostly-shared query finds it
+  either way; this pair needed enough unrelated filler on both sides to
+  dilute that overlap below the floor).
+- **Forgetting pass, retrievability strictly decreases:** `ForgettingPass`
+  run twice against the same live store, 60 days apart (`now` advanced, no
+  re-access in between). Live: `retrievability` on the same atom went
+  `1.000000 -> 0.680712`.
+- **`evaluate.py` against the live store reports coverage:** see item 10
+  above — `coverage 1.00` against the ten-turn store, recorded as the
+  starting baseline.
+- **Grep clean:** `grep` for actual `import` statements (not comments —
+  several docstrings *mention* `MemorySystem` by name, which is not the
+  same thing) matching `MemorySystem` or `lyra_memory.retrieval` under
+  `lyra_ai/`, excluding `tests/` and `memory_bridge.py`: zero results.
+- **MiniLM uncached, offline var unset:** see item 11 above — exits
+  nonzero, final log line names `all-MiniLM-L6-v2`, no fallback.
+
+## Files touched outside the FILES set
+
+- `lyra_ai/tests/test_core.py` — `_RecordingMemory`'s `add_turn`/
+  `add_observation` replaced with `append_atom` (recording
+  `(speaker, source, text)`), matching `interface.py`'s new call; the three
+  ingest-routing tests updated to assert the new speaker/source mapping
+  (item 2 above), plus a fourth added for the `"vision"` case that didn't
+  have its own test before. `test_harness_constructs_own_core_when_none_given`'s
+  docstring corrected — it described a "self-constructed core owns an
+  unstarted MemorySystem" that no longer exists (item 1 above); the test's
+  behavior (one empty tick, no memory touched) is unchanged.
+- `lyra_ai/tests/test_runtime.py` — extensive rewrite: every atom/fact
+  assertion now reads Store's schema (`atoms.speaker`/`.text`, not
+  `.role`/`.content`; `facts.subject`/`.text`/`valid_until`, not
+  `.key`/`.value`) instead of the old `memory.db` shape;
+  `_no_context()`/`build_context` patches retarget
+  `lyra_core.runtime.build_context` (now `store.context.build_context`,
+  returning a `ContextResult` with `.text`, not a bare string) instead of
+  `lyra_core.runtime.retrieval.build_context`; `construct_core`'s log test
+  reads `memory.path` (Store's attribute) instead of `memory._db_path`
+  (MemorySystem's); every `prepare_store()`/`Runtime(...)` call site passes
+  a `tmp_path`-scoped `legacy_path`/`legacy_db_path` (item 6 above — this
+  is not cosmetic, it is what stops the suite from touching a real
+  `~/.lyra/memory.db`). Six new tests added for legacy-archiving behavior
+  that didn't exist before this checkpoint
+  (`archive_legacy_memory_db` directly, `prepare_store`'s integration of
+  it, and the full cold-start-through-`Runtime` path). Every other test's
+  *assertions* are unchanged from before CP-B — only the schema they read
+  against moved.

@@ -2,8 +2,15 @@
 clock, the daemon-side turn handler, and the Runtime lifecycle over a real
 loopback socket.
 
-No LLM: the backend is a fake. No model download: conftest selects the
-offline embedder when MiniLM is not cached. Stores are per-test tmp files.
+CP-B: the store is lyra_memory.store.Store (store.db + runs.db), not the
+older lyra_memory.MemorySystem (memory.db) — atoms carry speaker/text, not
+role/content; facts carry subject/text, not key/value. See DECISIONS.md.
+
+No LLM: the backend is a fake. No model download: LYRA_EMBED_BACKEND=hashed
+must be set explicitly to run offline (conftest.py no longer auto-detects a
+MiniLM cache miss — CP-B change 8). Stores are per-test tmp files, and
+`legacy_path`/`legacy_db_path` are always pointed at a tmp_path file too —
+never the real DB_PATH — so a test run never touches a real ~/.lyra/memory.db.
 """
 from __future__ import annotations
 
@@ -31,6 +38,7 @@ from lyra_core.runtime import (
     StoreSchemaMismatch,
     TickClock,
     TurnHandler,
+    archive_legacy_memory_db,
     archive_store,
     check_store_schema,
     construct_core,
@@ -38,6 +46,9 @@ from lyra_core.runtime import (
     store_tables,
 )
 from lyra_core.transport import TurnRejected
+from lyra_memory.store.context import ContextResult
+
+_AFFECT_SUBJECT = "_lyra_internal_affect_state"
 
 
 @pytest.fixture(autouse=True)
@@ -65,7 +76,9 @@ class _FakeBackend:
 
 
 def _pre_atoms_store(path: Path, mtime: datetime) -> None:
-    """A store on the schema memory.db was on before atoms existed."""
+    """A store on the schema memory.db was on before atoms existed — and
+    still, under CP-B, missing everything Store's schema requires (atoms_fts,
+    vec_atoms, commitments, outcomes, candidates included)."""
     conn = sqlite3.connect(path)
     conn.executescript("""
         CREATE TABLE facts (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at REAL NOT NULL);
@@ -85,30 +98,31 @@ def _pre_atoms_store(path: Path, mtime: datetime) -> None:
 # ── store preparation ────────────────────────────────────────────────────────
 
 def test_missing_store_is_fatal_and_names_the_path(tmp_path):
-    missing = tmp_path / "memory.db"
+    missing = tmp_path / "store.db"
     with pytest.raises(StoreMissing, match=str(missing)):
-        asyncio.run(prepare_store(missing))
+        asyncio.run(prepare_store(missing, legacy_path=tmp_path / "legacy_memory.db"))
     assert not missing.exists(), "the daemon must not create a store on its own"
 
 
 def test_init_store_creates_an_empty_store_with_the_required_tables(tmp_path):
-    path = tmp_path / "memory.db"
-    asyncio.run(prepare_store(path, init_if_missing=True))
+    path = tmp_path / "store.db"
+    asyncio.run(prepare_store(
+        path, init_if_missing=True, legacy_path=tmp_path / "legacy_memory.db"))
     assert REQUIRED_TABLES <= store_tables(path)
     with sqlite3.connect(path) as conn:
         assert conn.execute("SELECT COUNT(*) FROM atoms").fetchone()[0] == 0
 
 
 def test_pre_atoms_store_is_archived_by_mtime_date_and_replaced(tmp_path, caplog):
-    path = tmp_path / "memory.db"
+    path = tmp_path / "store.db"
     _pre_atoms_store(path, datetime(2026, 6, 10, 14, 30))
     with pytest.raises(StoreSchemaMismatch, match="atoms"):
         check_store_schema(path)
 
     with caplog.at_level(logging.INFO, logger="lyra_core.runtime"):
-        asyncio.run(prepare_store(path))
+        asyncio.run(prepare_store(path, legacy_path=tmp_path / "legacy_memory.db"))
 
-    archive = tmp_path / "memory.db.2026-06-10.archive"
+    archive = tmp_path / "store.db.2026-06-10.archive"
     assert archive.is_file(), "archived by rename, named for the store's own mtime"
     with sqlite3.connect(archive) as conn:
         assert conn.execute("SELECT content FROM episodes").fetchone() == ("an old essay",)
@@ -116,11 +130,17 @@ def test_pre_atoms_store_is_archived_by_mtime_date_and_replaced(tmp_path, caplog
     with sqlite3.connect(path) as conn:
         assert conn.execute("SELECT COUNT(*) FROM atoms").fetchone()[0] == 0
     assert str(archive) in caplog.text
-    assert len(list(tmp_path.iterdir())) == 2, "nothing deleted, nothing extra"
+    # store.db + its archive + store.db-derived runs.db (Store.open creates
+    # runs.db alongside it, and WAL mode leaves -wal/-shm sidecars) — nothing
+    # deleted, nothing unaccounted for.
+    expected = {"store.db", "store.db.2026-06-10.archive", "runs.db"}
+    actual = {p.name for p in tmp_path.iterdir()}
+    assert expected <= actual
+    assert actual - expected <= {"store.db-wal", "store.db-shm", "runs.db-wal", "runs.db-shm"}
 
 
 def test_archive_never_clobbers_an_existing_archive(tmp_path):
-    path = tmp_path / "memory.db"
+    path = tmp_path / "store.db"
     when = datetime(2026, 6, 10, 9, 5, 7)
     _pre_atoms_store(path, when)
     first = archive_store(path)
@@ -128,25 +148,63 @@ def test_archive_never_clobbers_an_existing_archive(tmp_path):
     second = archive_store(path)
     assert first != second
     assert first.is_file() and second.is_file()
-    assert second.name == "memory.db.2026-06-10-090507.archive"
+    assert second.name == "store.db.2026-06-10-090507.archive"
 
 
 def test_archive_carries_wal_sidecars_along(tmp_path):
-    path = tmp_path / "memory.db"
+    path = tmp_path / "store.db"
     _pre_atoms_store(path, datetime(2026, 6, 10))
-    (tmp_path / "memory.db-wal").write_bytes(b"wal")
-    (tmp_path / "memory.db-shm").write_bytes(b"shm")
+    (tmp_path / "store.db-wal").write_bytes(b"wal")
+    (tmp_path / "store.db-shm").write_bytes(b"shm")
     archive = archive_store(path)
     assert (tmp_path / (archive.name + "-wal")).read_bytes() == b"wal"
     assert (tmp_path / (archive.name + "-shm")).read_bytes() == b"shm"
-    assert not (tmp_path / "memory.db-wal").exists()
+    assert not (tmp_path / "store.db-wal").exists()
+
+
+# ── legacy memory.db archiving (CP-B change 4) ─────────────────────────────────
+
+def test_archive_legacy_memory_db_renames_a_leftover_pre_cp_b_store(tmp_path, caplog):
+    legacy = tmp_path / "memory.db"
+    _pre_atoms_store(legacy, datetime(2026, 6, 10, 8, 0))
+    with caplog.at_level(logging.WARNING, logger="lyra_core.runtime"):
+        archived = archive_legacy_memory_db(legacy)
+    assert archived == tmp_path / "memory.db.2026-06-10.archive"
+    assert archived.is_file()
+    assert not legacy.exists()
+    assert str(archived) in caplog.text
+
+
+def test_archive_legacy_memory_db_is_a_noop_when_nothing_is_there(tmp_path):
+    assert archive_legacy_memory_db(tmp_path / "memory.db") is None
+
+
+def test_archive_legacy_memory_db_is_idempotent(tmp_path):
+    legacy = tmp_path / "memory.db"
+    _pre_atoms_store(legacy, datetime(2026, 6, 10))
+    first = archive_legacy_memory_db(legacy)
+    assert first is not None
+    assert archive_legacy_memory_db(legacy) is None, "nothing left to archive a second time"
+
+
+def test_prepare_store_archives_the_legacy_db_on_cold_start(tmp_path, caplog):
+    legacy = tmp_path / "memory.db"
+    _pre_atoms_store(legacy, datetime(2026, 6, 10, 8, 0))
+    store_path = tmp_path / "store.db"
+    with caplog.at_level(logging.INFO, logger="lyra_core.runtime"):
+        asyncio.run(prepare_store(store_path, init_if_missing=True, legacy_path=legacy))
+    archive = tmp_path / "memory.db.2026-06-10.archive"
+    assert archive.is_file()
+    assert not legacy.exists()
+    assert REQUIRED_TABLES <= store_tables(store_path)
+    assert str(archive) in caplog.text
 
 
 # ── the one core ─────────────────────────────────────────────────────────────
 
 def test_construct_core_logs_the_marker_once_and_refuses_a_second(caplog):
     memory = MagicMock()
-    memory._db_path = Path("/nowhere/memory.db")
+    memory.path = Path("/nowhere/store.db")
     with caplog.at_level(logging.INFO, logger="lyra_core.runtime"):
         core = construct_core(memory)
     assert isinstance(core, CognitiveCore)
@@ -200,8 +258,14 @@ def _handler(backend, core=None, vision=None, history=None, now=None):
     return TurnHandler(core, backend, history, clock, vision_fn=vision or MagicMock()), core, history
 
 
+def _context_result(text: str) -> ContextResult:
+    return ContextResult(
+        text=text, blocks={}, atom_ids=[], fact_ids=[], dream_ids=[], budget_used=0, misses=[])
+
+
 def _no_context():
-    return patch("lyra_core.runtime.retrieval.build_context", new=AsyncMock(return_value=""))
+    return patch(
+        "lyra_core.runtime.build_context", new=AsyncMock(return_value=_context_result("")))
 
 
 def test_handle_writes_history_and_ticks_user_then_lyra():
@@ -278,7 +342,7 @@ def test_context_failure_propagates_instead_of_degrading_to_layer1():
     """The old _get_system swallowed build_context errors and quietly served
     Layer 1 alone. Now the failure is the turn's failure."""
     handler, _, _ = _handler(_FakeBackend(["never"]))
-    with patch("lyra_core.runtime.retrieval.build_context", new=AsyncMock(side_effect=RuntimeError("store gone"))):
+    with patch("lyra_core.runtime.build_context", new=AsyncMock(side_effect=RuntimeError("store gone"))):
         with pytest.raises(RuntimeError, match="store gone"):
             asyncio.run(handler.handle("hello", "s1"))
 
@@ -289,7 +353,10 @@ def test_system_prompt_is_layer1_plus_context_plus_hint():
         "emotion_v": -0.6, "emotion_a": 0.6, "mood_v": 0.0, "mood_a": 0.0,
     }).state
     handler, _, _ = _handler(_FakeBackend(), core=_FakeCore(affect=negative))
-    with patch("lyra_core.runtime.retrieval.build_context", new=AsyncMock(return_value="## Persona Traits\n- curiosity")):
+    with patch(
+        "lyra_core.runtime.build_context",
+        new=AsyncMock(return_value=_context_result("## Persona Traits\n- curiosity")),
+    ):
         system = asyncio.run(handler.system_prompt("hello"))
     assert system.startswith(LAYER1_FACTS)
     assert "curiosity" in system
@@ -340,10 +407,11 @@ def test_tick_logs_one_stable_line_per_tick_whether_or_not_clamped(caplog):
 
 # ── runtime over a real socket ───────────────────────────────────────────────
 
-def _runtime(tmp_path, backend=None, **kw) -> Runtime:
+def _runtime(tmp_path, backend=None, legacy_db_path=None, **kw) -> Runtime:
     return Runtime(
         backend or _FakeBackend(),
-        db_path=tmp_path / "memory.db",
+        db_path=tmp_path / "store.db",
+        legacy_db_path=legacy_db_path if legacy_db_path is not None else tmp_path / "legacy_memory.db",
         history_path=tmp_path / "history.db",
         port=0,
         init_store=True,
@@ -371,11 +439,14 @@ def test_runtime_serves_a_turn_and_writes_history_and_atoms_in_the_daemon(tmp_pa
     with sqlite3.connect(tmp_path / "history.db") as conn:
         rows = conn.execute("SELECT session, role, content FROM turns ORDER BY id").fetchall()
     assert rows == [("s1", "user", "hello"), ("s1", "assistant", "echo: hello")]
-    with sqlite3.connect(tmp_path / "memory.db") as conn:
-        atoms = conn.execute("SELECT role, content FROM atoms ORDER BY id").fetchall()
-        affect = conn.execute("SELECT value FROM facts WHERE key = 'affect_state'").fetchone()
-    assert atoms == [("user", "hello"), ("lyra", "echo: hello")]
+    with sqlite3.connect(tmp_path / "store.db") as conn:
+        atoms = conn.execute("SELECT speaker, text FROM atoms ORDER BY id").fetchall()
+        affect = conn.execute(
+            f"SELECT text FROM facts WHERE subject = '{_AFFECT_SUBJECT}' AND valid_until IS NULL"
+        ).fetchone()
+    assert atoms == [("wilson", "hello"), ("lyra", "echo: hello")]
     assert affect is not None, "affect persisted on clean stop"
+    assert (tmp_path / "runs.db").is_file()
 
 
 def test_runtime_survives_client_disconnects_and_serves_the_next_client(tmp_path):
@@ -450,10 +521,16 @@ def test_memory_failure_on_the_turn_path_exits_nonzero(tmp_path, caplog):
 
 
 def test_runtime_refuses_to_start_without_a_store_and_leaves_none_behind(tmp_path):
-    rt = Runtime(_FakeBackend(), db_path=tmp_path / "memory.db", history_path=tmp_path / "history.db", port=0)
+    rt = Runtime(
+        _FakeBackend(),
+        db_path=tmp_path / "store.db",
+        legacy_db_path=tmp_path / "legacy_memory.db",
+        history_path=tmp_path / "history.db",
+        port=0,
+    )
     with pytest.raises(StoreMissing, match="memory store missing"):
         asyncio.run(rt.run_forever(asyncio.Event()))
-    assert not (tmp_path / "memory.db").exists()
+    assert not (tmp_path / "store.db").exists()
 
 
 def test_affect_persists_across_daemon_restarts(tmp_path):
@@ -479,3 +556,28 @@ def test_affect_persists_across_daemon_restarts(tmp_path):
     assert (before.valence, before.arousal) != (0.0, 0.0)
     assert after.valence == pytest.approx(before.valence)
     assert after.arousal == pytest.approx(before.arousal)
+
+
+def test_runtime_cold_start_archives_legacy_memory_db_and_logs_all_three_paths(tmp_path, caplog):
+    """DONE-WHEN: a machine with only memory.db present — the daemon archives
+    it by rename, creates store.db and runs.db, and starts. All three paths
+    appear in the log."""
+    legacy = tmp_path / "memory.db"
+    _pre_atoms_store(legacy, datetime(2026, 6, 10, 8, 0))
+
+    async def _run():
+        rt = _runtime(tmp_path, legacy_db_path=legacy)
+        await rt.start()
+        await rt.stop()
+
+    with caplog.at_level(logging.INFO):
+        asyncio.run(_run())
+
+    archive = tmp_path / "memory.db.2026-06-10.archive"
+    assert archive.is_file()
+    assert not legacy.exists()
+    assert (tmp_path / "store.db").is_file()
+    assert (tmp_path / "runs.db").is_file()
+    assert str(archive) in caplog.text
+    assert str(tmp_path / "store.db") in caplog.text
+    assert str(tmp_path / "runs.db") in caplog.text

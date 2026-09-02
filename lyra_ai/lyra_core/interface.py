@@ -15,6 +15,7 @@ Reserved seams present in Phase 0 (inert until noted phase):
 """
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -126,6 +127,22 @@ class AffectState:
 # "the recurring problem" framing for repeated action failures (Phase 3.6).
 _FAILURE_PROBLEM_ID = "action_outcome_failure"
 
+# CP-B: obs.source names WHO/WHAT produced an observation (conversation / lyra
+# / vision / ...), which is a different axis from Store's `speaker` vocabulary
+# (wilson | lyra | system) and `source` channel vocabulary (cli | wakeword |
+# ambient | vision | sandbox_read) — see DECISIONS.md (CP-B) for why this
+# mapping is what it is. Everything that isn't her own turn and isn't a vision
+# observation is attributed to the daemon's one channel today: the CLI.
+_ATOM_SPEAKER_BY_OBS_SOURCE: dict[str, str] = {"conversation": "wilson", "lyra": "lyra"}
+_ATOM_SOURCE_BY_OBS_SOURCE: dict[str, str] = {"vision": "vision"}
+_DEFAULT_ATOM_SOURCE = "cli"
+
+# CP-B: affect_state has no home in Store's schema (it is not a semantic fact
+# about the world, and OUT OF SCOPE forbids adding a table for it) — persisted
+# as a `facts` row instead, under a subject no real query will ever type. See
+# DECISIONS.md (CP-B, "affect_state has no table of its own").
+_AFFECT_STATE_FACT_SUBJECT = "_lyra_internal_affect_state"
+
 
 class CognitiveCore:
     """The live cognitive loop.
@@ -156,7 +173,6 @@ class CognitiveCore:
         from lyra_core.drives import BoredomDrive, CompetenceTracker, RelationalDrive
         from lyra_core.action_selection import ActionSelector
         from lyra_core.development import OutcomeConsolidator
-        from lyra_memory import MemorySystem
 
         self._gate = gate if gate is not None else HarmGate()
         self._affect = affect if affect is not None else AffectEngine()
@@ -164,7 +180,12 @@ class CognitiveCore:
         self._boredom = boredom if boredom is not None else BoredomDrive(self._competence)
         self._relational = relational if relational is not None else RelationalDrive()
         self._selector = selector if selector is not None else ActionSelector()
-        self._memory = memory if memory is not None else MemorySystem()
+        # CP-B: no default memory. The daemon always injects a Store (async
+        # open, not constructible here — CognitiveCore.__init__ is sync); a
+        # core built with no memory injected simply has none, and any ingest
+        # that reaches it fails loudly rather than reaching for a store this
+        # process never opened. See DECISIONS.md (CP-B, item 1).
+        self._memory = memory
 
         self._consolidator_injected = consolidator is not None
         self._consolidator = consolidator if consolidator is not None else OutcomeConsolidator(
@@ -174,18 +195,33 @@ class CognitiveCore:
 
     @property
     def memory(self):
-        """The MemorySystem this core owns (or was given)."""
+        """The memory (a Store, in the daemon; whatever was injected in tests)."""
         return self._memory
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
-        """Start the owned memory system and restore persisted affect, if any."""
-        await self._memory.start()
+        """Start the owned memory system (if it has a start()) and restore
+        persisted affect, if any.
+
+        CP-B: Store is opened by the caller (Runtime.start — Store.open() is
+        async and this constructor is sync, so it cannot happen here) and has
+        no start() of its own; `getattr` keeps this call working for anything
+        that still has the old MemorySystem-style lifecycle (fakes, tests)
+        without requiring Store to grow a method it doesn't need.
+        """
+        start_fn = getattr(self._memory, "start", None)
+        if start_fn is not None:
+            await start_fn()
 
         structured_state = getattr(self._memory, "structured_state", None)
         if structured_state is not None:
             saved = await structured_state.get_fact("affect_state")
+            if saved is not None:
+                from lyra_core.affect import AffectEngine
+                self._affect = AffectEngine.from_dict(saved)
+        else:
+            saved = await self._read_affect_fact()
             if saved is not None:
                 from lyra_core.affect import AffectEngine
                 self._affect = AffectEngine.from_dict(saved)
@@ -198,26 +234,71 @@ class CognitiveCore:
             )
 
     async def stop(self) -> None:
-        """Persist current affect state and stop the owned memory system."""
+        """Persist current affect state and stop the owned memory system.
+
+        CP-B: Store has no stop() (Runtime closes it explicitly after this
+        returns) — only MemorySystem-style memories are stopped here.
+        """
         structured_state = getattr(self._memory, "structured_state", None)
         if structured_state is not None:
             await structured_state.set_fact("affect_state", self._affect.to_dict())
+        else:
+            await self._write_affect_fact()
 
-        await self._memory.stop()
+        stop_fn = getattr(self._memory, "stop", None)
+        if stop_fn is not None:
+            await stop_fn()
+
+    # ── affect persistence against a Store (no structured_state) ───────────────
+
+    async def _read_affect_fact(self) -> dict | None:
+        """Latest current affect_state row from Store's `facts` table, if any.
+
+        Store has no generic key-value state table (OUT OF SCOPE forbids
+        adding one) — see `_AFFECT_STATE_FACT_SUBJECT` and DECISIONS.md.
+        """
+        db = getattr(self._memory, "db", None)
+        if db is None:
+            return None
+        async with db.execute(
+            "SELECT text FROM facts WHERE subject = ? AND valid_until IS NULL"
+            " ORDER BY id DESC LIMIT 1",
+            (_AFFECT_STATE_FACT_SUBJECT,),
+        ) as cur:
+            row = await cur.fetchone()
+        return json.loads(row[0]) if row is not None else None
+
+    async def _write_affect_fact(self) -> None:
+        db = getattr(self._memory, "db", None)
+        if db is None:
+            return
+        now = time.time()
+        await db.execute(
+            "UPDATE facts SET valid_until = ? WHERE subject = ? AND valid_until IS NULL",
+            (now, _AFFECT_STATE_FACT_SUBJECT),
+        )
+        await db.execute(
+            "INSERT INTO facts (ts, subject, text, source_kind, confidence, valid_from)"
+            " VALUES (?, ?, ?, 'inferred', 1.0, ?)",
+            (now, _AFFECT_STATE_FACT_SUBJECT, json.dumps(self._affect.to_dict()), now),
+        )
+        await db.commit()
 
     # ── Ingest ───────────────────────────────────────────────────────────────
 
     async def _ingest_sensory(self, obs: Observation) -> None:
-        # Unguarded (CP-A). A memory that is not started, or a store that
-        # cannot take the write, is a turn that did not happen; the daemon
-        # treats it as fatal rather than answering over a store that is
-        # silently dropping her record.
-        if obs.source == "conversation":
-            await self._memory.add_turn("user", obs.content)
-        elif obs.source == "lyra":
-            await self._memory.add_turn("lyra", obs.content)
-        else:
-            await self._memory.add_observation(obs.content, source=obs.source)
+        # Unguarded (CP-A; still true under CP-B's Store). A memory that is
+        # not open, or a store that cannot take the write, is a turn that did
+        # not happen; the daemon treats it as fatal rather than answering
+        # over a store that is silently dropping her record.
+        #
+        # One atom per turn (CP-B change 2): obs.source names who/what this
+        # observation is FROM, which Store's append_atom splits into two
+        # different vocabularies — see _ATOM_SPEAKER_BY_OBS_SOURCE and
+        # DECISIONS.md for the mapping.
+        speaker = _ATOM_SPEAKER_BY_OBS_SOURCE.get(obs.source, "system")
+        source = _ATOM_SOURCE_BY_OBS_SOURCE.get(obs.source, _DEFAULT_ATOM_SOURCE)
+        await self._memory.append_atom(speaker=speaker, source=source, text=obs.content)
 
     async def _ingest_outcome(self, obs: Observation) -> None:
         if obs.predicted is None or obs.actual is None:

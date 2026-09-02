@@ -1,6 +1,11 @@
 from __future__ import annotations
 from pathlib import Path
 
+# CP-B: the daemon no longer opens this file — it opens STORE_PATH below via
+# lyra_memory.store.Store. DB_PATH stays because MemorySystem, retrieval.py,
+# and inspect_state.py still import it and are staying in the tree unchanged
+# (OUT OF SCOPE), not because memory_bridge.py is the only remaining
+# importer — it is one of several. See DECISIONS.md (CP-B, change 9).
 DB_PATH = Path.home() / ".lyra" / "memory.db"
 
 # The rebuilt store (turn-as-substrate). A separate file from memory.db: the
