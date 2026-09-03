@@ -232,6 +232,69 @@ def test_retrieval_intent_passes_the_real_harm_gate():
     assert gate.check(retrieval_intent).allowed
 
 
+# ── CP-I: repo_query — the same drive-vs-frustration mechanism, again ─────────
+#
+# CP-G proposed repo_query by appending directly to tick()'s output,
+# bypassing this file — undeclinable, no comparison to lose. CP-I routes it
+# through the identical pressure-vs-frustration comparison retrieval
+# already uses, so these tests are retrieval's own tests with the pressure
+# key swapped, on purpose: the mechanism is meant to be identical, not
+# merely similar.
+
+def test_neutral_affect_repo_query_pressure_selects_repo_query_intent():
+    selector = ActionSelector()
+    intents = selector.select({"repo_query": 1.0}, _make_affect(valence=0.0))
+    assert any(i.kind == IntentKind.repo_query for i in intents)
+
+
+def test_zero_repo_query_pressure_does_not_select_repo_query():
+    selector = ActionSelector()
+    intents = selector.select({"repo_query": 0.0}, _make_affect(valence=0.0))
+    assert not any(i.kind == IntentKind.repo_query for i in intents)
+
+
+def test_strong_negative_affect_flips_repo_query_to_declined():
+    """The same frustration flip that overrides boredom/relational/
+    retrieval can override repo_query too — CP-I's whole point: this was
+    structurally impossible before this checkpoint."""
+    selector = ActionSelector(affect_weight=1.0)
+    intents = selector.select({"repo_query": 0.3}, _make_affect(valence=-0.8))
+    assert not any(i.kind == IntentKind.repo_query for i in intents)
+
+
+def test_repo_query_loses_to_frustration_at_exactly_equal_pressure():
+    """pressure > frustration is required, not >=: a tie is a loss."""
+    selector = ActionSelector(affect_weight=1.0)
+    intents = selector.select({"repo_query": 0.5}, _make_affect(valence=-0.5))
+    assert not any(i.kind == IntentKind.repo_query for i in intents)
+    assert any(i.kind == IntentKind.noop for i in intents)
+
+
+def test_repo_query_and_boredom_can_both_be_selected_in_one_tick():
+    selector = ActionSelector()
+    intents = selector.select({"boredom": 0.5, "repo_query": 1.0}, _make_affect(valence=0.0))
+    kinds = {i.kind for i in intents}
+    assert IntentKind.repo_query in kinds
+    assert IntentKind.look in kinds
+
+
+def test_repo_query_and_retrieval_can_both_be_selected_in_one_tick():
+    selector = ActionSelector()
+    intents = selector.select(
+        {"retrieval": 1.0, "repo_query": 1.0}, _make_affect(valence=0.0))
+    kinds = {i.kind for i in intents}
+    assert IntentKind.retrieval in kinds
+    assert IntentKind.repo_query in kinds
+
+
+def test_repo_query_intent_passes_the_real_harm_gate():
+    selector = ActionSelector()
+    gate = HarmGate()
+    intents = selector.select({"repo_query": 1.0}, _make_affect(valence=0.0))
+    repo_query_intent = next(i for i in intents if i.kind == IntentKind.repo_query)
+    assert gate.check(repo_query_intent).allowed
+
+
 # ── Gate boundary: affect override can never produce a blocked intent ─────────
 
 def test_extreme_affect_only_produces_allowed_intent_kinds():
@@ -245,6 +308,7 @@ def test_extreme_affect_only_produces_allowed_intent_kinds():
         {"relational": 1.0},
         {"boredom": 1.0, "relational": 1.0},
         {"retrieval": 1.0},
+        {"repo_query": 1.0},
         {},
     ]
     for pressures in pressure_scenarios:

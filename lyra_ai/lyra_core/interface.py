@@ -165,6 +165,17 @@ _AFFECT_STATE_FACT_SUBJECT = "_lyra_internal_affect_state"
 # of what this checkpoint measures, not something assumed going in.
 _RETRIEVAL_PRESSURE = 1.0
 
+# CP-I: same reasoning as _RETRIEVAL_PRESSURE, same value, for the same
+# structural reason — a candidate that either matches the keyword set at
+# full strength or isn't a candidate at all, scored against frustration by
+# ActionSelector exactly like retrieval. Not tuned relative to retrieval:
+# equal pressure means a turn frustrated enough to decline retrieval is
+# also frustrated enough to decline repo_query, with no separate lever for
+# "decline repo reads but not conversational recall" — CHANGES did not ask
+# for one, and OUT OF SCOPE forbids new drives, which a second, different
+# pressure constant would start to resemble.
+_REPO_QUERY_PRESSURE = 1.0
+
 # CP-D: the two-branch weak signal a retrieval outcome reduces to (change 4)
 # — whether the assembled context contained at least one atom above the
 # retrievability floor. Mirrors development.py's trait_name_from_outcome in
@@ -244,14 +255,16 @@ DECLINED_MARKER = "retrieval: declined"
 # this checkpoint used `atoms` instead — the reason `facts` was chosen).
 REPO_COMMIT_SOURCE_KIND = "repo_commit"
 
-# CP-G change 3: deterministic content trigger, not a drive/pressure —
-# action_selection.py (drives) is OUT OF SCOPE this checkpoint, so
-# repo_query does not go through ActionSelector the way retrieval does.
-# tick() below checks the turn's own conversational text directly against
-# this fixed keyword set and appends the intent itself when it matches.
-# Simpler than retrieval's frustration-gated design on purpose: CHANGES
-# never asks for frustration-gating here, and building it would mean
-# extending action_selection.py, which is forbidden.
+# CP-G change 3, CP-I change 1: the keyword match still decides WHETHER
+# repo_query is a candidate this tick, unchanged — what changed at CP-I is
+# what happens to that candidate afterward. CP-G appended the intent
+# directly to tick()'s output, bypassing ActionSelector entirely (action_
+# selection.py was out of that checkpoint's scope); that made repo_query
+# undeclinable — the only IntentKind whose proposal was also its
+# execution, with no comparison to lose. CP-I feeds this exact same
+# keyword-match result into `pressures["repo_query"]` (see tick() below)
+# instead, so ActionSelector.select() scores it against frustration
+# exactly as it already scores retrieval — see action_selection.py.
 _REPO_QUERY_KEYWORDS: frozenset[str] = frozenset({
     "commit", "commits", "committed", "checkpoint", "checkpoints",
     "repo", "repository", "codebase",
@@ -262,7 +275,8 @@ def _looks_like_repo_query(observations: list["Observation"]) -> bool:
     """True iff this tick's conversational observation's text plausibly asks
     about the repo's commit history — a fixed keyword substring check
     against the "conversation" observation only (never her own "lyra" turn,
-    same restriction retrieval's awaiting_reply already applies)."""
+    same restriction retrieval's awaiting_reply already applies). CP-I:
+    this is now a CANDIDACY test, not a decision — see tick()."""
     for obs in observations:
         if obs.kind == ObservationKind.sensory and obs.source == "conversation":
             text_lower = obs.content.lower()
@@ -396,6 +410,13 @@ class CognitiveCore:
             pool=getattr(self._memory, "candidate_pool", None),
             working_memory=getattr(self._memory, "working_memory", None),
         )
+
+        # CP-I: read by runtime.py after tick() to distinguish a repo_query
+        # WIN (intent present in tick()'s output) from a LOSS (this is
+        # nonzero but the intent isn't) from NOT-A-CANDIDATE (this is 0.0)
+        # — see tick()'s own comment. 0.0 before the first tick: nothing
+        # has proposed anything yet.
+        self._last_repo_query_pressure: float = 0.0
 
     @property
     def memory(self):
@@ -906,6 +927,46 @@ class CognitiveCore:
             ),
         )
 
+    async def record_repo_query_loss(
+        self, user_atom_id: int, context_log_id: int | None, pressure: float, affect_valence: float,
+    ) -> int | None:
+        """CP-I change 3: a repo_query candidate that LOST to frustration
+        inside ActionSelector.select() — pressure was proposed (nonzero)
+        but the intent did not appear in tick()'s output — gets an
+        `outcomes` row too, not just a log line. Without this, CP-G's
+        undeclinable repo_query had no way to lose at all; now that it can,
+        a silent drop would make "the loss is visible in the outcome
+        table" (DONE-WHEN) false.
+
+        `pressure` and `affect_valence` are what runtime.py already has in
+        hand (the constant tick() proposed the candidate at, and
+        introspect().valence) — "the losing score" recorded as those two
+        numbers, not a re-derivation of ActionSelector's own frustration
+        arithmetic (its `effective_weight`, adjustable by bias, is private
+        to the selector and was not exposed for this — see interface.py's
+        `_last_repo_query_pressure` comment for why that restraint was
+        chosen over widening ActionSelector's return contract).
+
+        valence (the outcomes-table column, distinct from affect_valence)
+        is 0.0: the candidate never executed — there was nothing to check
+        for truth or falsity, only a bid that did not win. `actual="lost"`
+        distinguishes this row from a citations_valid/citations_invalid
+        win at a glance.
+        """
+        record_outcome = getattr(self._memory, "record_outcome", None)
+        if record_outcome is None:
+            return None
+        return await record_outcome(
+            intent_atom_id=user_atom_id,
+            valence=0.0,
+            actual="lost",
+            predicted="repo_query",
+            environment=(
+                f"kind=repo_query_loss;context_log_id={context_log_id};"
+                f"pressure={pressure};affect_valence={affect_valence}"
+            ),
+        )
+
     async def consolidate_repo_citation_outcome(
         self, had_repo_context: bool, hit_count: int, miss_count: int,
         outcome_id: int | None = None,
@@ -1053,23 +1114,29 @@ class CognitiveCore:
             obs.kind == ObservationKind.sensory and obs.source == "conversation"
             for obs in observations
         )
+        # CP-I: repo_query is now a scored candidate, not a direct append —
+        # `_last_repo_query_pressure` is read by runtime.py (the same
+        # already-established pattern it uses for `_boredom`/`_relational`
+        # .pressure: "CognitiveCore.tick() returns only (intents, affect) —
+        # interface.py is outside [that] checkpoint's closed file set, so
+        # drive pressure is read off the core's own drive objects rather
+        # than adding a new accessor there", CP-A.1) so it can tell a WIN
+        # (the intent appears below) from a LOSS (pressure was nonzero, the
+        # intent does not) from NOT-A-CANDIDATE (pressure was zero) without
+        # re-deriving ActionSelector's frustration arithmetic itself — the
+        # same restraint CP-D's own retrieval-decline log line already
+        # showed ("valence is logged as the legible reason, not a
+        # re-derivation of the flip's arithmetic").
+        self._last_repo_query_pressure = (
+            _REPO_QUERY_PRESSURE if (awaiting_reply and _looks_like_repo_query(observations)) else 0.0
+        )
         pressures = {
             "boredom": self._boredom.pressure,
             "relational": self._relational.pressure,
             "retrieval": _RETRIEVAL_PRESSURE if awaiting_reply else 0.0,
+            "repo_query": self._last_repo_query_pressure,
         }
         intents = self._selector.select(pressures, self._affect.state, bias=bias)
-
-        # CP-G: repo_query is NOT one of ActionSelector's pressures — see
-        # this module's _looks_like_repo_query docstring for why (drives/
-        # action_selection.py are out of this checkpoint's scope). Appended
-        # directly, same restriction as retrieval's awaiting_reply (only on
-        # the tick where a fresh "conversation" observation arrived), before
-        # gating so it goes through the exact same ALLOWED_KINDS chokepoint
-        # every other intent does.
-        if awaiting_reply and _looks_like_repo_query(observations):
-            intents.append(Intent(kind=IntentKind.repo_query, payload={"reason": "repo"}))
-
         intents = self._gate_intents(intents)
 
         return intents, self._affect.state

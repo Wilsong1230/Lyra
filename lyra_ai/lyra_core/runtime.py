@@ -106,13 +106,25 @@ TRAIT_PROMOTED = "TRAIT_PROMOTED"
 # existing _loop_log_section/_outcomes_section as retrieval-specific
 # measurements (their own docstrings say so); reusing them here would
 # silently fold repo-query counts into fields CHANGES never asked this
-# checkpoint to touch. repo_query has no INTENT_DECLINED equivalent — see
-# interface.py's _looks_like_repo_query: it is a deterministic content
-# trigger, not a frustration-gated drive, so there is no "produced but
-# overridden" state to log.
+# checkpoint to touch.
+#
+# CP-G originally noted repo_query had no INTENT_DECLINED equivalent — a
+# deterministic content trigger, not a frustration-gated drive, so there
+# was no "produced but overridden" state to log. CP-I made that false: the
+# keyword match is now only candidacy, scored by ActionSelector against
+# frustration exactly like retrieval, so a loss is now reachable. See
+# REPO_QUERY_LOST below rather than reusing INTENT_DECLINED, for the same
+# reason REPO_QUERY_PRODUCED doesn't reuse INTENT_PRODUCED.
 REPO_QUERY_PRODUCED = "REPO_QUERY_PRODUCED"
 REPO_QUERY_EXECUTED = "REPO_QUERY_EXECUTED"
 REPO_OUTCOME_RECORDED = "REPO_OUTCOME_RECORDED"
+
+# CP-I change 3: logged when repo_query was a candidate this tick
+# (pressure > 0) but lost to frustration inside ActionSelector.select() —
+# the intent never appears in last_intents, so without this marker the
+# loss would be invisible in the log the same way it used to be invisible
+# in the store.
+REPO_QUERY_LOST = "REPO_QUERY_LOST"
 
 # CP-H: consolidate_repo_citation_outcome()'s own marker — "joining the
 # existing per-turn marker sequence" (change 5) means logged alongside
@@ -507,13 +519,17 @@ class TurnHandler:
             )
             context = None
 
-        # CP-G: repo_query has no decline branch (interface.py's
-        # _looks_like_repo_query is a deterministic content trigger, not a
-        # frustration-gated drive) — it is either produced-and-executed
-        # this turn, or it never appears in last_intents at all, in which
-        # case there is nothing to log (see REPO_QUERY_PRODUCED's own
-        # comment above).
+        # CP-I: repo_query is now scored by ActionSelector against
+        # frustration exactly like retrieval (interface.py, action_
+        # selection.py) — three states, not two: WON this tick (the intent
+        # is in last_intents), LOST (it was a candidate — pressure > 0 —
+        # but did not win), or was never a candidate at all (pressure ==
+        # 0.0, nothing to log). `_last_repo_query_pressure` is read the
+        # same established way `_boredom`/`_relational` pressure already
+        # is (see interface.py's tick() comment) rather than adding a new
+        # CognitiveCore accessor.
         repo_query_intended = any(i.kind == IntentKind.repo_query for i in self.last_intents)
+        repo_query_pressure = getattr(self._core, "_last_repo_query_pressure", 0.0)
         if repo_query_intended:
             log.info("%s turn=%d kind=repo_query", REPO_QUERY_PRODUCED, turn_id)
             repo_context = await self._core.retrieve_repo_context(message)
@@ -534,6 +550,7 @@ class TurnHandler:
                 await self._finish_exchange(
                     message, response, context, session, turn_id,
                     retrieval_intended, repo_query_intended, repo_context,
+                    repo_query_pressure,
                 )
                 return response
             self._history.add(session, "assistant", truncate_at_tool_call(response))
@@ -545,12 +562,14 @@ class TurnHandler:
         await self._finish_exchange(
             message, _VISION_FALLBACK, context, session, turn_id,
             retrieval_intended, repo_query_intended, repo_context,
+            repo_query_pressure,
         )
         return _VISION_FALLBACK
 
     async def _finish_exchange(
         self, message: str, response: str, context, session: str, turn_id: int,
         retrieval_intended: bool, repo_query_intended: bool = False, repo_context=None,
+        repo_query_pressure: float = 0.0,
     ) -> None:
         """ingest_exchange() always; the retrieval outcome/consolidator/
         promotion steps only when a retrieval intent actually executed this
@@ -628,6 +647,20 @@ class TurnHandler:
                         "%s turn=%d label=%r hits=%d misses=%d",
                         CITATION_OUTCOME, turn_id, label, hit_count, miss_count,
                     )
+        elif repo_query_pressure > 0.0:
+            # CP-I change 3: a repo_query candidate that lost to frustration
+            # this tick. Recorded, not dropped — the same standard CP-G
+            # already holds a win to (change 6: zero citations is still a
+            # recorded outcome), extended to the new "did not even run"
+            # case a scored candidate introduces.
+            loss_outcome_id = await self._core.record_repo_query_loss(
+                user_atom_id, context_log_id, repo_query_pressure, self._core.introspect().valence)
+            if loss_outcome_id is not None:
+                log.info(
+                    "%s turn=%d outcome_id=%d pressure=%.6f valence=%.6f",
+                    REPO_QUERY_LOST, turn_id, loss_outcome_id,
+                    repo_query_pressure, self._core.introspect().valence,
+                )
 
 
 def parse_tool_call(response: str) -> str | None:

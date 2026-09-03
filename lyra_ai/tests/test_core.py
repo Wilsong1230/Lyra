@@ -985,6 +985,98 @@ def test_repo_query_intent_passes_the_gate():
     assert IntentKind.repo_query in ALLOWED_KINDS
 
 
+# ── repo_query is a SCORED candidate, not a direct append (CP-I change 1/2) ──
+
+def test_last_repo_query_pressure_is_zero_before_any_tick():
+    core = CognitiveCore(memory=_RecordingMemory())
+    assert core._last_repo_query_pressure == 0.0
+
+
+def test_last_repo_query_pressure_nonzero_when_keyword_matches():
+    memory = _RecordingMemory()
+    core = CognitiveCore(memory=memory)
+    obs = Observation(kind=ObservationKind.sensory, source="conversation",
+                       content="what was the first commit about retrieval")
+
+    asyncio.run(core.tick([obs]))
+
+    assert core._last_repo_query_pressure > 0.0
+
+
+def test_last_repo_query_pressure_zero_when_keyword_does_not_match():
+    memory = _RecordingMemory()
+    core = CognitiveCore(memory=memory)
+    obs = Observation(kind=ObservationKind.sensory, source="conversation", content="how's it going")
+
+    asyncio.run(core.tick([obs]))
+
+    assert core._last_repo_query_pressure == 0.0
+
+
+def test_repo_query_intent_lost_when_frustration_beats_pressure():
+    """CP-I's whole point: a scored repo_query candidate CAN lose. An
+    injected ActionSelector with a large affect_weight (the same technique
+    test_action_selection.py's own extreme-affect tests use) turns even a
+    little accumulated frustration — built the honest way, via repeated
+    action_outcome failures (lyra_core.harness.failures(), CP-D's own
+    frustration-test pattern) — into more than enough to beat repo_query's
+    fixed pressure. Not a synthetic AffectState; real drive-driven
+    negative valence."""
+    from lyra_core.action_selection import ActionSelector
+    from lyra_core.harness import Harness, failures
+
+    memory = _RecordingMemory()
+    core = CognitiveCore(memory=memory, selector=ActionSelector(affect_weight=100.0))
+
+    async def _run():
+        h = Harness(core=core)
+        await h.run(failures(15))
+        obs = Observation(kind=ObservationKind.sensory, source="conversation",
+                           content="what commit was that")
+        return await core.tick([obs])
+
+    intents, affect = asyncio.run(_run())
+
+    assert affect.valence < 0.0, "frustration setup did not produce negative affect"
+    assert core._last_repo_query_pressure > 0.0, "keyword did not register as a candidate"
+    assert not any(i.kind == IntentKind.repo_query for i in intents), (
+        "repo_query won despite frustration outweighing its pressure"
+    )
+
+
+# ── record_repo_query_loss (CP-I change 3) ───────────────────────────────────
+
+def test_record_repo_query_loss_returns_none_without_a_db():
+    memory = _RecordingMemory()
+    core = CognitiveCore(memory=memory)
+
+    result = asyncio.run(core.record_repo_query_loss(1, context_log_id=2, pressure=1.0, affect_valence=-0.8))
+
+    assert result is None
+
+
+async def test_record_repo_query_loss_writes_an_outcomes_row(store):
+    core = CognitiveCore(memory=store)
+    user_id = await store.append_atom(speaker="wilson", source="cli", text="what commit was that")
+
+    outcome_id = await core.record_repo_query_loss(user_id, context_log_id=5, pressure=1.0, affect_valence=-0.8)
+
+    assert outcome_id is not None
+    async with store.db.execute(
+        "SELECT intent_atom_id, valence, actual, predicted, environment FROM outcomes WHERE id = ?",
+        (outcome_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    assert row[0] == user_id
+    assert row[1] == 0.0
+    assert row[2] == "lost"
+    assert row[3] == "repo_query"
+    assert "kind=repo_query_loss" in row[4]
+    assert "context_log_id=5" in row[4]
+    assert "pressure=1.0" in row[4]
+    assert "affect_valence=-0.8" in row[4]
+
+
 # ── retrieve_repo_context (CP-G change 4) ────────────────────────────────────
 
 async def _index_one_commit(

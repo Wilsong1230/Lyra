@@ -28,7 +28,7 @@ import pytest
 from lyra.assistant import LAYER1_FACTS, LyraClient
 from lyra_core import runtime
 from lyra_core.affect import AffectEngine
-from lyra_core.interface import AffectState, CognitiveCore, Intent, IntentKind, RepoContext
+from lyra_core.interface import AffectState, AffectVector, CognitiveCore, Intent, IntentKind, RepoContext
 from lyra_core.runtime import (
     CANDIDATE_CREATED,
     CONSOLIDATOR_FIRED,
@@ -261,6 +261,7 @@ class _FakeCore:
         produces_repo_query: bool = False,
         repo_context: "RepoContext | None" = None,
         repo_citations: tuple[int, int] = (0, 0),
+        repo_query_pressure: float | None = None,
     ) -> None:
         self.ticks: list[tuple[str, str, float]] = []
         self.exchanges: list[tuple[str, str, object, object]] = []
@@ -275,10 +276,22 @@ class _FakeCore:
         self._produces_repo_query = produces_repo_query
         self._repo_context = repo_context if repo_context is not None else RepoContext(text="", commit_hashes=[])
         self._repo_citations = repo_citations
+        # CP-I: independent of _produces_repo_query — set explicitly to
+        # simulate "was a candidate this tick (pressure > 0) but LOST"
+        # (produces_repo_query=False, repo_query_pressure=1.0), the third
+        # state alongside WON (produces_repo_query=True) and NOT-A-
+        # CANDIDATE (both default/zero). Mirrors interface.py's real
+        # CognitiveCore._last_repo_query_pressure exactly.
+        self._repo_query_pressure_setting = (
+            repo_query_pressure if repo_query_pressure is not None
+            else (1.0 if produces_repo_query else 0.0)
+        )
+        self._last_repo_query_pressure: float = 0.0
         self.repo_context_calls: list[str] = []
         self.repo_citation_calls: list[str] = []
         self.repo_outcomes: list[tuple] = []
         self.repo_citation_consolidations: list[tuple] = []
+        self.repo_query_losses: list[tuple] = []
         self.memory = MagicMock()
 
     async def tick(self, observations, dt=0.1):
@@ -287,7 +300,9 @@ class _FakeCore:
         intents = []
         if self._produces_retrieval and any(o.source == "conversation" for o in observations):
             intents.append(Intent(kind=IntentKind.retrieval, payload={"reason": "turn"}))
-        if self._produces_repo_query and any(o.source == "conversation" for o in observations):
+        is_candidate = any(o.source == "conversation" for o in observations)
+        self._last_repo_query_pressure = self._repo_query_pressure_setting if is_candidate else 0.0
+        if self._produces_repo_query and is_candidate:
             intents.append(Intent(kind=IntentKind.repo_query, payload={"reason": "repo"}))
         return intents, self._affect
 
@@ -336,6 +351,10 @@ class _FakeCore:
         else:
             label = "repo citations verified"
         return (label, "...")
+
+    async def record_repo_query_loss(self, user_atom_id, context_log_id, pressure, affect_valence):
+        self.repo_query_losses.append((user_atom_id, context_log_id, pressure, affect_valence))
+        return len(self.repo_query_losses)
 
 
 def _handler(backend, core=None, vision=None, history=None, now=None):
@@ -672,6 +691,74 @@ def test_handle_distinguishes_context_no_citation_from_no_context(caplog):
     assert len(lines) == 2
     assert "label='repo context given but nothing cited'" in lines[0]
     assert "label='no repo context to cite'" in lines[1]
+
+
+# ── repo_query as a scored, declinable candidate (CP-I) ─────────────────────
+
+def test_handle_does_not_call_repo_methods_when_not_a_candidate():
+    """pressure stays 0.0 (no keyword match) — not a candidate at all, not
+    even a loss."""
+    backend = _FakeBackend(["hi there"])
+    core = _FakeCore()  # produces_repo_query=False, repo_query_pressure=None -> 0.0
+    handler, _, _ = _handler(backend, core=core)
+    asyncio.run(handler.handle("hello", "s1"))
+
+    assert core.repo_context_calls == []
+    assert core.repo_outcomes == []
+    assert core.repo_query_losses == []
+
+
+def test_handle_records_a_repo_query_loss_when_candidate_but_not_won():
+    backend = _FakeBackend(["hi there"])
+    core = _FakeCore(produces_repo_query=False, repo_query_pressure=1.0)
+    handler, _, _ = _handler(backend, core=core)
+    asyncio.run(handler.handle("what commit was that", "s1"))
+
+    assert core.repo_query_losses == [(1, 99, 1.0, 0.0)]
+    # the WIN path must not have run
+    assert core.repo_context_calls == []
+    assert core.repo_outcomes == []
+
+
+def test_handle_logs_repo_query_lost(caplog):
+    from lyra_core.runtime import REPO_QUERY_LOST
+
+    backend = _FakeBackend(["hi there"])
+    core = _FakeCore(
+        produces_repo_query=False, repo_query_pressure=1.0,
+        affect=AffectState(emotion=AffectVector(valence=-0.8, arousal=0.0)),
+    )
+    handler, _, _ = _handler(backend, core=core)
+    with caplog.at_level(logging.INFO, logger="lyra_core.runtime"):
+        asyncio.run(handler.handle("what commit was that", "s1"))
+
+    lines = [l for l in caplog.text.splitlines() if REPO_QUERY_LOST in l]
+    assert len(lines) == 1
+    assert "outcome_id=1" in lines[0]
+    assert "pressure=1.000000" in lines[0]
+    assert "valence=-0.800000" in lines[0]
+
+
+def test_handle_win_path_still_unregressed_when_repo_query_wins(caplog):
+    """DONE-WHEN: repo-read intent wins at least once and still executes
+    correctly — CP-G/CP-H behavior (citation checking, consolidation)
+    unregressed by CP-I's scoring change."""
+    from lyra_core.runtime import CITATION_OUTCOME, REPO_QUERY_EXECUTED, REPO_QUERY_LOST, REPO_QUERY_PRODUCED
+
+    backend = _FakeBackend(["cited [aaaaaaa]"])
+    core = _FakeCore(produces_repo_query=True, repo_citations=(1, 0), repo_context=RepoContext(
+        text="## Repository history\n- [aaaaaaa] ...", commit_hashes=["a" * 40],
+    ))
+    handler, _, _ = _handler(backend, core=core)
+    with caplog.at_level(logging.INFO, logger="lyra_core.runtime"):
+        asyncio.run(handler.handle("what commit was that", "s1"))
+
+    assert any(REPO_QUERY_PRODUCED in l for l in caplog.text.splitlines())
+    assert any(REPO_QUERY_EXECUTED in l for l in caplog.text.splitlines())
+    assert any(CITATION_OUTCOME in l for l in caplog.text.splitlines())
+    assert not any(REPO_QUERY_LOST in l for l in caplog.text.splitlines())
+    assert core.repo_citation_calls == ["cited [aaaaaaa]"]
+    assert core.repo_query_losses == []
 
 
 def test_two_turns_get_two_different_turn_ids(caplog):
