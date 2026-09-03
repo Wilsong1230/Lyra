@@ -299,6 +299,55 @@ class RepoContext:
     commit_hashes: list[str]
 
 
+# CP-H change 1: the closed candidate vocabulary for a citation outcome.
+# Exactly four branches, distinguished by two independent facts that must
+# not collapse into each other:
+#   (a) was there repo context to cite at all (commit rows retrieved this
+#       turn)?
+#   (b) if something WAS cited, did every cited hash exist in the index?
+# "cited nothing because there was nothing to cite" and "cited nothing
+# despite having context" are different facts about her behavior — one is
+# about retrieval finding nothing, the other is about her declining to use
+# what she was given — so they get distinct labels rather than a shared
+# "nothing cited" bucket. Exact label match (closed_vocabulary=True), the
+# same reasoning CP-D's frustration vocabulary and CP-G's retrieval
+# vocabulary already established: these four descriptions are built from
+# one template each, share nearly all their words with their neighbors,
+# and a semantic threshold loose enough to merge genuine duplicates would
+# merge these apart-in-meaning branches too (measured for both prior
+# closed vocabularies in this codebase; not re-measured here because the
+# shape — one template, boolean-flipped — is identical, not merely
+# similar; see DECISIONS.md for why re-deriving the same conclusion a
+# third time was not repeated).
+def _repo_citation_trait_from_outcome(
+    had_repo_context: bool, hit_count: int, miss_count: int,
+) -> tuple[str, str]:
+    if hit_count + miss_count == 0:
+        if had_repo_context:
+            return (
+                "repo context given but nothing cited",
+                "an executed repo-query turn retrieved commit rows from the"
+                " index, but the reply cited none of them",
+            )
+        return (
+            "no repo context to cite",
+            "an executed repo-query turn retrieved no commit rows from the"
+            " index, so the reply had nothing to cite",
+        )
+    if miss_count > 0:
+        return (
+            "repo citations include a false hash",
+            "an executed repo-query turn's reply cited one or more hashes,"
+            " and at least one cited hash was not found in the indexed"
+            " commits",
+        )
+    return (
+        "repo citations verified",
+        "an executed repo-query turn's reply cited one or more hashes, and"
+        " every cited hash was found in the indexed commits",
+    )
+
+
 class CognitiveCore:
     """The live cognitive loop.
 
@@ -856,6 +905,56 @@ class CognitiveCore:
                 f"hits={hit_count};misses={miss_count}"
             ),
         )
+
+    async def consolidate_repo_citation_outcome(
+        self, had_repo_context: bool, hit_count: int, miss_count: int,
+        outcome_id: int | None = None,
+    ) -> tuple[str, str] | None:
+        """CP-H: the citation outcome consolidates (change 2) — reuses
+        CandidatePool exactly as consolidate_retrieval_outcome() already
+        does for retrieval, not a second consolidation path. Same
+        closed_vocabulary=True reasoning as that method and as
+        OutcomeConsolidator's frustration vocabulary before it:
+        `_repo_citation_trait_from_outcome` is a fixed, four-branch,
+        template-generated vocabulary (change 1) — descriptions of
+        adjacent branches ("cited, all verified" vs "cited, one false")
+        share almost every word except the fact that decides them, exactly
+        the shape CP-E measured as unsafe to dedup by embedding. Dedup by
+        exact label match instead.
+
+        Provenance (change 3): `evidence` is `outcome_id=<id>` when the
+        caller has one — the identical mechanism CP-E built and change 4's
+        retrieval consolidator already reuses — so a merged citation
+        candidate's `evidence_text` accumulates one line per contributing
+        `outcomes` row, parseable back to the exact turns (and their hit/
+        miss counts, via that outcome row's own `environment`) that
+        produced it. No new provenance code was written for this
+        checkpoint; this call site is the whole change.
+
+        Promotion is untouched (change 4): this method never calls
+        IdentityEngine, never checks confidence, never special-cases a
+        threshold. `CognitiveCore.promote_traits()` (CP-F) already scans
+        every row in `candidates` on each call, regardless of category —
+        a citation candidate crosses into `traits` through the exact same
+        `promote_traits()` call site `runtime.py` already makes after
+        retrieval consolidation, no new call, no new condition.
+
+        Returns (trait_name, trait_value) on every call — CandidatePool
+        inserts a new row on first sight of a branch and strengthens the
+        existing one on every repeat, never a fresh row for something
+        already seen. Returns None only when memory has no `.db`.
+        """
+        db = getattr(self._memory, "db", None)
+        if db is None:
+            return None
+        trait_name, trait_value = _repo_citation_trait_from_outcome(
+            had_repo_context, hit_count, miss_count)
+        evidence = f"outcome_id={outcome_id}" if outcome_id is not None else None
+        pool = CandidatePool(db)
+        await pool.add_observation(
+            trait_name, trait_value, "repo_citation", evidence=evidence, closed_vocabulary=True,
+        )
+        return trait_name, trait_value
 
     async def _ingest_outcome(self, obs: Observation) -> None:
         if obs.predicted is None or obs.actual is None:

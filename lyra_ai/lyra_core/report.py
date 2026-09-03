@@ -315,6 +315,20 @@ async def _context_log_section(db: aiosqlite.Connection, window_start: float) ->
     }
 
 
+# CP-F change 7 / CP-H change 6: how far evidence_count sits from the next
+# TRAIT_THRESHOLDS value it has not yet crossed (surface/character/core,
+# ascending). 0 means already at or above the highest tier (core) —
+# nothing left to cross. Shared by the all-candidates gap list
+# (_candidates_traits_section) and the repo-citation-only breakdown
+# (_repo_citation_candidates_section) — one formula, not two copies of it.
+_SORTED_TRAIT_THRESHOLDS = sorted(TRAIT_THRESHOLDS.values())
+
+
+def _gap_to_threshold(evidence_count: int) -> int:
+    remaining = [t - evidence_count for t in _SORTED_TRAIT_THRESHOLDS if t > evidence_count]
+    return remaining[0] if remaining else 0
+
+
 async def _candidates_traits_section(db: aiosqlite.Connection, window_start: float) -> dict:
     # CP-E: candidates are deduplicated at write time (candidate_pool.py) —
     # a row IS a distinct, post-collapse group, evidence_count IS how much
@@ -353,21 +367,12 @@ async def _candidates_traits_section(db: aiosqlite.Connection, window_start: flo
     mean_conf = sum(confidences) / len(confidences) if confidences else 0.0
 
     # CP-F change 7: "make an impending promotion visible before it
-    # happens" — for every candidate, how far its evidence_count sits from
-    # the next threshold it has not yet crossed (TRAIT_THRESHOLDS is
-    # surface/character/core, ascending). 0 means already at or above the
-    # highest tier (core) — nothing left to cross.
-    _sorted_thresholds = sorted(TRAIT_THRESHOLDS.values())
-
-    def _gap(evidence_count: int) -> int:
-        remaining = [t - evidence_count for t in _sorted_thresholds if t > evidence_count]
-        return remaining[0] if remaining else 0
-
+    # happens" — for every candidate, regardless of category.
     async with db.execute(
         "SELECT trait_name, evidence_count FROM candidates ORDER BY evidence_count DESC"
     ) as cur:
         cand_rows = await cur.fetchall()
-    candidate_gaps = [(name, ec, _gap(ec)) for name, ec in cand_rows]
+    candidate_gaps = [(name, ec, _gap_to_threshold(ec)) for name, ec in cand_rows]
 
     return {
         "candidates_total": candidates_total,
@@ -431,6 +436,21 @@ async def _repo_section(db: aiosqlite.Connection, window_start: float) -> dict:
         "repo_citations_miss_window": misses,
         "repo_citation_false_rate_window": false_rate,
     }
+
+
+async def _repo_citation_candidates_section(db: aiosqlite.Connection) -> dict:
+    """CP-H change 6: candidates and evidence PER CITATION LABEL, broken
+    out from the all-categories `_candidate_gaps` list above (which already
+    includes these rows, undifferentiated) — DONE-WHEN asks specifically to
+    see the four-label breakdown, not just find these rows mixed into the
+    generic candidate list. `_gap_to_threshold` is the identical formula
+    `_candidates_traits_section` uses, not a second one."""
+    async with db.execute(
+        "SELECT trait_name, evidence_count FROM candidates"
+        " WHERE category = 'repo_citation' ORDER BY evidence_count DESC"
+    ) as cur:
+        rows = await cur.fetchall()
+    return {"_repo_citation_labels": [(name, ec, _gap_to_threshold(ec)) for name, ec in rows]}
 
 
 async def _affect_section(db: aiosqlite.Connection, log_path: Path, window_start: float) -> dict:
@@ -701,6 +721,9 @@ async def collect_measurements(
         _repo_section(db, window_start),
     )
     await _section(
+        "repo_citation_candidates", (), _repo_citation_candidates_section(db),
+    )
+    await _section(
         "affect",
         ("emotion_v", "emotion_a", "mood_v", "mood_a", "temperament_v",
          "temperament_a", "temperament_c", "emotion_v_min", "emotion_v_max",
@@ -873,6 +896,16 @@ def render(measurements: dict, window_days: int) -> str:
     false_rate = measurements.get('repo_citation_false_rate_window', UNAVAILABLE)
     false_rate_str = f"{false_rate:.4f}" if isinstance(false_rate, float) else str(false_rate)
     lines.append(f"  citation false rate {false_rate_str}  (window)")
+
+    lines.append("\n2k. repo citation candidates, per label (CP-H)")
+    labels = measurements.get("_repo_citation_labels", [])
+    if not labels:
+        lines.append("  (none yet)")
+    for name, evidence_count, gap in labels:
+        if gap == 0:
+            lines.append(f"  {name}: evidence={evidence_count} (at or above the highest tier)")
+        else:
+            lines.append(f"  {name}: evidence={evidence_count}  gap={gap}")
 
     lines.append("\nKNOWN GAPS")
     for gap in KNOWN_GAPS:

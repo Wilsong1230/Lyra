@@ -2948,3 +2948,258 @@ are new tests added to `test_core.py`, `test_runtime.py`, and
 FILES set includes `candidate_pool.py` only conditionally, and Change 7
 found the condition unmet, so lyra-memory's own tree and tests are
 untouched this checkpoint).
+
+# CP-H — the citation outcome consolidates
+
+Register corrections carried in verbatim: `facts` now holds three
+populations (world, machine affect_state, repo commits) in one table;
+`context.py`'s recall paths do not filter by source, so atom purity is
+maintained by never writing non-experience into `atoms`, not by exclusion
+at read time; `IntentKind.repo_query` is registered but not declinable and
+not routed through `ActionSelector` — a content trigger, not a decision;
+citation existence is the first outcome signal that can come back false,
+and as of CP-G it was recorded and nothing consolidated it; 159 commits
+indexed as of CP-G (160 now — this checkpoint's own commits landed on the
+branch in between); the three-question semantic check against a real
+backend is still outstanding.
+
+## Change 1 — the closed citation candidate vocabulary
+
+Four labels, exact match (`closed_vocabulary=True`), no embedding — the
+same reasoning CP-D's frustration vocabulary and CP-G's own retrieval
+vocabulary already established for a fixed, template-generated set: these
+four descriptions share nearly every word with their neighbors and differ
+only in the one fact that decides them, exactly the shape a semantic
+threshold loose enough to merge genuine duplicates would also merge apart.
+Not re-measured against the offline embedder a third time — the shape is
+identical to the two prior closed vocabularies in this codebase (one
+template, one or two booleans flipped), not merely similar, and CP-G
+already measured that shape unsafe to dedup semantically.
+
+| label | description |
+|---|---|
+| `repo citations verified` | an executed repo-query turn's reply cited one or more hashes, and every cited hash was found in the indexed commits |
+| `repo citations include a false hash` | an executed repo-query turn's reply cited one or more hashes, and at least one cited hash was not found in the indexed commits |
+| `repo context given but nothing cited` | an executed repo-query turn retrieved commit rows from the index, but the reply cited none of them |
+| `no repo context to cite` | an executed repo-query turn retrieved no commit rows from the index, so the reply had nothing to cite |
+
+The two "nothing cited" branches are kept apart on purpose, per CHANGES'
+own instruction: the third label is about her declining to use context she
+was given; the fourth is about retrieval finding nothing for her to use.
+Collapsing them into one "nothing cited" bucket would erase exactly the
+distinction that makes one of them about her behavior and the other about
+the index's coverage.
+
+`_repo_citation_trait_from_outcome(had_repo_context, hit_count, miss_count)`
+(interface.py) selects the branch: `hit_count + miss_count == 0` splits on
+`had_repo_context` for labels 3/4; otherwise `miss_count > 0` selects label
+2, else label 1. Every branch is reachable from real inputs
+`check_repo_citations`/`retrieve_repo_context` already produce — no branch
+is dead code, confirmed live below (all four fired in the same run).
+
+## Change 2 — reuse, not a second consolidation path
+
+`CognitiveCore.consolidate_repo_citation_outcome()` (interface.py) is
+structurally identical to `consolidate_retrieval_outcome()` (CP-D/E): fresh
+`CandidatePool(db)` against `self._memory.db`, `add_observation(trait_name,
+trait_value, "repo_citation", evidence=..., closed_vocabulary=True)`. No
+new code was written in `candidate_pool.py` — `add_observation`'s
+`closed_vocabulary=True` path already does exactly what a fourth closed
+vocabulary needs; CHANGES' own FILES note ("vocabulary only") anticipated
+this, and in the end no vocabulary-shaped code change was needed there
+either, since the vocabulary lives in interface.py's
+`_repo_citation_trait_from_outcome`, not in `candidate_pool.py` itself
+(which has never contained any of the three prior closed vocabularies'
+label strings — it is generic over whatever `trait_name` a caller passes).
+`candidate_pool.py`'s diff for this checkpoint is empty.
+
+**A recurring finding, not a new bug class:** wiring this immediately hit
+the same blocker CP-F found for `category="retrieval"` —
+`Candidate.category`'s pydantic `Literal` (`lyra_memory/models.py`) did not
+include `"repo_citation"`, so `CandidatePool.get_candidates()` (called by
+`IdentityEngine.consolidate()`, called by `promote_traits()`) would raise
+`ValidationError` on the first `promote_traits()` call after a citation
+candidate existed — not just failing to read repo_citation candidates, but
+failing to read ANY candidate, the identical failure mode CP-F documented.
+Fixed the same way: `"repo_citation"` added to the Literal.
+`lyra_memory/models.py` is not in CP-H's FILES set; this is the same
+structurally-unavoidable companion touch CP-F's own precedent established
+for this exact recurring situation — see "Files touched outside the FILES
+set" below.
+
+## Change 3 — provenance, unmodified
+
+`evidence=f"outcome_id={outcome_id}"` is passed through exactly as
+`consolidate_retrieval_outcome` already does; `candidate_pool.py`'s
+`_append_evidence` (CP-E) accumulates it into `evidence_text` with no
+changes. Live-verified below: the false-hash candidate's `evidence_text`
+resolves to two real `outcomes` rows, each carrying its own `hits=`/
+`misses=` count in its own `environment` field (CP-G's packing, also
+unmodified) — a citation candidate's contributing turns, and what each one
+actually found, are both recoverable from the store alone.
+
+## Change 4 — promotion, exactly as wired at CP-F
+
+No new call site, no new condition, no check on category anywhere near
+promotion. `runtime.py`'s existing `promote_traits()` call (inside the
+`if retrieval_intended:` branch, unchanged from CP-F/CP-G) calls
+`IdentityEngine.consolidate()`, which reads `CandidatePool.get_candidates
+(min_evidence=1)` — every row, every category, exactly as it always has.
+A `repo_citation` candidate that reaches `evidence_count >= TRAIT_
+THRESHOLDS["surface"]` (5) promotes through this unchanged path the moment
+`promote_traits()` next runs, with no special case written for it anywhere
+in this checkpoint's diff. Live-verified below: `repo citations verified`
+promoted at evidence_count=5 on the very next retrieval-executed turn
+after crossing the threshold — the same one-tick lag CP-F's own retrieval
+trait showed, for the identical reason (promotion is tied to `retrieval_
+intended`, not to which candidate changed).
+
+One structural note, not a gap this checkpoint needed to close:
+`promote_traits()` is called from inside `if retrieval_intended:`, not
+`if repo_query_intended:`. Since `repo_query` is never declined (CP-G) but
+`retrieval` can be (frustration), a citation candidate could in principle
+have to wait for a later retrieval-executed turn to be picked up by
+promotion, on the rare turn where retrieval declines but repo_query still
+fires. CHANGES change 4 says "do not gate it, do not special-case it" —
+read as an instruction not to add a NEW condition around promotion for
+citation candidates specifically, which this checkpoint honors by leaving
+`promote_traits()`'s own trigger untouched rather than duplicating the
+call under `repo_query_intended` too (which would be two calls to the same
+idempotent operation on turns where both fire, and a second, redundant
+condition to reason about). Not exercised in the live run below (retrieval
+was never declined across ten turns), and not a case this checkpoint was
+asked to handle.
+
+## Change 5 — CITATION_OUTCOME
+
+`runtime.py` gains `CITATION_OUTCOME = "CITATION_OUTCOME"`, logged once per
+turn immediately after `REPO_OUTCOME_RECORDED`, under the same `turn=` id
+— "joining the existing per-turn marker sequence" read literally: this
+line sits beside the outcome-row log line the way `CONSOLIDATOR_FIRED`
+already sits beside `OUTCOME_RECORDED` for retrieval, not replacing
+anything. Carries `label=` and the same `hits=`/`misses=` counts
+`REPO_OUTCOME_RECORDED` logged one line above, so `grep CITATION_OUTCOME`
+alone tells a reader which branch fired and why, without cross-referencing
+the outcome line.
+
+## Change 6 — report.py, per label
+
+`_repo_citation_candidates_section` (new): `SELECT trait_name,
+evidence_count FROM candidates WHERE category = 'repo_citation'`, gap to
+the next `TRAIT_THRESHOLDS` value via `_gap_to_threshold` — the identical
+formula `_candidates_traits_section`'s own gap list already used, factored
+out into one shared function rather than duplicated a third time (CP-F
+first wrote it, CP-H's is the second copy that made extracting it worth
+doing). Rendered as its own "2k. repo citation candidates, per label"
+section, distinct from the all-categories "2d." breakdown that already
+includes these rows undifferentiated — DONE-WHEN asks to SEE the labels
+broken out, not merely confirm they exist somewhere in the generic list.
+
+## Files touched outside the FILES set
+
+- **`lyra-memory/lyra_memory/models.py`** — `Candidate.category`'s
+  `Literal` gains `"repo_citation"` (Change 2's finding). Structurally
+  unavoidable, not stylistic: without it `IdentityEngine.consolidate()`
+  raises on any store containing a repo_citation candidate, i.e.
+  `promote_traits()` — already running unconditionally per Change 4 — would
+  crash on its very next call once this checkpoint's own consolidator ever
+  fired once. The identical justification CP-F recorded for `"retrieval"`,
+  recurring for the reason CP-F's own comment already names: a closed
+  vocabulary category is data this Literal has to know about before
+  anything using it can be read back, not merely written.
+- **`lyra_ai/tests/test_core.py`, `test_runtime.py`, `test_report.py`** —
+  new tests for `consolidate_repo_citation_outcome` (label selection,
+  dedup-by-exact-match, provenance, promotion via the unmodified
+  `promote_traits()`), the daemon-path wiring (`_FakeCore` gained
+  `consolidate_repo_citation_outcome` and a `repo_citation_consolidations`
+  recorder), and the new report.py section — the same standing every prior
+  checkpoint's test-file companions had.
+
+## DONE-WHEN — evidence
+
+Ten turns through a real `Runtime` (tmp-path store indexed against the
+real Lyra repository — 160 commits at the time of this run —
+`LYRA_EMBED_BACKEND=hashed`, the same scripted-backend disclosure as CP-G:
+no LLM API key is configured in this environment, verified directly, so
+these replies are hand-written to exercise all four branches, not
+generated by a model).
+
+- **Candidates under all four labels**, sqlite:
+  ```
+  (3, 'repo citations verified',            'repo_citation', 5, 'outcome_id=3\noutcome_id=5\noutcome_id=7\noutcome_id=9\noutcome_id=11')
+  (4, 'repo citations include a false hash', 'repo_citation', 2, 'outcome_id=13\noutcome_id=15')
+  (5, 'repo context given but nothing cited','repo_citation', 1, 'outcome_id=17')
+  (6, 'no repo context to cite',             'repo_citation', 1, 'outcome_id=19')
+  ```
+- **A candidate carrying evidence from a FALSE citation, provenance
+  resolved**: `repo citations include a false hash` (id=4) resolves via
+  `evidence_text` to outcome ids 13 and 15:
+  ```
+  outcome row: (13, 0.0, 'citations_invalid', 'kind=repo_query;context_log_id=7;hits=0;misses=1')
+  outcome row: (15, 0.0, 'citations_invalid', 'kind=repo_query;context_log_id=8;hits=0;misses=1')
+  ```
+  Both carry `valence=0.0` and their own `hits=`/`misses=` counts, exactly
+  DONE-WHEN's requirement — "identifiable and contain the miss counts."
+  The turn that produced them: asked twice "what commit added candidate
+  deduplication", scripted to answer `[deadbeef]` — a hash not in the
+  index (the real answer is `2d7a91f`; the wrong hash was written
+  deliberately to exercise this label, disclosed here as in CP-G, not
+  discovered from a live model).
+- **Context-given-but-nothing-cited vs. no-context-to-cite, both rows
+  shown, distinct**:
+  ```
+  [('no repo context to cite', 1), ('repo context given but nothing cited', 1)]
+  ```
+  Produced by two different turns: "did we ever add a commit about time
+  travel to this repo" (10 real commit rows retrieved, reply correctly
+  cited none of them — label 3) and "committed anything about xylophone
+  hovercraft zeppelin" (repo_query triggered on the word "committed", but
+  the keyword-LIKE search over indexed commit text matched zero rows,
+  verified directly against the store before relying on it in this run —
+  label 4). One measured pitfall worth recording: an earlier version of
+  this same "no context" query included the word "repo", which — because
+  `retrieve_repo_context`'s keyword pass is a substring `LIKE`, unchanged
+  from CP-G — matched commit messages containing "repo" as a SUBSTRING
+  ("CP-C: the daemon **repo**rts on itself"), producing label 3 instead of
+  4. Not a bug in this checkpoint's code (CP-G's retrieval, out of scope
+  to touch, behaved exactly as documented); a bug in the first draft of
+  this verification's own query, caught by checking `retrieve_repo_
+  context()`'s actual return value directly before trusting it in the full
+  run, per this session's standing "measure, don't assume" discipline.
+- **`python -m lyra_core --report`-equivalent output**:
+  ```
+  2k. repo citation candidates, per label (CP-H)
+    repo citations verified: evidence=5  gap=10
+    repo citations include a false hash: evidence=2  gap=3
+    repo context given but nothing cited: evidence=1  gap=4
+    no repo context to cite: evidence=1  gap=4
+  ```
+- **Trait count before/after: 0 -> 2.** A citation trait DID promote:
+  ```
+  name: repo citations verified
+  description: an executed repo-query turn's reply cited one or more hashes, and every cited hash was found in the indexed commits
+  evidence_count: 5
+  threshold: 5 (TRAIT_THRESHOLDS["surface"])
+  stability: surface
+  confidence: 0.10
+  ```
+  logged:
+  ```
+  TRAIT_PROMOTED turn=7 trait_name='repo citations verified' evidence_count=5 threshold=5
+  ```
+  This is the second trait this system has ever promoted, and the first
+  whose underlying signal (change 5 was checkable and could have come back
+  the other way) — CP-F's "retrieval finds relevant context" describes
+  machinery that is nearly always true by construction; "repo citations
+  verified" describes an answer about the world that was checked against
+  ground truth and happened, this run, to hold. The false-hash label
+  (evidence=2) did not promote — gap to `TRAIT_THRESHOLDS["surface"]` is 3.
+  `TRAIT_THRESHOLDS` is unchanged (`git diff` over `lyra_memory/config.py`
+  for this checkpoint is empty, confirmed alongside `schema.py`,
+  `store/context.py`, `action_selection.py`, `candidate_pool.py`, and
+  `gate.py` — none touched).
+- **Both test suites green:** `lyra_ai` 414 passed (397 before this
+  checkpoint + 17 new: 7 in `test_core.py`, 5 in `test_runtime.py`, 5 in
+  `test_report.py`); `lyra-memory` 283 passed, 4 skipped (unchanged — this
+  checkpoint's `candidate_pool.py` diff is empty, so lyra-memory's own tree
+  and tests are untouched).

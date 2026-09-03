@@ -540,3 +540,62 @@ def test_format_log_line_includes_repo_fields():
     line = format_log_line(m)
     assert "commits_indexed=0" in line
     assert "repo_citation_false_rate_window=0" in line
+
+
+# ── citation candidates, per label (CP-H change 6) ──────────────────────────
+
+async def test_collect_measurements_repo_citation_labels_empty_on_a_fresh_store(store, tmp_path):
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["_repo_citation_labels"] == []
+
+
+async def test_collect_measurements_repo_citation_labels_breaks_out_by_label(store, tmp_path):
+    from lyra_core.interface import CognitiveCore
+
+    core = CognitiveCore(memory=store)
+    await core.consolidate_repo_citation_outcome(True, hit_count=1, miss_count=0, outcome_id=1)
+    await core.consolidate_repo_citation_outcome(True, hit_count=1, miss_count=0, outcome_id=2)
+    await core.consolidate_repo_citation_outcome(True, hit_count=0, miss_count=1, outcome_id=3)
+
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    labels = {name: (ec, gap) for name, ec, gap in m["_repo_citation_labels"]}
+    assert labels["repo citations verified"] == (2, 3)
+    assert labels["repo citations include a false hash"] == (1, 4)
+
+
+async def test_collect_measurements_repo_citation_labels_excludes_other_categories(store, tmp_path):
+    """Only category='repo_citation' rows appear here — a retrieval
+    candidate (category='retrieval') must not bleed into this breakdown."""
+    from lyra_core.interface import CognitiveCore
+
+    core = CognitiveCore(memory=store)
+    await core.consolidate_retrieval_outcome(had_context=True)
+    await core.consolidate_repo_citation_outcome(True, hit_count=1, miss_count=0, outcome_id=1)
+
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    names = [name for name, _ec, _gap in m["_repo_citation_labels"]]
+    assert names == ["repo citations verified"]
+    # sanity: the retrieval candidate is still in the generic, all-category list
+    generic_names = [name for name, _ec, _gap in m["_candidate_gaps"]]
+    assert "retrieval finds relevant context" in generic_names
+
+
+def test_render_includes_repo_citation_candidates_section():
+    m = {"_repo_citation_labels": [("repo citations verified", 3, 2)]}
+    text = render(m, window_days=7)
+    assert "2k. repo citation candidates, per label (CP-H)" in text
+    assert "repo citations verified: evidence=3  gap=2" in text
+
+
+def test_render_repo_citation_candidates_section_handles_no_labels_yet():
+    text = render({}, window_days=7)
+    assert "(none yet)" in text

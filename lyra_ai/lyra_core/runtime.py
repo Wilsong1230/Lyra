@@ -114,6 +114,13 @@ REPO_QUERY_PRODUCED = "REPO_QUERY_PRODUCED"
 REPO_QUERY_EXECUTED = "REPO_QUERY_EXECUTED"
 REPO_OUTCOME_RECORDED = "REPO_OUTCOME_RECORDED"
 
+# CP-H: consolidate_repo_citation_outcome()'s own marker — "joining the
+# existing per-turn marker sequence" (change 5) means logged alongside
+# REPO_OUTCOME_RECORDED under the same turn id, not replacing it: the
+# outcomes row and the candidate it strengthens are two different writes,
+# same as CONSOLIDATOR_FIRED sits beside OUTCOME_RECORDED for retrieval.
+CITATION_OUTCOME = "CITATION_OUTCOME"
+
 # Tables the hot path and the current retrieval queries reference (CP-B —
 # Store's schema, lyra_memory/store/schema.py, not the older db.py):
 #   atoms       — every turn is written here (CognitiveCore._ingest_sensory)
@@ -526,7 +533,7 @@ class TurnHandler:
                 await self.tick("lyra", response)
                 await self._finish_exchange(
                     message, response, context, session, turn_id,
-                    retrieval_intended, repo_query_intended,
+                    retrieval_intended, repo_query_intended, repo_context,
                 )
                 return response
             self._history.add(session, "assistant", truncate_at_tool_call(response))
@@ -537,23 +544,28 @@ class TurnHandler:
         await self.tick("lyra", _VISION_FALLBACK)
         await self._finish_exchange(
             message, _VISION_FALLBACK, context, session, turn_id,
-            retrieval_intended, repo_query_intended,
+            retrieval_intended, repo_query_intended, repo_context,
         )
         return _VISION_FALLBACK
 
     async def _finish_exchange(
         self, message: str, response: str, context, session: str, turn_id: int,
-        retrieval_intended: bool, repo_query_intended: bool = False,
+        retrieval_intended: bool, repo_query_intended: bool = False, repo_context=None,
     ) -> None:
         """ingest_exchange() always; the retrieval outcome/consolidator/
         promotion steps only when a retrieval intent actually executed this
         turn (change 4: "one outcome row per EXECUTED retrieval intent" —
         a declined turn produced neither an intent to execute nor context
-        to score); the repo-query citation-check/outcome step only when a
-        repo_query intent executed — independently of retrieval_intended,
-        since the two are unrelated conditions and either can be true
-        without the other (CP-G change 6: even a repo turn with nothing
-        retrieved or nothing cited still gets its outcome row)."""
+        to score); the repo-query citation-check/outcome/consolidation
+        steps only when a repo_query intent executed — independently of
+        retrieval_intended, since the two are unrelated conditions and
+        either can be true without the other (CP-G change 6: even a repo
+        turn with nothing retrieved or nothing cited still gets its
+        outcome row). `repo_context` is the RepoContext retrieve_repo_
+        context() returned this turn (or None) — CP-H needs to know
+        whether commit rows were actually retrieved, not just whether the
+        intent executed, to pick the right citation label (change 1's
+        third vs. fourth branch)."""
         user_atom_id, _lyra_atom_id, context_log_id = await self._core.ingest_exchange(
             message, response, context, session_id=session)
 
@@ -596,6 +608,26 @@ class TurnHandler:
                     "%s turn=%d outcome_id=%d hits=%d misses=%d",
                     REPO_OUTCOME_RECORDED, turn_id, repo_outcome_id, hit_count, miss_count,
                 )
+
+                # CP-H change 2/5: consolidate into the candidate pool,
+                # exactly the way retrieval's own outcome already does
+                # above — reusing consolidate_retrieval_outcome's pattern,
+                # not a second path. had_repo_context distinguishes labels
+                # 3 and 4 of change 1's closed vocabulary (context given
+                # but nothing cited vs. nothing to cite at all); promotion
+                # is not called here at all — it already runs, unconditionally
+                # over every candidate row, from the retrieval branch above
+                # (CP-F's promote_traits(), change 4: "do not gate it, do
+                # not special-case it").
+                had_repo_context = repo_context is not None and bool(repo_context.commit_hashes)
+                citation_consolidated = await self._core.consolidate_repo_citation_outcome(
+                    had_repo_context, hit_count, miss_count, repo_outcome_id)
+                if citation_consolidated is not None:
+                    label, _value = citation_consolidated
+                    log.info(
+                        "%s turn=%d label=%r hits=%d misses=%d",
+                        CITATION_OUTCOME, turn_id, label, hit_count, miss_count,
+                    )
 
 
 def parse_tool_call(response: str) -> str | None:

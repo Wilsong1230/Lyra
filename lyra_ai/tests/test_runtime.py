@@ -278,6 +278,7 @@ class _FakeCore:
         self.repo_context_calls: list[str] = []
         self.repo_citation_calls: list[str] = []
         self.repo_outcomes: list[tuple] = []
+        self.repo_citation_consolidations: list[tuple] = []
         self.memory = MagicMock()
 
     async def tick(self, observations, dt=0.1):
@@ -325,6 +326,16 @@ class _FakeCore:
     async def record_repo_query_outcome(self, user_atom_id, context_log_id, hit_count, miss_count):
         self.repo_outcomes.append((user_atom_id, context_log_id, hit_count, miss_count))
         return len(self.repo_outcomes)
+
+    async def consolidate_repo_citation_outcome(self, had_repo_context, hit_count, miss_count, outcome_id=None):
+        self.repo_citation_consolidations.append((had_repo_context, hit_count, miss_count, outcome_id))
+        if hit_count + miss_count == 0:
+            label = "repo context given but nothing cited" if had_repo_context else "no repo context to cite"
+        elif miss_count > 0:
+            label = "repo citations include a false hash"
+        else:
+            label = "repo citations verified"
+        return (label, "...")
 
 
 def _handler(backend, core=None, vision=None, history=None, now=None):
@@ -588,6 +599,79 @@ def test_repo_query_and_retrieval_both_fire_and_are_independently_recorded():
 
     assert len(core.retrieval_outcomes) == 1
     assert len(core.repo_outcomes) == 1
+
+
+# ── citation consolidation wiring (CP-H) ─────────────────────────────────────
+
+def test_handle_calls_consolidate_repo_citation_outcome_with_had_context_and_counts():
+    backend = _FakeBackend(["reply [aaaaaaa]"])
+    core = _FakeCore(produces_repo_query=True, repo_citations=(1, 1), repo_context=RepoContext(
+        text="## Repository history\n- [aaaaaaa] ...", commit_hashes=["a" * 40],
+    ))
+    handler, _, _ = _handler(backend, core=core)
+    asyncio.run(handler.handle("what commit was that", "s1"))
+
+    assert core.repo_citation_consolidations == [(True, 1, 1, 1)]
+
+
+def test_handle_passes_had_repo_context_false_when_nothing_was_retrieved():
+    backend = _FakeBackend(["reply"])
+    core = _FakeCore(produces_repo_query=True, repo_citations=(0, 0), repo_context=RepoContext(
+        text="", commit_hashes=[],
+    ))
+    handler, _, _ = _handler(backend, core=core)
+    asyncio.run(handler.handle("what commit was that", "s1"))
+
+    assert core.repo_citation_consolidations == [(False, 0, 0, 1)]
+
+
+def test_handle_logs_citation_outcome(caplog):
+    from lyra_core.runtime import CITATION_OUTCOME
+
+    backend = _FakeBackend(["reply [aaaaaaa]"])
+    core = _FakeCore(produces_repo_query=True, repo_citations=(1, 0), repo_context=RepoContext(
+        text="## Repository history\n- [aaaaaaa] ...", commit_hashes=["a" * 40],
+    ))
+    handler, _, _ = _handler(backend, core=core)
+    with caplog.at_level(logging.INFO, logger="lyra_core.runtime"):
+        asyncio.run(handler.handle("what commit was that", "s1"))
+
+    lines = [l for l in caplog.text.splitlines() if CITATION_OUTCOME in l]
+    assert len(lines) == 1
+    assert "label='repo citations verified'" in lines[0]
+    assert "hits=1" in lines[0]
+    assert "misses=0" in lines[0]
+
+
+def test_handle_does_not_call_consolidate_repo_citation_when_repo_query_not_produced():
+    backend = _FakeBackend(["hi there"])
+    handler, core, _ = _handler(backend)  # produces_repo_query=False by default
+    asyncio.run(handler.handle("hello", "s1"))
+
+    assert core.repo_citation_consolidations == []
+
+
+def test_handle_distinguishes_context_no_citation_from_no_context(caplog):
+    """DONE-WHEN: a turn with repo context and no citation, and a turn with
+    no repo context, land under different labels."""
+    from lyra_core.runtime import CITATION_OUTCOME
+
+    backend = _FakeBackend(["reply with nothing cited", "another reply, nothing cited"])
+    core = _FakeCore(produces_repo_query=True, repo_citations=(0, 0), repo_context=RepoContext(
+        text="## Repository history\n- [aaaaaaa] ...", commit_hashes=["a" * 40],
+    ))
+    handler, _, _ = _handler(backend, core=core)
+    with caplog.at_level(logging.INFO, logger="lyra_core.runtime"):
+        asyncio.run(handler.handle("what commit was that", "s1"))
+
+    core._repo_context = RepoContext(text="", commit_hashes=[])
+    with caplog.at_level(logging.INFO, logger="lyra_core.runtime"):
+        asyncio.run(handler.handle("what commit was that", "s1"))
+
+    lines = [l for l in caplog.text.splitlines() if CITATION_OUTCOME in l]
+    assert len(lines) == 2
+    assert "label='repo context given but nothing cited'" in lines[0]
+    assert "label='no repo context to cite'" in lines[1]
 
 
 def test_two_turns_get_two_different_turn_ids(caplog):

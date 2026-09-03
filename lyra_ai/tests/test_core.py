@@ -1168,3 +1168,117 @@ async def test_record_repo_query_outcome_records_zero_zero_turn(store):
     async with store.db.execute("SELECT valence FROM outcomes WHERE id = ?", (outcome_id,)) as cur:
         (valence,) = await cur.fetchone()
     assert valence == 1.0
+
+
+# ── consolidate_repo_citation_outcome (CP-H) ─────────────────────────────────
+
+def test_consolidate_repo_citation_outcome_returns_none_without_a_db():
+    memory = _RecordingMemory()
+    core = CognitiveCore(memory=memory)
+
+    result = asyncio.run(core.consolidate_repo_citation_outcome(
+        had_repo_context=True, hit_count=1, miss_count=0))
+
+    assert result is None
+
+
+async def test_consolidate_repo_citation_outcome_four_labels_are_distinct(store):
+    """Change 1: the four branches must not collapse, checked directly —
+    each of the four (had_repo_context, hit_count, miss_count) inputs below
+    produces a DIFFERENT label."""
+    core = CognitiveCore(memory=store)
+
+    verified = await core.consolidate_repo_citation_outcome(True, hit_count=1, miss_count=0)
+    false_hash = await core.consolidate_repo_citation_outcome(True, hit_count=1, miss_count=1)
+    context_no_citation = await core.consolidate_repo_citation_outcome(True, hit_count=0, miss_count=0)
+    no_context = await core.consolidate_repo_citation_outcome(False, hit_count=0, miss_count=0)
+
+    labels = {verified[0], false_hash[0], context_no_citation[0], no_context[0]}
+    assert len(labels) == 4, f"expected four distinct labels, got {labels}"
+    assert verified[0] == "repo citations verified"
+    assert false_hash[0] == "repo citations include a false hash"
+    assert context_no_citation[0] == "repo context given but nothing cited"
+    assert no_context[0] == "no repo context to cite"
+
+
+async def test_consolidate_repo_citation_outcome_writes_a_candidates_row(store):
+    core = CognitiveCore(memory=store)
+
+    result = await core.consolidate_repo_citation_outcome(True, hit_count=1, miss_count=0, outcome_id=42)
+
+    assert result == (
+        "repo citations verified",
+        "an executed repo-query turn's reply cited one or more hashes, and"
+        " every cited hash was found in the indexed commits",
+    )
+    async with store.db.execute("SELECT trait_name, category, evidence_count FROM candidates") as cur:
+        rows = await cur.fetchall()
+    assert rows == [("repo citations verified", "repo_citation", 1)]
+
+
+async def test_consolidate_repo_citation_outcome_strengthens_on_repeat(store):
+    """Closed-vocabulary dedup: repeating the SAME branch increments the
+    existing candidate rather than inserting a second row (CP-E's
+    mechanism, reused unmodified)."""
+    core = CognitiveCore(memory=store)
+    for _ in range(3):
+        await core.consolidate_repo_citation_outcome(True, hit_count=1, miss_count=0, outcome_id=1)
+
+    async with store.db.execute("SELECT trait_name, evidence_count FROM candidates") as cur:
+        rows = await cur.fetchall()
+    assert rows == [("repo citations verified", 3)]
+
+
+async def test_consolidate_repo_citation_outcome_keeps_different_labels_separate(store):
+    core = CognitiveCore(memory=store)
+    await core.consolidate_repo_citation_outcome(True, hit_count=1, miss_count=0, outcome_id=1)
+    await core.consolidate_repo_citation_outcome(True, hit_count=1, miss_count=1, outcome_id=2)
+    await core.consolidate_repo_citation_outcome(True, hit_count=0, miss_count=0, outcome_id=3)
+    await core.consolidate_repo_citation_outcome(False, hit_count=0, miss_count=0, outcome_id=4)
+
+    async with store.db.execute(
+        "SELECT trait_name, evidence_count FROM candidates ORDER BY trait_name"
+    ) as cur:
+        rows = await cur.fetchall()
+    assert rows == [
+        ("no repo context to cite", 1),
+        ("repo citations include a false hash", 1),
+        ("repo citations verified", 1),
+        ("repo context given but nothing cited", 1),
+    ]
+
+
+async def test_consolidate_repo_citation_outcome_provenance_via_evidence_text(store):
+    """Change 3: contributing outcome rows recoverable per candidate — the
+    exact evidence_text accumulation mechanism CP-E built and CP-G's
+    retrieval consolidator already reuses, reused again here unmodified."""
+    core = CognitiveCore(memory=store)
+    await core.consolidate_repo_citation_outcome(True, hit_count=1, miss_count=1, outcome_id=7)
+    await core.consolidate_repo_citation_outcome(True, hit_count=0, miss_count=1, outcome_id=9)
+
+    async with store.db.execute(
+        "SELECT evidence_text FROM candidates WHERE trait_name = 'repo citations include a false hash'"
+    ) as cur:
+        (evidence_text,) = await cur.fetchone()
+    assert evidence_text == "outcome_id=7\noutcome_id=9"
+
+
+async def test_repo_citation_candidate_promotes_via_the_existing_promote_traits(store):
+    """Change 4: promotion is not special-cased — the same promote_traits()
+    CP-F wired picks up a repo_citation candidate once it crosses
+    TRAIT_THRESHOLDS['surface'] (5), with no new call site."""
+    core = CognitiveCore(memory=store)
+    for i in range(5):
+        await core.consolidate_repo_citation_outcome(True, hit_count=1, miss_count=0, outcome_id=i)
+
+    promotions = await core.promote_traits()
+
+    assert promotions == [{
+        "trait_name": "repo citations verified",
+        "evidence_count": 5,
+        "threshold": 5,
+        "stability": "surface",
+    }]
+    async with store.db.execute("SELECT name, stability FROM traits") as cur:
+        rows = await cur.fetchall()
+    assert rows == [("repo citations verified", "surface")]

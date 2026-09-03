@@ -33,7 +33,15 @@ class Candidate(BaseModel):
     # know about is not a retrieval-path bug, it is every candidate in the
     # store failing to load, dream-derived ones included. See DECISIONS.md
     # (CP-F, change 1).
-    category: Literal["behavioral", "emotional", "relational", "cognitive", "retrieval"]
+    # CP-H: "repo_citation" added — the same finding CP-F made for
+    # "retrieval", recurring: CognitiveCore.consolidate_repo_citation_
+    # outcome() (interface.py) writes candidates rows with category=
+    # "repo_citation", and CandidatePool.get_candidates() validates every
+    # `candidates` row into a Candidate regardless of category, so an
+    # unlisted category is not scoped to repo-citation candidates failing
+    # to load — it is every candidate in the store failing to load the
+    # moment one repo_citation row exists. See DECISIONS.md (CP-H, change 1).
+    category: Literal["behavioral", "emotional", "relational", "cognitive", "retrieval", "repo_citation"]
     evidence_text: str | None = None
 
 
