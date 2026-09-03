@@ -16,6 +16,7 @@ Reserved seams present in Phase 0 (inert until noted phase):
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -48,6 +49,7 @@ class IntentKind(str, Enum):
     noop       = "noop"
     research   = "research"   # RESERVED — deliberate information-seeking
     retrieval  = "retrieval"  # CP-D: retrieve context for the turn in progress
+    repo_query = "repo_query" # CP-G: answer over indexed repo commit history
 
 
 # ── Port types ────────────────────────────────────────────────────────────────
@@ -196,6 +198,105 @@ _EXCHANGE_OBS_SOURCES: frozenset[str] = frozenset(_ATOM_SPEAKER_BY_OBS_SOURCE)
 # from "tried and found nothing." Change 3's own requirement: a declined
 # turn is still a visible row, not an absent one.
 DECLINED_MARKER = "retrieval: declined"
+
+# ── CP-G: repo query ────────────────────────────────────────────────────────
+#
+# The `facts` row shape a repo_index.py commit becomes (change 1 — see
+# DECISIONS.md for the full comparison against atoms/entities):
+#   subject      = the commit's full 40-hex-char hash (idempotency key —
+#                   query existing subjects to skip already-indexed commits;
+#                   also the citation-validation key, via a prefix LIKE).
+#   text         = "[<short-hash>] <date> <author>: <subject-line>" — already
+#                   in the exact bracketed-citation form the repo-context
+#                   block displays, so retrieval does no reformatting.
+#   source_kind  = "repo_commit" — not one of FACT_CONFIDENCE's four values
+#                  (stated/observed/document/inferred); source_kind has no DB
+#                  CHECK constraint (schema.py enforces `source`/`environment`
+#                  vocab in Python for the same reason — a growing vocabulary
+#                  cannot be a CHECK constraint under a no-migration schema),
+#                  so this needed no schema change, matching OUT OF SCOPE.
+#   confidence   = 1.0 — a commit hash either is or is not in `git log`; there
+#                  is no epistemic gradient to weigh, unlike a stated/
+#                  inferred fact about the world.
+#   source_atom_id = NULL — not derived from any atom she experienced.
+#   valid_from   = the commit's own author timestamp; ts = indexing time —
+#                  the schema's existing distinction between "when this
+#                  became true" and "when this row was written" is exactly
+#                  right for a commit indexed long after it happened.
+#
+# Distinguishable from a lived experience: a `facts` row with source_kind=
+# "repo_commit" is never atoms-table content, so it is structurally
+# unreachable by DreamPass._input_atoms() (reads `atoms` only) — a commit
+# cannot become dream input, a candidate, or a promoted trait no matter what
+# it says, the same "cannot write to her identity" property
+# DREAM_EXCLUDED_SOURCES gives sandbox_read atoms, achieved here for free by
+# never being an atom in the first place.
+#
+# Excluded from ordinary conversational retrieval by construction, not by a
+# new filter: store/context.py's `_facts_block` (OUT OF SCOPE forbids
+# touching it) only injects a fact when a query word exactly matches its
+# `subject` — and a repo commit's subject is a 40-hex-char hash, a string
+# that essentially never appears as a token in ordinary conversation. Repo
+# rows are retrieved by a wholly separate path — retrieve_repo_context()
+# below, wired to a NEW intent kind, not the recall/semantic/lexical/
+# temporal machinery `_recall_block` runs (which has no source filter at
+# all and would have leaked commit rows into every conversational turn had
+# this checkpoint used `atoms` instead — the reason `facts` was chosen).
+REPO_COMMIT_SOURCE_KIND = "repo_commit"
+
+# CP-G change 3: deterministic content trigger, not a drive/pressure —
+# action_selection.py (drives) is OUT OF SCOPE this checkpoint, so
+# repo_query does not go through ActionSelector the way retrieval does.
+# tick() below checks the turn's own conversational text directly against
+# this fixed keyword set and appends the intent itself when it matches.
+# Simpler than retrieval's frustration-gated design on purpose: CHANGES
+# never asks for frustration-gating here, and building it would mean
+# extending action_selection.py, which is forbidden.
+_REPO_QUERY_KEYWORDS: frozenset[str] = frozenset({
+    "commit", "commits", "committed", "checkpoint", "checkpoints",
+    "repo", "repository", "codebase",
+})
+
+
+def _looks_like_repo_query(observations: list["Observation"]) -> bool:
+    """True iff this tick's conversational observation's text plausibly asks
+    about the repo's commit history — a fixed keyword substring check
+    against the "conversation" observation only (never her own "lyra" turn,
+    same restriction retrieval's awaiting_reply already applies)."""
+    for obs in observations:
+        if obs.kind == ObservationKind.sensory and obs.source == "conversation":
+            text_lower = obs.content.lower()
+            if any(kw in text_lower for kw in _REPO_QUERY_KEYWORDS):
+                return True
+    return False
+
+
+# Bounds how many commit rows one repo-query turn injects — the analogue of
+# CONTEXT_BUDGETS["recall"] (store/context.py, OUT OF SCOPE to touch) but a
+# row count rather than a token budget: commit lines are short and uniform
+# (one line each, already truncated to a single subject line at index time),
+# so counting rows is simple and sufficient rather than needing a second
+# token-budget mechanism duplicating context.py's.
+_REPO_QUERY_ROW_LIMIT = 10
+
+_HEX_TOKEN_RE = re.compile(r"\b[0-9a-f]{7,40}\b")
+_REPO_WORD_RE = re.compile(r"[A-Za-z0-9_]+")
+# CP-G change 4/5: the exact citation form repo commit `text` rows are
+# stored in and the block instructs the model to use — bracketed hash,
+# 7-40 lowercase hex chars (matches git's own abbreviation range up to a
+# full hash). Parsed out of her reply for change 5's outcome check.
+_CITATION_RE = re.compile(r"\[([0-9a-f]{7,40})\]")
+
+
+@dataclass
+class RepoContext:
+    """What retrieve_repo_context() found — the repo-query analogue of
+    lyra_memory.store.context.ContextResult, deliberately much smaller (one
+    block, no budget accounting, no misses list): CHANGES scopes this
+    checkpoint to commit metadata only, not a second context-assembly
+    system."""
+    text: str
+    commit_hashes: list[str]
 
 
 class CognitiveCore:
@@ -616,6 +717,146 @@ class CognitiveCore:
         pool = CandidatePool(db)
         return await IdentityEngine(db, pool).consolidate()
 
+    async def retrieve_repo_context(self, query: str) -> RepoContext:
+        """Read-only lookup over indexed repo commits (CP-G change 4) — the
+        repo-query analogue of retrieve_context(), but a plain SQL scan over
+        `facts WHERE source_kind = 'repo_commit'`, not build_context()
+        (OUT OF SCOPE forbids touching retrieval, and this is deliberately
+        a separate, much simpler mechanism, not a second recall system).
+
+        Two passes, in order:
+          1. Any hex-looking token in `query` (7-40 hex chars) is tried as a
+             commit-hash PREFIX first — "what does commit abc1234 do" is a
+             stronger, better-defined request than a keyword search.
+          2. If fewer than _REPO_QUERY_ROW_LIMIT rows were found this way,
+             fill the remainder with a plain substring OR-search over the
+             stored commit lines using the query's own words (short/
+             stopword-free tokens only) — no FTS index (a new virtual table
+             would be a schema change, forbidden); a LIKE scan is adequate
+             at the scale of one repository's commit metadata.
+
+        Returns an EMPTY RepoContext (never None) when memory has no `.db`
+        or nothing matched — change 6 treats "nothing retrieved" as a
+        recorded, executed intent, not an absent one; the caller
+        (runtime.py) is what decides whether to log/record, not this
+        method returning a sentinel.
+        """
+        db = getattr(self._memory, "db", None)
+        if db is None:
+            return RepoContext(text="", commit_hashes=[])
+
+        rows: list[tuple[str, str]] = []
+        seen: set[str] = set()
+
+        for tok in _HEX_TOKEN_RE.findall((query or "").lower()):
+            async with db.execute(
+                "SELECT subject, text FROM facts WHERE source_kind = ?"
+                " AND subject LIKE ? ORDER BY valid_from DESC LIMIT ?",
+                (REPO_COMMIT_SOURCE_KIND, tok + "%", _REPO_QUERY_ROW_LIMIT),
+            ) as cur:
+                for subject, text in await cur.fetchall():
+                    if subject not in seen:
+                        rows.append((subject, text))
+                        seen.add(subject)
+
+        if len(rows) < _REPO_QUERY_ROW_LIMIT:
+            tokens = [
+                t.lower() for t in _REPO_WORD_RE.findall(query or "")
+                if len(t) > 2
+            ]
+            if tokens:
+                clauses = " OR ".join("text LIKE ?" for _ in tokens)
+                params = [f"%{t}%" for t in tokens]
+                async with db.execute(
+                    f"SELECT subject, text FROM facts WHERE source_kind = ?"
+                    f" AND ({clauses}) ORDER BY valid_from DESC LIMIT ?",
+                    (REPO_COMMIT_SOURCE_KIND, *params, _REPO_QUERY_ROW_LIMIT),
+                ) as cur:
+                    for subject, text in await cur.fetchall():
+                        if subject not in seen and len(rows) < _REPO_QUERY_ROW_LIMIT:
+                            rows.append((subject, text))
+                            seen.add(subject)
+
+        if not rows:
+            return RepoContext(text="", commit_hashes=[])
+
+        lines = [f"- {text}" for _subject, text in rows]
+        heading = (
+            "## Repository history (git log metadata for this repository — "
+            "not something you experienced, and not conversation. Cite the "
+            "bracketed hash, e.g. [abc1234], for any commit you rely on. Do "
+            "not cite a hash you have not seen here.)"
+        )
+        return RepoContext(
+            text=heading + "\n" + "\n".join(lines),
+            commit_hashes=[subject for subject, _text in rows],
+        )
+
+    async def check_repo_citations(self, reply_text: str) -> tuple[int, int]:
+        """Change 5's outcome bit: parse every `[hash]` citation out of
+        `reply_text` and check each against the FULL indexed set (a prefix
+        LIKE against `facts.subject`, not just the rows this turn happened
+        to retrieve — a reply may correctly cite a commit from an earlier
+        turn's context or from her own prior knowledge of this repo, and
+        that is still a real hit). Returns (hit_count, miss_count), counted
+        per citation occurrence, not deduplicated — a hash cited twice is
+        two citations to check, not one.
+
+        Deliberately does not suppress, retry, or repair anything (change
+        5's own words) — a miss is simply counted.
+        """
+        db = getattr(self._memory, "db", None)
+        hashes = _CITATION_RE.findall(reply_text or "")
+        if db is None or not hashes:
+            return (0, 0)
+
+        hit = miss = 0
+        for h in hashes:
+            async with db.execute(
+                "SELECT 1 FROM facts WHERE source_kind = ? AND subject LIKE ? LIMIT 1",
+                (REPO_COMMIT_SOURCE_KIND, h.lower() + "%"),
+            ) as cur:
+                row = await cur.fetchone()
+            if row is not None:
+                hit += 1
+            else:
+                miss += 1
+        return (hit, miss)
+
+    async def record_repo_query_outcome(
+        self, user_atom_id: int, context_log_id: int | None, hit_count: int, miss_count: int,
+    ) -> int | None:
+        """One outcomes row per executed repo_query intent (change 5/6) —
+        always recorded when the intent executed, including a (0, 0) turn
+        (change 6: zero citations is a recorded outcome, not an absent
+        row). `environment` packs hit/miss counts the same free-text
+        `key=value;...` way record_retrieval_outcome's `environment` already
+        does (OUT OF SCOPE forbids a schema change to give them real
+        columns) — `kind=repo_query` at the front lets report.py select
+        just these rows out of the shared `outcomes` table without a new
+        column to filter on.
+
+        valence is the FALSE/not-FALSE bit change 5 asks for: 0.0 the
+        moment miss_count > 0 (a hash cited that is not in the index is a
+        false outcome, full stop — one miss makes the whole outcome
+        false), 1.0 otherwise (every citation checked out, including the
+        zero-citations case — there was nothing to be wrong about).
+        """
+        record_outcome = getattr(self._memory, "record_outcome", None)
+        if record_outcome is None:
+            return None
+        valence = 0.0 if miss_count > 0 else 1.0
+        return await record_outcome(
+            intent_atom_id=user_atom_id,
+            valence=valence,
+            actual="citations_invalid" if miss_count > 0 else "citations_valid",
+            predicted="citations_valid",
+            environment=(
+                f"kind=repo_query;context_log_id={context_log_id};"
+                f"hits={hit_count};misses={miss_count}"
+            ),
+        )
+
     async def _ingest_outcome(self, obs: Observation) -> None:
         if obs.predicted is None or obs.actual is None:
             return
@@ -719,6 +960,17 @@ class CognitiveCore:
             "retrieval": _RETRIEVAL_PRESSURE if awaiting_reply else 0.0,
         }
         intents = self._selector.select(pressures, self._affect.state, bias=bias)
+
+        # CP-G: repo_query is NOT one of ActionSelector's pressures — see
+        # this module's _looks_like_repo_query docstring for why (drives/
+        # action_selection.py are out of this checkpoint's scope). Appended
+        # directly, same restriction as retrieval's awaiting_reply (only on
+        # the tick where a fresh "conversation" observation arrived), before
+        # gating so it goes through the exact same ALLOWED_KINDS chokepoint
+        # every other intent does.
+        if awaiting_reply and _looks_like_repo_query(observations):
+            intents.append(Intent(kind=IntentKind.repo_query, payload={"reason": "repo"}))
+
         intents = self._gate_intents(intents)
 
         return intents, self._affect.state

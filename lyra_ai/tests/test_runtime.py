@@ -28,7 +28,7 @@ import pytest
 from lyra.assistant import LAYER1_FACTS, LyraClient
 from lyra_core import runtime
 from lyra_core.affect import AffectEngine
-from lyra_core.interface import AffectState, CognitiveCore, Intent, IntentKind
+from lyra_core.interface import AffectState, CognitiveCore, Intent, IntentKind, RepoContext
 from lyra_core.runtime import (
     CANDIDATE_CREATED,
     CONSOLIDATOR_FIRED,
@@ -258,6 +258,9 @@ class _FakeCore:
         self, affect: AffectState | None = None, context: "ContextResult | None" = None,
         retrieve_context_error: Exception | None = None,
         produces_retrieval: bool = True,
+        produces_repo_query: bool = False,
+        repo_context: "RepoContext | None" = None,
+        repo_citations: tuple[int, int] = (0, 0),
     ) -> None:
         self.ticks: list[tuple[str, str, float]] = []
         self.exchanges: list[tuple[str, str, object, object]] = []
@@ -269,6 +272,12 @@ class _FakeCore:
         self._context = context if context is not None else _context_result("")
         self._retrieve_context_error = retrieve_context_error
         self._produces_retrieval = produces_retrieval
+        self._produces_repo_query = produces_repo_query
+        self._repo_context = repo_context if repo_context is not None else RepoContext(text="", commit_hashes=[])
+        self._repo_citations = repo_citations
+        self.repo_context_calls: list[str] = []
+        self.repo_citation_calls: list[str] = []
+        self.repo_outcomes: list[tuple] = []
         self.memory = MagicMock()
 
     async def tick(self, observations, dt=0.1):
@@ -277,6 +286,8 @@ class _FakeCore:
         intents = []
         if self._produces_retrieval and any(o.source == "conversation" for o in observations):
             intents.append(Intent(kind=IntentKind.retrieval, payload={"reason": "turn"}))
+        if self._produces_repo_query and any(o.source == "conversation" for o in observations):
+            intents.append(Intent(kind=IntentKind.repo_query, payload={"reason": "repo"}))
         return intents, self._affect
 
     def introspect(self) -> AffectState:
@@ -302,6 +313,18 @@ class _FakeCore:
     async def promote_traits(self):
         self.promote_traits_calls += 1
         return self._promotions
+
+    async def retrieve_repo_context(self, query):
+        self.repo_context_calls.append(query)
+        return self._repo_context
+
+    async def check_repo_citations(self, reply_text):
+        self.repo_citation_calls.append(reply_text)
+        return self._repo_citations
+
+    async def record_repo_query_outcome(self, user_atom_id, context_log_id, hit_count, miss_count):
+        self.repo_outcomes.append((user_atom_id, context_log_id, hit_count, miss_count))
+        return len(self.repo_outcomes)
 
 
 def _handler(backend, core=None, vision=None, history=None, now=None):
@@ -471,6 +494,100 @@ def test_handle_logs_no_trait_promoted_when_promote_traits_returns_none(caplog):
         asyncio.run(handler.handle("hello", "s1"))
 
     assert not any(TRAIT_PROMOTED in l for l in caplog.text.splitlines())
+
+
+# ── repo_query wiring (CP-G) ─────────────────────────────────────────────────
+
+def test_handle_does_not_call_repo_methods_when_not_produced():
+    backend = _FakeBackend(["hi there"])
+    handler, core, _ = _handler(backend)  # produces_repo_query=False by default
+    asyncio.run(handler.handle("hello", "s1"))
+
+    assert core.repo_context_calls == []
+    assert core.repo_citation_calls == []
+    assert core.repo_outcomes == []
+
+
+def test_handle_logs_repo_query_produced_and_executed_when_signaled(caplog):
+    from lyra_core.runtime import REPO_QUERY_EXECUTED, REPO_QUERY_PRODUCED
+
+    backend = _FakeBackend(["here is [aaaaaaa]"])
+    core = _FakeCore(produces_repo_query=True, repo_context=RepoContext(
+        text="## Repository history\n- [aaaaaaa] ...", commit_hashes=["a" * 40],
+    ))
+    handler, _, _ = _handler(backend, core=core)
+    with caplog.at_level(logging.INFO, logger="lyra_core.runtime"):
+        asyncio.run(handler.handle("what commit was that", "s1"))
+
+    lines = caplog.text.splitlines()
+    assert any(REPO_QUERY_PRODUCED in l for l in lines)
+    assert any(REPO_QUERY_EXECUTED in l and "commit_count=1" in l for l in lines)
+
+
+def test_handle_includes_repo_context_in_the_system_prompt():
+    backend = _FakeBackend(["hi there"])
+    core = _FakeCore(produces_repo_query=True, repo_context=RepoContext(
+        text="## Repository history\n- [aaaaaaa] a commit line", commit_hashes=["a" * 40],
+    ))
+    handler, _, _ = _handler(backend, core=core)
+    asyncio.run(handler.handle("what commit was that", "s1"))
+
+    system = backend.calls[0][1]
+    assert "## Repository history" in system
+    assert "[aaaaaaa]" in system
+
+
+def test_handle_calls_check_repo_citations_with_the_reply_text():
+    backend = _FakeBackend(["cited [aaaaaaa] right here"])
+    core = _FakeCore(produces_repo_query=True)
+    handler, _, _ = _handler(backend, core=core)
+    asyncio.run(handler.handle("what commit was that", "s1"))
+
+    assert core.repo_citation_calls == ["cited [aaaaaaa] right here"]
+
+
+def test_handle_records_repo_outcome_with_hit_and_miss_counts():
+    backend = _FakeBackend(["reply"])
+    core = _FakeCore(produces_repo_query=True, repo_citations=(2, 1))
+    handler, _, _ = _handler(backend, core=core)
+    asyncio.run(handler.handle("what commit was that", "s1"))
+
+    assert core.repo_outcomes == [(1, 99, 2, 1)]
+
+
+def test_handle_logs_repo_outcome_recorded(caplog):
+    from lyra_core.runtime import REPO_OUTCOME_RECORDED
+
+    backend = _FakeBackend(["reply"])
+    core = _FakeCore(produces_repo_query=True, repo_citations=(1, 1))
+    handler, _, _ = _handler(backend, core=core)
+    with caplog.at_level(logging.INFO, logger="lyra_core.runtime"):
+        asyncio.run(handler.handle("what commit was that", "s1"))
+
+    lines = [l for l in caplog.text.splitlines() if REPO_OUTCOME_RECORDED in l]
+    assert len(lines) == 1
+    assert "hits=1" in lines[0]
+    assert "misses=1" in lines[0]
+
+
+def test_handle_records_repo_outcome_even_with_zero_zero_citations():
+    """Change 6: no repo rows retrieved / nothing cited is still recorded."""
+    backend = _FakeBackend(["reply with nothing cited"])
+    core = _FakeCore(produces_repo_query=True, repo_citations=(0, 0))
+    handler, _, _ = _handler(backend, core=core)
+    asyncio.run(handler.handle("what commit was that", "s1"))
+
+    assert core.repo_outcomes == [(1, 99, 0, 0)]
+
+
+def test_repo_query_and_retrieval_both_fire_and_are_independently_recorded():
+    backend = _FakeBackend(["reply [aaaaaaa]"])
+    core = _FakeCore(produces_retrieval=True, produces_repo_query=True, repo_citations=(1, 0))
+    handler, _, _ = _handler(backend, core=core)
+    asyncio.run(handler.handle("what commit fixed the retrieval loop", "s1"))
+
+    assert len(core.retrieval_outcomes) == 1
+    assert len(core.repo_outcomes) == 1
 
 
 def test_two_turns_get_two_different_turn_ids(caplog):

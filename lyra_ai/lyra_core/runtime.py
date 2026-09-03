@@ -101,6 +101,19 @@ CANDIDATE_CREATED = "CANDIDATE_CREATED"
 # time this turn, zero or more times per turn (usually zero).
 TRAIT_PROMOTED = "TRAIT_PROMOTED"
 
+# CP-G: repo_query's own markers, deliberately NOT sharing INTENT_PRODUCED/
+# INTENT_EXECUTED/OUTCOME_RECORDED — those three are counted by report.py's
+# existing _loop_log_section/_outcomes_section as retrieval-specific
+# measurements (their own docstrings say so); reusing them here would
+# silently fold repo-query counts into fields CHANGES never asked this
+# checkpoint to touch. repo_query has no INTENT_DECLINED equivalent — see
+# interface.py's _looks_like_repo_query: it is a deterministic content
+# trigger, not a frustration-gated drive, so there is no "produced but
+# overridden" state to log.
+REPO_QUERY_PRODUCED = "REPO_QUERY_PRODUCED"
+REPO_QUERY_EXECUTED = "REPO_QUERY_EXECUTED"
+REPO_OUTCOME_RECORDED = "REPO_OUTCOME_RECORDED"
+
 # Tables the hot path and the current retrieval queries reference (CP-B —
 # Store's schema, lyra_memory/store/schema.py, not the older db.py):
 #   atoms       — every turn is written here (CognitiveCore._ingest_sensory)
@@ -398,8 +411,9 @@ class TurnHandler:
             temperament.valence, temperament.arousal, temperament_c,
         )
 
-    def _compose_system_prompt(self, context) -> str:
-        """LAYER1 + whatever retrieve_context() returned + the affect hint.
+    def _compose_system_prompt(self, context, repo_context=None) -> str:
+        """LAYER1 + whatever retrieve_context() returned + repo context (CP-G)
+        + the affect hint.
 
         Takes an already-fetched ContextResult (CP-D.0) rather than a query
         string and fetching it here: handle() needs that same ContextResult
@@ -410,10 +424,19 @@ class TurnHandler:
         an empty ContextResult would, just without ever having asked.
         Unguarded on purpose, same as before: a broken store and an empty
         store must not produce the same prompt.
+
+        `repo_context` (CP-G change 4) is a RepoContext or None — its own
+        block, appended after conversational context and before the affect
+        hint, with a heading that makes it structurally distinguishable
+        from `context.text` (change 1's "must be distinguishable in the
+        store" requirement extended to the prompt itself: a commit is not
+        something she experienced, and the block says so).
         """
         parts = [self._system]
         if context is not None and context.text:
             parts.append(context.text)
+        if repo_context is not None and repo_context.text:
+            parts.append(repo_context.text)
         hint = prose_hint(self._core.introspect())
         if hint:
             parts.append(hint)
@@ -477,14 +500,34 @@ class TurnHandler:
             )
             context = None
 
-        system = self._compose_system_prompt(context)
+        # CP-G: repo_query has no decline branch (interface.py's
+        # _looks_like_repo_query is a deterministic content trigger, not a
+        # frustration-gated drive) — it is either produced-and-executed
+        # this turn, or it never appears in last_intents at all, in which
+        # case there is nothing to log (see REPO_QUERY_PRODUCED's own
+        # comment above).
+        repo_query_intended = any(i.kind == IntentKind.repo_query for i in self.last_intents)
+        if repo_query_intended:
+            log.info("%s turn=%d kind=repo_query", REPO_QUERY_PRODUCED, turn_id)
+            repo_context = await self._core.retrieve_repo_context(message)
+            log.info(
+                "%s turn=%d kind=repo_query commit_count=%d",
+                REPO_QUERY_EXECUTED, turn_id, len(repo_context.commit_hashes),
+            )
+        else:
+            repo_context = None
+
+        system = self._compose_system_prompt(context, repo_context)
         for _ in range(_VISION_ATTEMPTS):
             response = await self._complete(session, system)
             source = parse_tool_call(response)
             if source is None:
                 self._history.add(session, "assistant", response)
                 await self.tick("lyra", response)
-                await self._finish_exchange(message, response, context, session, turn_id, retrieval_intended)
+                await self._finish_exchange(
+                    message, response, context, session, turn_id,
+                    retrieval_intended, repo_query_intended,
+                )
                 return response
             self._history.add(session, "assistant", truncate_at_tool_call(response))
             description = await asyncio.to_thread(self._vision_fn, source)
@@ -492,51 +535,67 @@ class TurnHandler:
             self._history.add(session, "user", f"[Vision result: {description}]")
         self._history.add(session, "assistant", _VISION_FALLBACK)
         await self.tick("lyra", _VISION_FALLBACK)
-        await self._finish_exchange(message, _VISION_FALLBACK, context, session, turn_id, retrieval_intended)
+        await self._finish_exchange(
+            message, _VISION_FALLBACK, context, session, turn_id,
+            retrieval_intended, repo_query_intended,
+        )
         return _VISION_FALLBACK
 
     async def _finish_exchange(
         self, message: str, response: str, context, session: str, turn_id: int,
-        retrieval_intended: bool,
+        retrieval_intended: bool, repo_query_intended: bool = False,
     ) -> None:
-        """ingest_exchange() always; the outcome/consolidator steps only
-        when a retrieval intent actually executed this turn (change 4:
-        "one outcome row per EXECUTED retrieval intent" — a declined turn
-        produced neither an intent to execute nor context to score)."""
+        """ingest_exchange() always; the retrieval outcome/consolidator/
+        promotion steps only when a retrieval intent actually executed this
+        turn (change 4: "one outcome row per EXECUTED retrieval intent" —
+        a declined turn produced neither an intent to execute nor context
+        to score); the repo-query citation-check/outcome step only when a
+        repo_query intent executed — independently of retrieval_intended,
+        since the two are unrelated conditions and either can be true
+        without the other (CP-G change 6: even a repo turn with nothing
+        retrieved or nothing cited still gets its outcome row)."""
         user_atom_id, _lyra_atom_id, context_log_id = await self._core.ingest_exchange(
             message, response, context, session_id=session)
 
-        if not retrieval_intended:
-            return
+        if retrieval_intended:
+            atom_count, path = self._retrieval_path(context)
+            outcome_id = await self._core.record_retrieval_outcome(
+                user_atom_id, context_log_id, atom_count, path)
+            if outcome_id is not None:
+                log.info(
+                    "%s turn=%d outcome_id=%d atom_count=%d path=%s context_log_id=%s",
+                    OUTCOME_RECORDED, turn_id, outcome_id, atom_count, path, context_log_id,
+                )
 
-        atom_count, path = self._retrieval_path(context)
-        outcome_id = await self._core.record_retrieval_outcome(
-            user_atom_id, context_log_id, atom_count, path)
-        if outcome_id is None:
-            return
-        log.info(
-            "%s turn=%d outcome_id=%d atom_count=%d path=%s context_log_id=%s",
-            OUTCOME_RECORDED, turn_id, outcome_id, atom_count, path, context_log_id,
-        )
+                consolidated = await self._core.consolidate_retrieval_outcome(atom_count > 0, outcome_id)
+                log.info("%s turn=%d outcome_id=%d", CONSOLIDATOR_FIRED, turn_id, outcome_id)
+                if consolidated is not None:
+                    trait_name, _trait_value = consolidated
+                    log.info("%s turn=%d trait_name=%r", CANDIDATE_CREATED, turn_id, trait_name)
 
-        consolidated = await self._core.consolidate_retrieval_outcome(atom_count > 0, outcome_id)
-        log.info("%s turn=%d outcome_id=%d", CONSOLIDATOR_FIRED, turn_id, outcome_id)
-        if consolidated is not None:
-            trait_name, _trait_value = consolidated
-            log.info("%s turn=%d trait_name=%r", CANDIDATE_CREATED, turn_id, trait_name)
+                # CP-F change 2: promotion runs after consolidation, every
+                # turn — IdentityEngine.consolidate() is cheap (one SELECT
+                # over candidates plus, at most, the handful of rows that
+                # actually changed) and idempotent when nothing crosses a
+                # threshold, so there is no reason to gate it behind
+                # consolidated being non-None.
+                promotions = await self._core.promote_traits()
+                for promotion in promotions:
+                    log.info(
+                        "%s turn=%d trait_name=%r evidence_count=%d threshold=%d",
+                        TRAIT_PROMOTED, turn_id, promotion["trait_name"],
+                        promotion["evidence_count"], promotion["threshold"],
+                    )
 
-        # CP-F change 2: promotion runs after consolidation, every turn —
-        # IdentityEngine.consolidate() is cheap (one SELECT over candidates
-        # plus, at most, the handful of rows that actually changed) and
-        # idempotent when nothing crosses a threshold, so there is no
-        # reason to gate it behind consolidated being non-None.
-        promotions = await self._core.promote_traits()
-        for promotion in promotions:
-            log.info(
-                "%s turn=%d trait_name=%r evidence_count=%d threshold=%d",
-                TRAIT_PROMOTED, turn_id, promotion["trait_name"],
-                promotion["evidence_count"], promotion["threshold"],
-            )
+        if repo_query_intended:
+            hit_count, miss_count = await self._core.check_repo_citations(response)
+            repo_outcome_id = await self._core.record_repo_query_outcome(
+                user_atom_id, context_log_id, hit_count, miss_count)
+            if repo_outcome_id is not None:
+                log.info(
+                    "%s turn=%d outcome_id=%d hits=%d misses=%d",
+                    REPO_OUTCOME_RECORDED, turn_id, repo_outcome_id, hit_count, miss_count,
+                )
 
 
 def parse_tool_call(response: str) -> str | None:

@@ -441,3 +441,102 @@ def test_render_includes_candidate_gap_line():
     m = {"_candidate_gaps": [("retrieval finds relevant context", 3, 2)]}
     text = render(m, window_days=7)
     assert "retrieval finds relevant context: evidence=3  gap=2" in text
+
+
+# ── repo index / repo-query outcomes (CP-G change 8) ────────────────────────
+
+async def _index_one_commit(store, full_hash="a" * 40, valid_from=1_700_000_000.0):
+    await store.db.execute(
+        "INSERT INTO facts (ts, subject, text, source_atom_id, source_kind, confidence, valid_from, valid_until)"
+        " VALUES (?, ?, ?, NULL, 'repo_commit', 1.0, ?, NULL)",
+        (time.time(), full_hash, f"[{full_hash[:7]}] 2026-09-02 Claude: a commit", valid_from),
+    )
+    await store.db.commit()
+
+
+async def test_collect_measurements_commits_indexed_counts_repo_commit_facts(store, tmp_path):
+    await _index_one_commit(store, full_hash="a" * 40)
+    await _index_one_commit(store, full_hash="b" * 40)
+    await store.db.execute(
+        "INSERT INTO facts (ts, subject, text, source_kind, confidence, valid_from)"
+        " VALUES (?, 'Wilson', 'graduated from FGCU', 'stated', 0.9, ?)",
+        (time.time(), time.time()),
+    )
+    await store.db.commit()
+
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["commits_indexed"] == 2
+
+
+async def test_collect_measurements_repo_citations_zero_on_a_fresh_store(store, tmp_path):
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["commits_indexed"] == 0
+    assert m["repo_citations_checked_window"] == 0
+    assert m["repo_citations_hit_window"] == 0
+    assert m["repo_citations_miss_window"] == 0
+    assert m["repo_citation_false_rate_window"] == 0.0
+
+
+async def test_collect_measurements_repo_citations_reads_outcomes_environment(store, tmp_path):
+    from lyra_core.interface import CognitiveCore
+
+    core = CognitiveCore(memory=store)
+    await _index_one_commit(store, full_hash="a" * 40)
+    user_id = await store.append_atom(speaker="wilson", source="cli", text="what commit was that")
+    await core.record_repo_query_outcome(user_id, context_log_id=1, hit_count=2, miss_count=1)
+
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["repo_citations_checked_window"] == 3
+    assert m["repo_citations_hit_window"] == 2
+    assert m["repo_citations_miss_window"] == 1
+    assert m["repo_citation_false_rate_window"] == pytest.approx(1 / 3)
+
+
+async def test_collect_measurements_repo_citations_does_not_count_retrieval_outcomes(store, tmp_path):
+    """A retrieval outcome's `environment` (context_log_id=...;atom_count=...)
+    must not be mistaken for a repo-query outcome — only rows whose
+    environment starts with 'kind=repo_query' are counted."""
+    from lyra_core.interface import CognitiveCore
+
+    core = CognitiveCore(memory=store)
+    user_id = await store.append_atom(speaker="wilson", source="cli", text="hi")
+    await core.record_retrieval_outcome(user_id, context_log_id=1, atom_count=3, path="both")
+
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["repo_citations_checked_window"] == 0
+    assert m["outcomes_total"] == 1
+
+
+def test_render_includes_repo_index_section():
+    m = {
+        "commits_indexed": 159,
+        "repo_query_produced_window": 3,
+        "repo_query_executed_window": 3,
+        "repo_citations_checked_window": 4,
+        "repo_citations_hit_window": 3,
+        "repo_citations_miss_window": 1,
+        "repo_citation_false_rate_window": 0.25,
+    }
+    text = render(m, window_days=7)
+    assert "2j. repo index (CP-G)" in text
+    assert "commits indexed     159" in text
+    assert "citation false rate 0.2500" in text
+
+
+def test_format_log_line_includes_repo_fields():
+    m = {f: 0 for f in FIELDS}
+    line = format_log_line(m)
+    assert "commits_indexed=0" in line
+    assert "repo_citation_false_rate_window=0" in line

@@ -943,3 +943,228 @@ async def test_promote_traits_writes_a_trait_history_row(store):
     ) as cur:
         rows = await cur.fetchall()
     assert rows == [("retrieval finds relevant context", "promoted", 5)]
+
+
+# ── repo_query intent production (CP-G change 3) ────────────────────────────
+
+def test_tick_produces_repo_query_intent_for_commit_keyword():
+    memory = _RecordingMemory()
+    core = CognitiveCore(memory=memory)
+    obs = Observation(kind=ObservationKind.sensory, source="conversation",
+                       content="what was the first commit about retrieval")
+
+    intents, _ = asyncio.run(core.tick([obs]))
+
+    assert any(i.kind == IntentKind.repo_query for i in intents)
+
+
+def test_tick_does_not_produce_repo_query_intent_without_a_keyword():
+    memory = _RecordingMemory()
+    core = CognitiveCore(memory=memory)
+    obs = Observation(kind=ObservationKind.sensory, source="conversation", content="how's it going")
+
+    intents, _ = asyncio.run(core.tick([obs]))
+
+    assert not any(i.kind == IntentKind.repo_query for i in intents)
+
+
+def test_tick_does_not_produce_repo_query_intent_for_a_lyra_observation():
+    """Her own reply repeating a repo word must not itself trigger a fresh
+    repo_query — same restriction retrieval's awaiting_reply already has."""
+    memory = _RecordingMemory()
+    core = CognitiveCore(memory=memory)
+    obs = Observation(kind=ObservationKind.sensory, source="lyra", content="here is the commit you asked about")
+
+    intents, _ = asyncio.run(core.tick([obs]))
+
+    assert not any(i.kind == IntentKind.repo_query for i in intents)
+
+
+def test_repo_query_intent_passes_the_gate():
+    from lyra_core.gate import ALLOWED_KINDS
+    assert IntentKind.repo_query in ALLOWED_KINDS
+
+
+# ── retrieve_repo_context (CP-G change 4) ────────────────────────────────────
+
+async def _index_one_commit(
+    store, full_hash="a" * 40, short_hash="aaaaaaa",
+    text_suffix="CP-D: close the intent loop for retrieval",
+    valid_from=1_700_000_000.0,
+):
+    await store.db.execute(
+        "INSERT INTO facts (ts, subject, text, source_atom_id, source_kind, confidence, valid_from, valid_until)"
+        " VALUES (?, ?, ?, NULL, 'repo_commit', 1.0, ?, NULL)",
+        (time.time(), full_hash, f"[{short_hash}] 2026-09-02 Claude: {text_suffix}", valid_from),
+    )
+    await store.db.commit()
+
+
+def test_retrieve_repo_context_returns_empty_without_a_db():
+    memory = _RecordingMemory()
+    core = CognitiveCore(memory=memory)
+
+    result = asyncio.run(core.retrieve_repo_context("any query"))
+
+    assert result.text == ""
+    assert result.commit_hashes == []
+
+
+async def test_retrieve_repo_context_finds_a_commit_by_hash_prefix(store):
+    core = CognitiveCore(memory=store)
+    await _index_one_commit(store)
+
+    result = await core.retrieve_repo_context("what does commit aaaaaaa do")
+
+    assert result.commit_hashes == ["a" * 40]
+    assert "[aaaaaaa]" in result.text
+    assert "## Repository history" in result.text
+
+
+async def test_retrieve_repo_context_finds_a_commit_by_keyword(store):
+    core = CognitiveCore(memory=store)
+    await _index_one_commit(store)
+
+    result = await core.retrieve_repo_context("tell me about the retrieval work")
+
+    assert result.commit_hashes == ["a" * 40]
+
+
+async def test_retrieve_repo_context_empty_when_nothing_matches(store):
+    core = CognitiveCore(memory=store)
+    await _index_one_commit(store)
+
+    result = await core.retrieve_repo_context("completely unrelated query about weather")
+
+    assert result.text == ""
+    assert result.commit_hashes == []
+
+
+async def test_retrieve_repo_context_does_not_leak_into_facts_block(store):
+    """Change 1's own requirement, checked directly: an ordinary
+    conversational query must not surface a commit fact through the
+    UNCHANGED _facts_block/build_context path — only through
+    retrieve_repo_context()."""
+    from lyra_memory.store.context import build_context
+
+    await _index_one_commit(store)
+
+    result = await build_context(store, query="what did we decide about the threshold")
+
+    assert "CP-D" not in result.text
+    assert "commit" not in result.text.lower()
+
+
+# ── check_repo_citations (CP-G change 5) ─────────────────────────────────────
+
+def test_check_repo_citations_returns_zero_zero_without_a_db():
+    memory = _RecordingMemory()
+    core = CognitiveCore(memory=memory)
+
+    result = asyncio.run(core.check_repo_citations("see [aaaaaaa]"))
+
+    assert result == (0, 0)
+
+
+def test_check_repo_citations_returns_zero_zero_with_no_citations():
+    memory = _RecordingMemory()
+    core = CognitiveCore(memory=memory)
+
+    result = asyncio.run(core.check_repo_citations("no brackets here at all"))
+
+    assert result == (0, 0)
+
+
+async def test_check_repo_citations_counts_a_real_hash_as_a_hit(store):
+    core = CognitiveCore(memory=store)
+    await _index_one_commit(store)
+
+    hit, miss = await core.check_repo_citations("see [aaaaaaa] for details")
+
+    assert (hit, miss) == (1, 0)
+
+
+async def test_check_repo_citations_counts_a_fabricated_hash_as_a_miss(store):
+    core = CognitiveCore(memory=store)
+    await _index_one_commit(store)
+
+    hit, miss = await core.check_repo_citations("see [deadbee] for details")
+
+    assert (hit, miss) == (0, 1)
+
+
+async def test_check_repo_citations_counts_per_occurrence_not_deduplicated(store):
+    core = CognitiveCore(memory=store)
+    await _index_one_commit(store)
+
+    hit, miss = await core.check_repo_citations("[aaaaaaa] and again [aaaaaaa], plus [deadbee]")
+
+    assert (hit, miss) == (2, 1)
+
+
+async def test_check_repo_citations_matches_the_full_hash_too(store):
+    core = CognitiveCore(memory=store)
+    await _index_one_commit(store)
+
+    hit, miss = await core.check_repo_citations(f"see [{'a' * 40}]")
+
+    assert (hit, miss) == (1, 0)
+
+
+# ── record_repo_query_outcome (CP-G change 5/6) ──────────────────────────────
+
+def test_record_repo_query_outcome_returns_none_without_a_db():
+    memory = _RecordingMemory()
+    core = CognitiveCore(memory=memory)
+
+    result = asyncio.run(core.record_repo_query_outcome(1, context_log_id=2, hit_count=1, miss_count=0))
+
+    assert result is None
+
+
+async def test_record_repo_query_outcome_writes_an_outcomes_row(store):
+    core = CognitiveCore(memory=store)
+    user_id = await store.append_atom(speaker="wilson", source="cli", text="what commit was that")
+
+    outcome_id = await core.record_repo_query_outcome(user_id, context_log_id=9, hit_count=1, miss_count=0)
+
+    assert outcome_id is not None
+    async with store.db.execute(
+        "SELECT intent_atom_id, valence, actual, predicted, environment FROM outcomes WHERE id = ?",
+        (outcome_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    assert row[0] == user_id
+    assert row[1] == 1.0
+    assert row[2] == "citations_valid"
+    assert row[3] == "citations_valid"
+    assert "kind=repo_query" in row[4]
+    assert "context_log_id=9" in row[4]
+    assert "hits=1" in row[4]
+    assert "misses=0" in row[4]
+
+
+async def test_record_repo_query_outcome_valence_is_zero_on_any_miss(store):
+    core = CognitiveCore(memory=store)
+    user_id = await store.append_atom(speaker="wilson", source="cli", text="what commit was that")
+
+    outcome_id = await core.record_repo_query_outcome(user_id, context_log_id=None, hit_count=1, miss_count=1)
+
+    async with store.db.execute("SELECT valence, actual FROM outcomes WHERE id = ?", (outcome_id,)) as cur:
+        row = await cur.fetchone()
+    assert row[0] == 0.0
+    assert row[1] == "citations_invalid"
+
+
+async def test_record_repo_query_outcome_records_zero_zero_turn(store):
+    """Change 6: a turn with no repo rows retrieved or nothing cited is
+    still a recorded outcome — not skipped."""
+    core = CognitiveCore(memory=store)
+    user_id = await store.append_atom(speaker="wilson", source="cli", text="what commit was that")
+
+    outcome_id = await core.record_repo_query_outcome(user_id, context_log_id=None, hit_count=0, miss_count=0)
+
+    assert outcome_id is not None
+    async with store.db.execute("SELECT valence FROM outcomes WHERE id = ?", (outcome_id,)) as cur:
+        (valence,) = await cur.fetchone()
+    assert valence == 1.0

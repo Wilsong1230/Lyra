@@ -2560,3 +2560,391 @@ and via `collect_from_path()`:
   `lyra-memory` 283 passed, 4 skipped (unchanged count — `test_trait_
   history.py`'s two edits added assertions to existing tests rather than
   new tests).
+
+# CP-G — repo history, indexed and citation-checked
+
+Register corrections carried in verbatim: the first emergent trait
+("retrieval finds relevant context") promoted turn 6 at evidence_count 5,
+character tier by turn 20 — produced by mechanism, not authorship;
+`IdentityEngine.consolidate()`'s two dead callers (unscheduled DreamPass,
+wrong-database MemorySystem/DreamingLoop) are fixed — it runs per-turn from
+runtime.py now; traits reach Lyra through `_traits_block` above
+`TRAIT_CONFIDENCE_FLOOR` 0.3, `introspect()` needed no change;
+`Candidate.category` now includes `"retrieval"`; every outcome signal to
+date is internal, and the first trait is near-trivially true because of it.
+
+## Change 1 — where a commit lives, and why
+
+Considered atoms, facts, and entities (CHANGES' own three candidates).
+
+**Atoms ruled out, measured, not assumed.** Read `store/context.py`'s three
+recall paths before deciding anything: `_semantic_hits` joins `vec_atoms`
+to `atoms` unconditionally; `_lexical_hits` matches `atoms_fts` (populated
+by an insert trigger — schema.py's `FTS_SQL`) with no source filter;
+`_temporal_hits` is `SELECT ... FROM atoms ... ORDER BY ts DESC` with no
+source filter either. None of the three recall paths know about `source`
+at all — a commit written as an atom, under ANY source string, is
+findable by all three the moment it exists, deterministically for
+`_temporal_hits` alone. OUT OF SCOPE forbids touching `store/context.py`
+("changing retrieval"), so there is no way to exclude a new atom source
+from recall without violating that — atoms was excluded by this constraint
+before any design work started, not chosen against on taste.
+
+**Facts chosen.** The row a `repo_index.py` commit becomes:
+
+| column | value |
+|---|---|
+| `subject` | the commit's full 40-hex-char hash |
+| `text` | `"[<short-hash>] <date> <author>: <subject-line>"` |
+| `source_kind` | `"repo_commit"` |
+| `confidence` | `1.0` |
+| `source_atom_id` | `NULL` |
+| `valid_from` | the commit's own author timestamp |
+| `valid_until` | `NULL` |
+| `ts` | indexing time (`time.time()` at the moment `repo_index.py` ran) |
+
+`source_kind` has no `CHECK` constraint in `schema.py` — the same reason
+`source`/`environment` are enforced in Python (`SOURCES`/`ENVIRONMENTS`
+frozensets), per schema.py's own comment: "a CHECK constraint on a growing
+vocabulary is exactly the migration this schema rules out." Adding
+`"repo_commit"` as a fifth `source_kind` value (alongside
+stated/observed/document/inferred) needed no schema change and none was
+made — verified: `git diff` over `schema.py` for this checkpoint is empty.
+
+**Distinguishable in the store, structurally, not by convention.** A
+`facts` row is never `atoms`-table content. `store/passes/dream.py`'s
+`DreamPass._input_atoms()` — the only path from anything to
+candidate/promotion — reads `atoms` exclusively (`SELECT ... FROM atoms a
+LEFT JOIN dream_atoms ...`). A `facts` row with `source_kind="repo_commit"`
+is therefore not merely excluded from dream input the way
+`DREAM_EXCLUDED_SOURCES` excludes `sandbox_read` atoms (a WHERE clause
+filtering something that COULD otherwise be read) — it is not the kind of
+row that pipeline reads AT ALL. "A commit is not an experience she had; it
+must be distinguishable from things that are" (CHANGES item 1's own
+words) is true here in the strongest available sense: nothing downstream
+of `atoms` can mistake it for one, because it was never one.
+
+**Excluded from ordinary conversational retrieval, also structurally, not
+by a new filter.** `_facts_block` (`store/context.py`, unmodified — OUT OF
+SCOPE) injects a fact only when a query word exactly matches its
+`subject`, lowercased. A commit's subject is a 40-hex-char hash; no
+ordinary conversational sentence contains one. Repo rows reach a prompt
+through an entirely separate path — `CognitiveCore.retrieve_repo_context()`
+(interface.py), wired to the new `repo_query` intent kind, never through
+`build_context`/`_facts_block`/`_recall_block`. Live-verified below (turn
+5): a repo-unrelated conversational turn's `context_log` row has
+`fact_ids: []` even though 159 repo-commit facts exist in the same store,
+and turns 2-4 (repo-related, which DO inject a repo block) still show
+`fact_ids: []` too — the two channels never touch, confirmed on both
+repo and non-repo turns, not assumed from the design alone.
+
+## Change 2 — repo_index.py
+
+Reads `git log --format=%H\x1f%h\x1f%an\x1f%aI\x1f%s\x1e` via `subprocess`
+(control-character field/record separators — a commit subject line
+legally containing `|` would corrupt a pipe-delimited parse; tested
+directly, see test_repo_index.py). Writes one `facts` row per commit not
+already indexed (idempotency: `SELECT subject FROM facts WHERE
+source_kind='repo_commit'` first, skip full hashes already present — no
+UNIQUE constraint exists or was added on `facts.subject`, so this is
+enforced in Python, the same discipline `source_kind`'s own growing
+vocabulary already requires per Change 1).
+
+Opens the store via `lyra_memory.store.Store.open()` (full schema
+assertion + WAL + foreign_keys, the correct way to open a WRITABLE
+connection against this schema) rather than report.py's `mode=ro`
+`_ReadOnlyStore` pattern (that pattern exists specifically so a read-only
+tool cannot write; this tool's whole job is to write). Does not import
+`lyra_core.runtime.Runtime`/`TurnHandler`/`lyra_core.transport` (CHANGES
+item 2's own words, mirroring report.py's identical discipline for the
+identical reason) and does not import or call `lyra_memory.embeddings.
+embed()` at all — commit facts are never vectorized (`retrieve_repo_
+context` is a plain SQL scan, not KNN), so this tool needs no
+`LYRA_EMBED_BACKEND` and no network to run.
+
+One environment finding, not a design decision: this container's cached
+`all-MiniLM-L6-v2` was NOT reachable earlier in this session (CP-B/CP-E
+both recorded `LYRA_EMBED_BACKEND=hashed` as forced) but IS reachable now
+— a bare `Store.open()` on a NEW store stamps `schema_meta.embedder` with
+whatever `backend_id()` returns at that moment, real or offline stand-in,
+regardless of whether the opener ever calls `embed()`. Running
+`repo_index.py` and the verification `Runtime` under different embedder
+choices produced a real `SchemaMismatch` on the second process
+(store/integrity.py's own designed behavior — a mismatch crashes on open,
+by design, per Change 1's schema-change discussion above). Not a bug;
+recorded here because it is exactly the kind of drift `assert_schema`
+exists to catch, and because it means anyone re-running this checkpoint's
+verification must set `LYRA_EMBED_BACKEND=hashed` (or leave it unset
+consistently) for every process that opens the SAME store — `repo_index.py`
+included, even though it never embeds anything itself.
+
+## Change 3 — the repo_query intent kind
+
+`IntentKind.repo_query = "repo_query"` (interface.py). Payload:
+`{"reason": "repo"}` — matching the minimal `{"reason": ...}` shape every
+other kind already uses (`retrieval`/"turn", `look`/"curiosity",
+`speak`/"boredom"/"friction"); the query text itself is not carried in the
+payload, the same way `retrieval`'s isn't — `runtime.py` already has
+`message` directly and passes it straight to `retrieve_repo_context()`,
+matching `retrieve_context()`'s own precedent.
+
+**Deliberately NOT routed through `ActionSelector`/drives.**
+`action_selection.py` is explicitly OUT OF SCOPE ("changing... drives").
+Retrieval's own trigger (`_RETRIEVAL_PRESSURE` compared against frustration
+inside `ActionSelector.select()`) lives there; extending it for repo_query
+would mean editing that file, which CP-G forbids. Instead, `tick()`
+(interface.py, in FILES) appends `Intent(kind=IntentKind.repo_query, ...)`
+directly — after `self._selector.select(...)` runs, before `_gate_intents`
+— when `_looks_like_repo_query(observations)` matches a fixed keyword set
+(`commit(s)`/`committed`/`checkpoint(s)`/`repo`/`repository`/`codebase`)
+against the tick's own "conversation" observation, restricted to
+`awaiting_reply` exactly as retrieval already is (never on her own "lyra"
+turn — tested directly). This is simpler than retrieval's design on
+purpose: nothing in CHANGES asks for frustration-gating here, and building
+it without touching action_selection.py is not straightforward (the
+frustration-vs-pressure comparison is that file's one mechanism); the
+simpler, deterministic, in-scope design was chosen over replicating
+retrieval's shape for its own sake. There is consequently no
+`repo_query`-declined state — no equivalent of `INTENT_DECLINED` — see
+Change 8/runtime.py's own comment on `REPO_QUERY_PRODUCED`.
+
+Registered in `gate.ALLOWED_KINDS` (`gate.py`, not in the closed FILES set
+— CHANGES item 3 explicitly instructs this, the same kind of mandated
+companion touch CP-E/CP-F's precedent already established; see "Files
+touched outside the FILES set" below). `test_gate.py`'s tripwire test
+(`test_allow_list_is_exactly_the_five_reviewed_kinds`, renamed to `_six_`)
+caught the omission immediately on the first test run after adding the
+`IntentKind` member but before touching `gate.py` — exactly the mechanism
+that test exists to be.
+
+## Change 4 — the repo block, and the citation instruction
+
+`retrieve_repo_context(query)` (interface.py): two passes over
+`facts WHERE source_kind='repo_commit'`, no new index (a `facts_fts`
+virtual table would be a schema change, forbidden). Pass 1: any hex-looking
+token in the query (7-40 hex chars) tried as a `subject LIKE token||'%'`
+prefix — treats "what does commit abc1234 do" as the strong, well-defined
+request it is. Pass 2, filling up to `_REPO_QUERY_ROW_LIMIT` (10) rows: a
+plain `OR`-of-`LIKE` scan over `text` using the query's own words (length
+>2, no stopword filtering — the corpus is small enough and short lines
+enough that this is adequate; a fixed row-count cap, not
+`CONTEXT_BUDGETS`-style token budgeting, since commit lines are already
+short and uniform by construction).
+
+The block:
+```
+## Repository history (git log metadata for this repository — not
+something you experienced, and not conversation. Cite the bracketed hash,
+e.g. [abc1234], for any commit you rely on. Do not cite a hash you have
+not seen here.)
+- [5c8163c] 2026-09-02 Claude: CP-D: close the intent loop for retrieval
+- [2d7a91f] 2026-09-02 Claude: CP-E: candidate deduplication
+...
+```
+appended in `TurnHandler._compose_system_prompt` (runtime.py) after
+conversational context and before the affect hint — its own heading is
+what makes it "distinguishable from conversational context" (change 4's
+own words), independent of position.
+
+## Change 5 — citation existence, the outcome bit
+
+`check_repo_citations(reply_text)` (interface.py) parses every `[hash]`
+(`_CITATION_RE`, 7-40 lowercase hex) out of the reply and checks EACH
+against the FULL index — `facts WHERE source_kind='repo_commit' AND
+subject LIKE cited||'%'` — not just the rows this turn happened to
+retrieve: a correct citation to a commit surfaced on an earlier turn, or
+recalled from her own prior knowledge of this repo, is still a real hit,
+and restricting validation to "this turn's retrieved set" would have
+manufactured false misses for a genuinely correct answer. Counted PER
+OCCURRENCE, not deduplicated — citing the same hash twice is two things to
+check, not one (tested directly: `[aaaaaaa]` twice + one fabricated hash =
+`(2, 1)`).
+
+`record_repo_query_outcome` writes to the existing `outcomes` table (no
+new table): `valence = 0.0` the moment `miss_count > 0` — change 5's own
+wording, "a reply citing a hash that is not in the index is a FALSE
+outcome," read literally: one miss makes the whole outcome false, not a
+ratio. `environment` packs `kind=repo_query;context_log_id=...;hits=N;
+misses=N` into the same free-text `key=value;...` column
+`record_retrieval_outcome`'s own `environment` already uses (OUT OF SCOPE
+forbids a schema change to give repo-query outcomes real columns); the
+`kind=repo_query` prefix is what lets report.py select only these rows out
+of the one shared table.
+
+Nothing here suppresses, retries, or repairs a miss — `check_repo_
+citations` and `record_repo_query_outcome` are pure read/write with no
+branch that could do any of the three; `runtime.py`'s `_finish_exchange`
+calls them once per repo-query-executed turn and moves on.
+
+## Change 6 — zero is a recorded row, not an absent one
+
+`_finish_exchange` calls `record_repo_query_outcome` whenever
+`repo_query_intended` is true, unconditionally — not gated on `hit_count +
+miss_count > 0` the way retrieval's own `outcome_id is None` check gates
+its downstream steps. Live-verified (turn 4 below): a repo-related turn
+that retrieved 10 commit rows but cited none still produced outcome row
+`(7, ..., hits=0, misses=0)`, logged via `REPO_OUTCOME_RECORDED`. Tested
+directly for the "nothing retrieved" half too
+(`test_record_repo_query_outcome_records_zero_zero_turn`).
+
+## Change 7 — no candidate vocabulary was added
+
+`candidate_pool.py` was NOT touched. CHANGES item 7 is conditional ("if
+the candidate vocabulary needs a repo-query label") and it did not: SCOPE
+is "index... and can answer over it, with an outcome signal that can come
+back false" — the `outcomes` row IS that signal, and neither DONE-WHEN nor
+any other CHANGES item asks repo-query outcomes to feed
+`CandidatePool.add_observation`/consolidation/promotion. Doing so anyway
+would mean deciding a trait vocabulary for "cites accurately"/"cites
+falsely" and touching the consolidation path — real design work outside
+what this checkpoint asked for, and adjacent to "changing... promotion"
+(OUT OF SCOPE). Left for a future checkpoint to decide deliberately, the
+same way CP-D left promotion itself unwired for CP-F to pick up.
+
+## Change 8 — report.py
+
+Two new sections, kept separate from CP-D's own fields on purpose (see
+runtime.py's `REPO_QUERY_PRODUCED` comment): `commits_indexed` (all-time —
+indexing is a one-off explicit act like `atoms_total`, not a window flow),
+`repo_query_produced_window`/`executed_window` (new markers, own regex,
+`_repo_loop_log_section`), and `repo_citations_checked_window`/
+`hit_window`/`miss_window`/`repo_citation_false_rate_window` (read from
+`outcomes.environment`, `_repo_section`) — the false rate rendered to 4
+decimal places, always a number (0.0 on a fresh store, never `UNAVAILABLE`
+unless the DB query itself fails).
+
+## Files touched outside the FILES set
+
+- **`lyra_ai/lyra_core/gate.py`** — `ALLOWED_KINDS` gains
+  `IntentKind.repo_query`, per CHANGES item 3's explicit instruction ("Register
+  it in gate.ALLOWED_KINDS"). Not a judgment call — a directly mandated edit
+  to a file outside the closed set, the same standing this checkpoint's own
+  text gives it.
+- **`lyra_ai/tests/test_gate.py`** — the ALLOWED_KINDS tripwire test updated
+  to expect six kinds instead of five (renamed
+  `test_allow_list_is_exactly_the_five_reviewed_kinds` ->
+  `..._six_reviewed_kinds`). This test existing and failing immediately is
+  the mechanism working as designed, not a problem to route around.
+- **`lyra_ai/tests/test_core.py`, `test_runtime.py`, `test_report.py`** —
+  new tests for `retrieve_repo_context`/`check_repo_citations`/
+  `record_repo_query_outcome`, the daemon-path wiring (`_FakeCore` gained
+  `retrieve_repo_context`/`check_repo_citations`/`record_repo_query_
+  outcome` and a `produces_repo_query` flag), and the two new report.py
+  sections, respectively — the same standing CP-E/CP-F's own test-file
+  companions had.
+- **`lyra_ai/tests/test_repo_index.py`** (new) — builds real git
+  repositories with `subprocess` (`git init`/`commit`, global identity
+  already configured in this environment) rather than mocking `git log`.
+
+## DONE-WHEN — evidence
+
+`repo_index.py` run twice against the real Lyra repository
+(`/home/user/Lyra`, 159 commits at HEAD):
+```
+repo_index: /home/user/Lyra — 159 commits found, 159 indexed, 0 already present (skipped).
+repo_index: /home/user/Lyra — 159 commits found, 0 indexed, 159 already present (skipped).
+```
+sqlite: 159 rows, all `source_kind='repo_commit', confidence=1.0,
+source_atom_id=NULL, valid_until=NULL`, subject a 40-hex-char hash, text
+the bracketed-citation form — e.g. `('aac3b4459f0bea...', '[aac3b44]
+2026-09-02 Claude: CP-F: wire candidate-to-trait promotion into the live
+daemon', 'repo_commit', 1.0, None, None)`.
+
+Live verification: a real `Runtime` (tmp-path store indexed as above,
+`LYRA_EMBED_BACKEND=hashed`) driven through five turns via
+`rt._handler.handle()`. **No LLM API key is configured in this
+environment** — verified directly: no `.env` file anywhere in the repo,
+`env | grep -iE "anthropic|openrouter|cerebras|google_api"` returns
+nothing, so `lyra.backends.auto_select_backend()` has no real backend to
+select. Every prior checkpoint's live daemon verification in this session
+used a scripted fake backend for the same reason; this one does too, with
+replies written by hand to demonstrate the mechanism against the real
+indexed commit set — not generated by any model. This bears directly on
+the Wilson-gradable check below.
+
+- **Turn 2** — "what commit closed the intent loop for retrieval":
+  ```
+  REPO_QUERY_PRODUCED turn=2 kind=repo_query
+  REPO_QUERY_EXECUTED turn=2 kind=repo_query commit_count=10
+  reply: "The intent loop for retrieval was closed in commit [5c8163c], per the repo history."
+  REPO_OUTCOME_RECORDED turn=2 outcome_id=3 hits=1 misses=0
+  outcomes row: (3, 3, 1.0, 'citations_valid', 'citations_valid', 'kind=repo_query;context_log_id=2;hits=1;misses=0')
+  ```
+  `5c8163c` is the real short hash of `5c8163c32d8bfb8a61763c4529eaf9be060beed8`
+  ("CP-D: close the intent loop for retrieval") — verified against `git
+  log` directly, not assumed.
+- **Turn 3** — "what commit added candidate deduplication", reply
+  scripted to cite one real hash and one fabricated one (to demonstrate
+  the miss path, not to claim a real model produced it — disclosed, not
+  hidden):
+  ```
+  reply: "Candidate deduplication was added in commit [2d7a91f]. I'll also mention [deadbeef] for context, though I'm not fully sure about that one."
+  REPO_OUTCOME_RECORDED turn=3 outcome_id=5 hits=1 misses=1
+  outcomes row: (5, 5, 0.0, 'citations_invalid', 'citations_valid', 'kind=repo_query;context_log_id=3;hits=1;misses=1')
+  ```
+  `2d7a91f` is real (CP-E: candidate deduplication, verified against `git
+  log`); `deadbeef` is not an indexed commit — `valence=0.0`, confirming a
+  false outcome IS recorded, not suppressed, retried, or repaired. This is
+  the DONE-WHEN citation-miss requirement — produced by a deliberately
+  scripted reply, recorded as such rather than presented as a discovered
+  hallucination, per the same "do not manufacture" ethic DONE-WHEN itself
+  states for this exact case.
+- **Turn 4** — "did we ever add a commit about time travel to this repo":
+  repo_query fired (10 commit rows retrieved, none about time travel — a
+  correct, honest reply citing nothing):
+  ```
+  REPO_OUTCOME_RECORDED turn=4 outcome_id=7 hits=0 misses=0
+  ```
+  Change 6's requirement, observed directly: rows retrieved, nothing
+  cited, still a recorded outcome row, not an absent one.
+- **Turn 5** — "what did we decide about the threshold last time" (no
+  repo keyword): no `REPO_QUERY_PRODUCED`/`EXECUTED`/`REPO_OUTCOME_
+  RECORDED` line at all; `context_log` row 5:
+  `atom_ids=[1..8], fact_ids=[]` — conversational atoms only, zero commit
+  facts, even though 159 exist in the same store. **Conversational
+  retrieval is not polluted.** The same holds on the repo-answering turns
+  themselves (rows 2-4 also show `fact_ids: []`) — the repo channel and
+  the conversational-facts channel never share a row, on any turn observed.
+
+`python -m lyra_core --report`-equivalent output:
+```
+2j. repo index (CP-G)
+  commits indexed     159
+  repo_query produced 3  (window)
+  repo_query executed 3  (window)
+  citations checked   3  (window)
+  citations existed   2  (window)
+  citations did not   1  (window)
+  citation false rate 0.3333  (window)
+```
+The false rate is a visible number, per change 8's own requirement.
+
+**Wilson-gradable check — recorded as a gap, not manufactured.** DONE-WHEN
+asks for three questions with known answers, replies recorded verbatim,
+graded by human judgment. The three Q&A pairs above (turns 2-4) ARE
+recorded verbatim, and their citations were independently checked against
+real `git log` output (not merely trusted) — but the replies themselves
+were written by hand for this verification, not generated by a model, for
+the concrete reason stated above (no LLM API key configured in this
+environment). Grading a hand-scripted reply against the ground truth I
+used to write it is circular and would not be a meaningful signal — the
+whole point of change 5/8's false rate is that it can come back true
+against a process that MIGHT be wrong, and a script I wrote is not that
+process. What this session DOES establish, mechanically and verifiably: the
+citation-parse/validate/record/report pipeline is correct end to end
+against real indexed data, including a genuine detected miss. What it does
+NOT establish, and cannot in this environment: whether a real model,
+asked these same three questions against this same index, would answer
+correctly. That check needs a configured backend and a human to grade the
+result — recorded here as the honest state, per this checkpoint's own
+"do not manufacture one" instruction applied to the same problem one level
+up.
+
+**Both test suites green:** `lyra_ai` 397 passed (351 before this
+checkpoint + 46 net new — `test_gate.py`'s tripwire test was renamed, not
+added to; `test_repo_index.py` is a new file with 12 tests; the remainder
+are new tests added to `test_core.py`, `test_runtime.py`, and
+`test_report.py`); `lyra-memory` 283 passed, 4 skipped (unchanged — CP-G's
+FILES set includes `candidate_pool.py` only conditionally, and Change 7
+found the condition unmet, so lyra-memory's own tree and tests are
+untouched this checkpoint).

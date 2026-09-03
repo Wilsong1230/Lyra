@@ -121,6 +121,18 @@ FIELDS: tuple[str, ...] = (
     "mood_v_min", "mood_v_max", "mood_a_min", "mood_a_max",
     "clamp_count_window", "clamp_max_elapsed_window",
     "store_db_bytes", "runs_db_bytes", "history_db_bytes",
+    # CP-G change 8: commits indexed (all-time, like atoms_total — indexing
+    # is an explicit one-off act, not a per-window flow), the repo-query
+    # intent's own produced/executed counts (log-derived, its own markers —
+    # see runtime.py's REPO_QUERY_PRODUCED/EXECUTED comment for why these
+    # are not folded into intents_produced_window/intents_executed_window),
+    # and the citation check itself: how many were checked, how many
+    # existed, how many did not, and the false rate as a number (change 8's
+    # own requirement — "The false rate must be a visible number").
+    "commits_indexed",
+    "repo_query_produced_window", "repo_query_executed_window",
+    "repo_citations_checked_window", "repo_citations_hit_window",
+    "repo_citations_miss_window", "repo_citation_false_rate_window",
 )
 
 
@@ -377,6 +389,50 @@ async def _outcomes_section(db: aiosqlite.Connection) -> dict:
     return {"outcomes_total": total}
 
 
+_REPO_OUTCOME_ENV_RE = re.compile(r"hits=(\d+);misses=(\d+)")
+
+
+async def _repo_section(db: aiosqlite.Connection, window_start: float) -> dict:
+    """CP-G change 8. `commits_indexed` is all-time (repo_index.py is a
+    one-off explicit act, not a window-scoped flow, same reasoning as
+    atoms_total). The citation counts read straight from `outcomes.
+    environment` — CognitiveCore.record_repo_query_outcome() packs
+    `kind=repo_query;context_log_id=...;hits=N;misses=N` into the same
+    free-text column record_retrieval_outcome() already uses for its own
+    extra fields (OUT OF SCOPE forbids a schema change to give repo-query
+    outcomes real columns); the `kind=repo_query` prefix is what lets this
+    query select just these rows out of the one shared `outcomes` table.
+    """
+    async with db.execute(
+        "SELECT COUNT(*) FROM facts WHERE source_kind = 'repo_commit'"
+    ) as cur:
+        commits_indexed = (await cur.fetchone())[0]
+
+    async with db.execute(
+        "SELECT environment FROM outcomes"
+        " WHERE environment LIKE 'kind=repo_query%' AND ts >= ?",
+        (window_start,),
+    ) as cur:
+        rows = await cur.fetchall()
+
+    hits = misses = 0
+    for (env,) in rows:
+        m = _REPO_OUTCOME_ENV_RE.search(env or "")
+        if m:
+            hits += int(m.group(1))
+            misses += int(m.group(2))
+    checked = hits + misses
+    false_rate = misses / checked if checked else 0.0
+
+    return {
+        "commits_indexed": commits_indexed,
+        "repo_citations_checked_window": checked,
+        "repo_citations_hit_window": hits,
+        "repo_citations_miss_window": misses,
+        "repo_citation_false_rate_window": false_rate,
+    }
+
+
 async def _affect_section(db: aiosqlite.Connection, log_path: Path, window_start: float) -> dict:
     async with db.execute(
         "SELECT text FROM facts WHERE subject = '_lyra_internal_affect_state'"
@@ -524,6 +580,41 @@ def _loop_log_section(log_path: Path, window_start: float) -> dict:
     }
 
 
+# CP-G change 8: repo_query's own two markers (runtime.py's
+# REPO_QUERY_PRODUCED/EXECUTED) — a separate regex/section rather than
+# folding them into _LOOP_LINE_RE/_loop_log_section above, so
+# intents_produced_window/intents_executed_window (CP-D's own fields, about
+# retrieval) stay exactly what they have always measured.
+_REPO_LOOP_LINE_RE = re.compile(
+    r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ \S+ lyra_core\.runtime: "
+    r"(?P<marker>REPO_QUERY_PRODUCED|REPO_QUERY_EXECUTED)\b"
+)
+
+
+def _repo_loop_log_section(log_path: Path, window_start: float) -> dict:
+    fields = ("repo_query_produced_window", "repo_query_executed_window")
+    if not log_path.is_file():
+        return {f: UNAVAILABLE for f in fields}
+
+    counts = {"REPO_QUERY_PRODUCED": 0, "REPO_QUERY_EXECUTED": 0}
+    for line in log_path.read_text(errors="replace").splitlines():
+        m = _REPO_LOOP_LINE_RE.match(line)
+        if not m:
+            continue
+        try:
+            ts = datetime.strptime(m.group("ts"), "%Y-%m-%d %H:%M:%S").timestamp()
+        except ValueError:
+            continue
+        if ts < window_start:
+            continue
+        counts[m.group("marker")] += 1
+
+    return {
+        "repo_query_produced_window": counts["REPO_QUERY_PRODUCED"],
+        "repo_query_executed_window": counts["REPO_QUERY_EXECUTED"],
+    }
+
+
 def _file_sizes_section(store_path: Path, runs_path: Path, history_path: Path | None) -> dict:
     def size(p: Path | None) -> object:
         if p is None or not p.is_file():
@@ -603,6 +694,13 @@ async def collect_measurements(
     )
     await _section("outcomes", ("outcomes_total",), _outcomes_section(db))
     await _section(
+        "repo",
+        ("commits_indexed", "repo_citations_checked_window",
+         "repo_citations_hit_window", "repo_citations_miss_window",
+         "repo_citation_false_rate_window"),
+        _repo_section(db, window_start),
+    )
+    await _section(
         "affect",
         ("emotion_v", "emotion_a", "mood_v", "mood_a", "temperament_v",
          "temperament_a", "temperament_c", "emotion_v_min", "emotion_v_max",
@@ -627,6 +725,12 @@ async def collect_measurements(
             "consolidator_fired_window", "candidates_created_window_log",
         ):
             out[f] = UNAVAILABLE
+
+    try:
+        out.update(_repo_loop_log_section(log_path, window_start))
+    except Exception:
+        out["repo_query_produced_window"] = UNAVAILABLE
+        out["repo_query_executed_window"] = UNAVAILABLE
 
     try:
         out.update(_file_sizes_section(store_path, runs_path, history_path))
@@ -758,6 +862,17 @@ def render(measurements: dict, window_days: int) -> str:
     lines.append(f"  consolidator fired  {measurements.get('consolidator_fired_window', UNAVAILABLE)}")
     lines.append(f"  candidates created  {measurements.get('candidates_created_window_log', UNAVAILABLE)}"
                   f"  (candidates table, same window: {measurements.get('candidates_created_window', UNAVAILABLE)})")
+
+    lines.append("\n2j. repo index (CP-G)")
+    lines.append(f"  commits indexed     {measurements.get('commits_indexed', UNAVAILABLE)}")
+    lines.append(f"  repo_query produced {measurements.get('repo_query_produced_window', UNAVAILABLE)}  (window)")
+    lines.append(f"  repo_query executed {measurements.get('repo_query_executed_window', UNAVAILABLE)}  (window)")
+    lines.append(f"  citations checked   {measurements.get('repo_citations_checked_window', UNAVAILABLE)}  (window)")
+    lines.append(f"  citations existed   {measurements.get('repo_citations_hit_window', UNAVAILABLE)}  (window)")
+    lines.append(f"  citations did not   {measurements.get('repo_citations_miss_window', UNAVAILABLE)}  (window)")
+    false_rate = measurements.get('repo_citation_false_rate_window', UNAVAILABLE)
+    false_rate_str = f"{false_rate:.4f}" if isinstance(false_rate, float) else str(false_rate)
+    lines.append(f"  citation false rate {false_rate_str}  (window)")
 
     lines.append("\nKNOWN GAPS")
     for gap in KNOWN_GAPS:
