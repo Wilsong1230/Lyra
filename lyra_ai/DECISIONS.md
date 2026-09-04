@@ -3458,3 +3458,446 @@ disclosure as CP-G/H: no LLM API key configured in this environment).
   `repo_query_pressure` override letting a test simulate "candidate but
   lost" independently of "candidate and won"); `lyra-memory` 283 passed, 4
   skipped (unchanged — this checkpoint's diff never touches `lyra-memory`).
+
+# CP-J — retrieval iterates
+
+**Labeling note.** This is the second occurrence of the same pattern CP-I's
+labeling note describes. This message arrived tagged "=== ACTIVE
+CHECKPOINT: CP-I ===", with a SCOPE unrelated to the CP-I already completed
+and pushed (repo-read as a scored candidate) and a register one checkpoint
+stale (describing state as of "since CP-H," not acknowledging the
+just-completed CP-I). Unlike the first occurrence, this was noted to
+Wilson in plain text rather than re-raised through `AskUserQuestion` —
+the resolution precedent ("treat the mislabeled arrival as the next
+letter, build on what is actually committed rather than redoing or
+reverting it") was already established and confirmed once; asking the
+identical question a second time would have been re-litigating a decision
+already made, not surfacing new information. Proceeding as CP-J was stated,
+not silently assumed, and this section records that explicitly so the
+register stays legible: CP-H is citation consolidation, CP-I is repo-read
+as a scored candidate, CP-J is this section, multi-pass retrieval.
+
+Register corrections carried in verbatim (the SCOPE this message actually
+specified): a turn's retrieval was single-pass, unconditionally; the
+second citation trait (`repo citations verified`, evidence_count 5) is the
+first CP-G/H/I signal checked against ground truth; the false-citation
+candidate exists with real evidence and has not promoted; `Candidate.
+category`'s pydantic `Literal` must be extended for every new category,
+deliberately, by hand; `promote_traits()` scans all candidates regardless
+of category; `facts` still holds three populations (world record, machine
+affect_state, repo commits), unchanged, still out of scope; the
+three-question semantic check against a real backend remains outstanding —
+every CP-G/H/I/J verification to date, this one included, is mechanical,
+not model-graded.
+
+Settled design decisions carried in verbatim, because they shape every
+change below: "Internal deliberation IS experience and is written to the
+store. Unimportant deliberations are filtered by retrievability decay, not
+at write time." / "Deliberation is written DISTINGUISHABLY, so ordinary
+conversational recall does not compete against her own thinking.
+Spurious-injection is already 0.50; undifferentiated deliberation atoms
+would worsen it." / "ONE affect tick per exchange, not per pass.
+Deliberation persists as experience but does not make her age faster.
+Revisit after real pass counts are observed."
+
+## Change 1 — the one-pass-per-turn inventory
+
+Read before writing anything, per CHANGES item 1. Every place in the
+closed FILES set (plus the constant CHANGES itself requires in
+`config.py`) that assumed one intent / one retrieval / one marker sequence
+per turn:
+
+- **`runtime.py`, `TurnHandler.handle()`:** exactly one
+  `await self._core.retrieve_context(message)` call per turn; its single
+  `ContextResult` was both what got shown in the prompt and what got
+  logged to `context_log`. `INTENT_PRODUCED`/`INTENT_EXECUTED` were each
+  logged once, with no pass concept to distinguish. `_finish_exchange()`
+  called `record_retrieval_outcome()` / `consolidate_retrieval_outcome()`
+  / `promote_traits()` each exactly once per turn — one `outcome_id`, one
+  possible candidate write, one promotion check.
+- **`report.py`:** `FIELDS`' own names assumed the equivalence —
+  `intents_produced_window`/`intents_executed_window` (read from
+  `INTENT_PRODUCED`/`INTENT_EXECUTED` log lines) were never distinguished
+  from "how many turns produced/executed retrieval" because, before this
+  checkpoint, a turn always produced/executed retrieval either zero times
+  (declined) or exactly once. `consolidator_fired_window` and
+  `candidates_created_window_log` inherited the same assumption
+  transitively — `CONSOLIDATOR_FIRED`/`CANDIDATE_CREATED` were themselves
+  logged at most once per turn because they are tied 1:1 to
+  `record_retrieval_outcome()`'s single `outcome_id`. Nothing in
+  `report.py` computed "how many times did retrieval run for this turn" as
+  its own question, because the answer was always definitionally 1 (or 0).
+- **Log parsing (`_LOOP_LINE_RE`, `_RETRIEVAL_OUTCOME_ENV_RE`'s
+  predecessor):** the regexes themselves are pass-agnostic (they count
+  matching lines; a line is a line), but every *consumer* of those counts
+  — `_loop_log_section()`'s field names, this checkpoint's own new
+  `_retrieval_pass_distribution_section()` needing to exist at all —
+  assumed a produced/executed count could stand in for a turn count.
+  `context_log`'s own row-per-turn contract (`Store.ingest_turn()`,
+  outside FILES) was never actually violated by this assumption — it
+  already only ever wrote one row per turn — so this is the one place the
+  inventory found nothing to fix: `context_log` staying turn-scoped is a
+  correct existing invariant, not a bug the assumption papered over (see
+  Change 6).
+- **`interface.py`'s `record_retrieval_outcome()`:** no `pass_index`
+  parameter existed; every call site (there was exactly one,
+  `_finish_exchange()`) implicitly meant "the one pass this turn took."
+
+No other file in FILES (or examined as a possible companion touch)
+encoded this assumption structurally — `action_selection.py`,
+`candidate_pool.py`, `identity_engine.py`, and `store/context.py` all
+already operate per-call, with no per-turn state of their own, so they
+needed no change to become correct under multi-pass (see Files touched
+outside the FILES set, and the DONE-WHEN grep confirming their diffs are
+empty).
+
+## Change 2 — the loop itself: `retrieve_context_passes()`
+
+`CognitiveCore.retrieve_context_passes(query)` (`interface.py`), an async
+generator, replaces the single `retrieve_context()` call inside
+`TurnHandler.handle()`'s retrieval branch — `retrieve_context()` itself is
+untouched, called as a black box each pass (OUT OF SCOPE: "changing
+retrieval, dedup, promotion, affect, drives, or thresholds" — the
+assembly logic in `store/context.py` is never touched by this checkpoint;
+`git diff --stat` against it is empty).
+
+Pass 1 queries with the message unchanged. After each pass, if it
+surfaced any atom id not already assembled by an earlier pass this turn,
+the loop continues: the next pass's query is the original message plus
+the literal `atoms.text` of every newly-found atom (`_atom_texts()`, a
+direct `SELECT text FROM atoms WHERE id IN (...)` — deliberately not a
+`ContextResult`'s own synthesized recall text, which paraphrases/truncates
+rather than reproducing what was actually found). This is a real, if
+simple, pseudo-relevance-feedback expansion: a query that finds nothing
+new when re-issued unchanged is definitionally a query that has already
+seen everything reachable from it, so re-issuing it verbatim would be a
+no-op — expansion is what makes a second pass capable of finding anything
+the first pass could not.
+
+The loop stops (the yielded `RetrievalPass.is_final` is `True`) the moment
+a pass finds nothing new, or at `RETRIEVAL_PASS_CAP` (=3, `config.py`),
+whichever comes first. No model call anywhere in this method — OUT OF
+SCOPE's "model self-report as a stopping condition" is not a fix to a
+tempting alternative that existed here; the method has no LLM access at
+all, so self-report was never reachable, only excludable by construction.
+
+**An unexpected consequence, confirmed live rather than assumed:** because
+pass 1 starts with an empty `assembled_ids`, ANY atom found on pass 1
+counts as "new" relative to it — so a turn takes at least two passes
+whenever pass 1 finds *anything at all*, not just when the store
+happens to reward a broadened query. The only way a turn takes exactly
+one pass is finding literally nothing on pass 1 (an empty store, or a
+query nothing matches). This was not the checkpoint's design intent
+("multi-pass is something a turn MAY do, per SCOPE, not something forced
+every time retrieval executes" — see `retrieve_context_passes()`'s own
+docstring) so much as its falsified prediction: in the 20-turn live run
+below, 19 of 20 turns took >=2 passes; only turn 1, against an empty
+store, took exactly one. Recorded here rather than corrected — SCOPE
+describes a bound on iteration, not a floor on it, and nothing in
+CHANGES or DONE-WHEN requires single-pass turns to be common.
+
+## Change 3 — deliberation atoms, and whether anything protects them
+
+`CognitiveCore.record_deliberation_pass()` writes one atom per pass:
+`speaker="system"`, `source="deliberation"` — a new value added to
+`lyra_memory.store.schema.SOURCES` (a Python-enforced closed vocabulary,
+checked in `validate_atom()`, not a `CREATE TABLE`/`CHECK` constraint —
+not a schema change under this project's own established distinction; see
+Files touched outside the FILES set). `SOURCES`' own tripwire test
+(`test_vocabularies_match_the_sheet`, `lyra-memory/tests/test_store_
+schema.py`) failed loudly the moment this value was added, exactly as
+`Candidate.category`'s Literal and `gate.ALLOWED_KINDS` failed loudly at
+CP-F and CP-I — the mechanism working as designed, updated in place rather
+than routed around.
+
+Text format: `[retrieval pass N] query=<repr> found <atom_count> atom(s),
+<new_atom_count> new` — enough to reconstruct, from the atom alone, which
+pass produced it, what it searched with, and whether it advanced the
+loop. Deliberately NOT excluded from anything: not from
+`DREAM_EXCLUDED_SOURCES` (unlike `sandbox_read` — settled design states
+deliberation IS experience, eligible for dream input same as a lived
+exchange), not from the candidate pool, not from ordinary conversational
+recall. The settled design's own words — "filtered by retrievability
+decay, not at write time" — are a statement about what protects the
+store from being swamped by low-value atoms over time, not a claim that
+anything protects a fresh deliberation atom from immediate reuse. CHANGES
+item 3 requires this be measured, not assumed:
+
+**Measured, live, against the 20-turn run below: nothing stops it, and
+the competition is not marginal.** `store/context.py`'s `_semantic_hits`/
+`_lexical_hits`/`_temporal_hits` (all outside FILES, all unmodified) carry
+no `source` filter — this was already known from CP-G/H/I for vision
+atoms, and deliberation atoms inherit it unchanged. Querying every
+`context_log` row's `atom_ids` against the set of `deliberation`-sourced
+atom ids in the same run:
+
+```
+context_log id=2  includes deliberation atom [3] among 3 total
+context_log id=6  includes deliberation atoms [3,6,7,10,11,14,15,18,19] among 19 total
+context_log id=20 includes deliberation atoms [58,59,62,63,66,67,68,71] among 15 total
+```
+
+Every `context_log` row from the turn after the first deliberation atom
+was written onward contains at least one deliberation atom, and by
+turn 6 nearly half the assembled context (9 of 19 atoms) is her own prior
+deliberation, not a lived exchange. This is not the vision-atom gap's
+occasional-collision shape — it is dominant, structural competition, for
+a mechanical reason: `retrieve_context_passes()`'s own query expansion
+(Change 2) actively re-queries with the accumulated text of whatever it
+just found, so if a deliberation atom is found on pass 1 of turn N, its
+own text — which may itself quote an earlier pass's `query=` field,
+verbatim, nested — becomes part of the *query* for pass 2 of that same
+turn, and the resulting atom's text becomes part of the query for a LATER
+turn's retrieval too. Deliberation atom text was observed growing across
+the run — id 3 (89 chars) versus id 7 (268 chars, one turn later, quoting
+id 3's own `query=` field inside its own) versus id 63 (293 chars, quoting
+a further turn's worth of nesting). OUT OF SCOPE forbids touching
+`context.py`, so no source filter was added; recorded here as a
+consequence CHANGES asked to be found, not one this checkpoint is
+licensed to fix, and a sharper version of the same unaddressed gap CP-B
+left standing for `vision` atoms.
+
+## Change 4 — one tick per exchange, verified by observation
+
+Unchanged from CP-D: `TurnHandler.handle()` calls `self.tick("conversation",
+message)` once and `self.tick("lyra", response)` once, regardless of how
+many retrieval passes ran in between — the tick calls bracket the whole
+exchange, not the retrieval loop, and `retrieve_context_passes()` has no
+tick call anywhere inside it. CHANGES item 4 asks this be verified by
+observation, not by reading the code and trusting it: in the 20-turn live
+run, every turn logged exactly 2 `tick` lines (`source=conversation`,
+`source=lyra`) — turn 17, which took 3 retrieval passes, logged the same 2
+tick lines as turn 1, which took 1. Total tick lines across the run: 40
+(2 x 20), independent of the 40 retrieval-pass total being coincidentally
+equal — confirmed by checking turn 17 individually rather than trusting
+the aggregate match. "Deliberation persists as experience but does not
+make her age faster" (settled design) holds: a deliberation atom is
+written per pass, but nothing about the affect clock advances per pass.
+
+## Change 5 — pass index on the markers, and which ones needed it
+
+CHANGES item 5 names three: `INTENT_PRODUCED`, `INTENT_EXECUTED`,
+`OUTCOME_RECORDED`. `runtime.py` also extends `CONSOLIDATOR_FIRED`,
+`CANDIDATE_CREATED`, and `TRAIT_PROMOTED` with the same `pass=%d` field,
+past what CHANGES names literally. Reasoning: `_finish_exchange()`'s
+per-pass loop (Change 6) calls `record_retrieval_outcome()` once per pass,
+producing one `outcome_id` per pass; `consolidate_retrieval_outcome()`
+and `promote_traits()` are then called once per THAT outcome_id, inside
+the same per-pass loop iteration — they were never turn-scoped
+independently of the outcome that triggers them, so leaving their log
+lines pass-less while `OUTCOME_RECORDED` two lines above them in the same
+log carries `pass=` would make the log internally inconsistent about
+which outcome a consolidation/promotion line belongs to, on any turn that
+takes more than one pass. This is the same reasoning CP-D itself used
+to decide DECLINED_MARKER-adjacent lines needed no pass concept (declined
+retrieval never entered the per-pass loop at all — `intents_declined_
+window` stays turn-scoped, unrenamed, in Change 7). New marker:
+`DELIBERATION_RECORDED turn=%d pass=%d atom_id=%d`, logged once per
+`record_deliberation_pass()` call, i.e. once per pass.
+
+All markers for one turn's passes share that turn's `turn_id`
+(`TurnHandler._turn_seq`, unchanged from CP-D) — a turn's full sequence is
+`grep turn=N` on the log, distinguishable pass by pass via `pass=`.
+
+## Change 6 — one outcome row per pass; `context_log` stays turn-scoped
+
+`record_retrieval_outcome()` is called once per element of `passes`
+inside `_finish_exchange()`'s new loop — one `outcomes` row per executed
+retrieval pass, `environment` carrying `pass=N` alongside the existing
+`context_log_id`/`atom_count`. Pass count for a turn is therefore
+`COUNT(*)` (equivalently `MAX(pass)`) of retrieval-kind `outcomes` rows
+sharing that turn's `context_log_id` — recoverable from the store alone,
+per DONE-WHEN, with no new column and no schema change.
+
+`context_log` itself gets exactly one row per turn, unchanged —
+confirmed both by reading `Store.ingest_turn()`/`_log_context()`'s own
+docstring ("one row per turn," a file outside FILES, deliberately not
+touched) and by the live run: 20 turns, 20 `context_log` rows, regardless
+of the 40 total passes those 20 turns took. The row that gets written is
+the LAST pass's `ContextResult` (`TurnHandler.handle()`: `context =
+passes[-1].context`) — the most informed single assembly, not a union
+across passes, because each pass's query is strictly a superset of the
+one before it in informational content (Change 2), so the final pass
+already subsumes what an earlier pass could offer, and merging would only
+double-count the same atoms with no new information.
+
+## Change 7 — `report.py`, turns vs. passes, nothing silently renamed
+
+`FIELDS`' `intents_produced_window`/`intents_executed_window` are renamed
+to `retrieval_passes_produced_window`/`retrieval_passes_executed_window`
+— under CP-J, `INTENT_PRODUCED`/`INTENT_EXECUTED` fire once per pass, so
+the old names would silently start meaning "passes this window" while
+still claiming to count something turn-shaped. `intents_declined_window`
+keeps its name unchanged: `INTENT_DECLINED` still fires at most once per
+turn (a turn either enters the per-pass loop at least once, or declines
+retrieval entirely — there is no "declined, but only for this pass"
+state), so nothing about what it counts changed. `consolidator_fired_
+window` and `candidates_created_window_log` keep their names too, but for
+a different reason than `intents_declined_window` does: they always
+counted "how many times this step ran," a definition that does not
+mention turns at all — it only ever *equaled* the turn count because,
+before this checkpoint, one turn's retrieval was mechanically one step.
+Renaming a field whose stated meaning never changes, only its count under
+that unchanged meaning, would be the CHANGES item 7 failure mode in
+reverse (renaming something that didn't need it obscures the one thing
+that consistently stayed true across the checkpoint). `outcomes_total`
+(all-kinds, all-time, unchanged from CP-D) needed no rename for the same
+reason — it never claimed turn-scoping in the first place.
+
+Every renamed/reasoned-about field is documented at its point of
+definition in `FIELDS` (inline comment) and in the module docstring's new
+CP-J paragraph, cross-referencing this section — not left for a reader to
+infer from a diff.
+
+## Change 8 — pass-count distribution and cap-hit count
+
+`_retrieval_pass_distribution_section()` (new, `report.py`) groups
+retrieval-kind `outcomes.environment` rows by their shared
+`context_log_id` (via `_RETRIEVAL_OUTCOME_ENV_RE`, parsing `context_log_
+id=`/`pass=` out of the same string Change 6 writes) and reduces to two
+new `FIELDS` entries: `retrieval_pass_distribution_window` (a compact
+`passes=turn_count;...` string, e.g. `1=1;2=18;3=1`) and `retrieval_cap_
+hit_window` (turns whose pass count reached `RETRIEVAL_PASS_CAP`). Both
+are DB-derived, not log-derived — consistent with Change 6's "recoverable
+from the store alone," and with `_repo_section`'s existing precedent for
+parsing a `kind=`-prefixed `environment` string rather than adding a
+column. Rendered under "2i. intent loop," alongside the renamed produced/
+executed pass counts, so the section reads as one coherent picture of
+what retrieval did this window rather than scattering pass information
+across two unrelated headings.
+
+## Files touched outside the FILES set
+
+- **`lyra_ai/lyra_core/config.py`** — `RETRIEVAL_PASS_CAP = 3`. CHANGES
+  item 2's own words: "the cap is a named constant in config.py" — not a
+  discretionary companion touch, a literal requirement naming the file.
+- **`lyra-memory/lyra_memory/store/schema.py`** — `"deliberation"` added
+  to `SOURCES`. Structurally unavoidable: Change 3 requires deliberation
+  atoms be "marked distinguishably," and the only mechanism this codebase
+  has for a new atom `source` value is this frozenset plus `validate_
+  atom()` — there is no way to write a `source="deliberation"` atom
+  without it, and no file inside FILES can add a value to a vocabulary
+  defined in `lyra-memory`. `DREAM_EXCLUDED_SOURCES` was read, not
+  written to (Change 3).
+- **`lyra-memory/tests/test_store_schema.py`** — `test_vocabularies_
+  match_the_sheet`'s hardcoded expected `SOURCES` set updated to include
+  `"deliberation"`, for the same reason CP-F updated `Candidate.category`'s
+  equivalent test and CP-I updated `gate.ALLOWED_KINDS`'s: the tripwire
+  fired exactly as designed, and leaving it red would mean either
+  reverting the schema change or shipping a known-failing suite, neither
+  of which is "no companion touch."
+- **`lyra_ai/tests/test_core.py`, `lyra_ai/tests/test_runtime.py`,
+  `lyra_ai/tests/test_report.py`** — new/updated tests for `retrieve_
+  context_passes()`, `record_deliberation_pass()`, `record_retrieval_
+  outcome()`'s new `pass_index` parameter, `_FakeCore`'s multi-pass
+  generator, and `report.py`'s renamed/new fields. Not named in FILES
+  (which names production files), but the CP-D/E/F/G/H/I precedent
+  throughout this file has been to update the tests a change makes
+  incorrect or incomplete, in the same checkpoint, rather than leave a
+  suite red or silently uncovering new behavior.
+
+No other file's diff is nonempty. `store/context.py`, `action_
+selection.py`, `candidate_pool.py`, `identity_engine.py`, and `gate.py`
+are all confirmed empty in `git diff --stat` (DONE-WHEN).
+
+## DONE-WHEN — evidence
+
+All measured live: a real `Runtime` (tmp-path store, `init_store=True`),
+`LYRA_EMBED_BACKEND=hashed`, a fake backend that always replies (no LLM
+API key configured in this environment — same disclosure as every prior
+checkpoint's live verification), twenty turns driven through `TurnHandler.
+handle()` directly (the same code path a real socket client reaches).
+
+- **Change-1 inventory:** above, in DECISIONS.md before any production
+  code was written.
+- **Twenty live turns, >=1 taking >1 pass, log shows the multi-pass
+  sequence with distinct pass indices:** 19 of 20 took >1 pass (see
+  Change 2's "unexpected consequence"); one, turn 17, took all 3
+  (`RETRIEVAL_PASS_CAP`). Raw `outcomes.environment` for turn 17's
+  `context_log_id=17`:
+  ```
+  kind=retrieval;context_log_id=17;atom_count=3;pass=1
+  kind=retrieval;context_log_id=17;atom_count=4;pass=2
+  kind=retrieval;context_log_id=17;atom_count=6;pass=3
+  ```
+  and the matching log lines:
+  ```
+  INTENT_PRODUCED turn=17 pass=1 kind=retrieval
+  INTENT_EXECUTED turn=17 pass=1 kind=retrieval atom_count=3 path=both new_atom_count=3 is_final=False
+  INTENT_PRODUCED turn=17 pass=2 kind=retrieval
+  INTENT_EXECUTED turn=17 pass=2 kind=retrieval atom_count=4 path=both new_atom_count=1 is_final=False
+  INTENT_PRODUCED turn=17 pass=3 kind=retrieval
+  INTENT_EXECUTED turn=17 pass=3 kind=retrieval atom_count=6 path=both new_atom_count=2 is_final=True
+  ```
+  Turn 1 (empty store) shows the other end: exactly one pass,
+  `atom_count=0`, `is_final=True` immediately — the loop does not force
+  iteration when there is nothing to find.
+- **sqlite shows one outcome row per pass, pass count recoverable from the
+  store alone:** 41 total `outcomes` rows; 40 carry `kind=retrieval;` (one
+  per pass, matching `SUM` of the per-turn pass counts below) and 1 carries
+  `kind=repo_query` (turn 16's unrelated, pre-existing CP-G/H/I mechanism —
+  confirmed by prefix, not folded into the retrieval count).
+  `retrieval_pass_distribution_window` (grouped by `context_log_id` alone,
+  no other table read) = `1=1;2=18;3=1`, matching the log-derived count
+  exactly.
+- **Deliberation records exist; conversational-retrieval competition
+  measured, not assumed:** 40 deliberation atoms written (one per pass,
+  matching the outcome count). Competition is NOT absent — see Change 3
+  for the full measurement; every `context_log` row from the second turn
+  onward contains at least one deliberation atom, rising to nearly half
+  the assembled context by turn 6.
+- **A 3-pass turn and a 1-pass turn produce the same tick-line count:**
+  turn 17 (3 passes) and turn 1 (1 pass) each logged exactly 2 `tick`
+  lines; the run total is 40 (2 x 20 turns), independent of the 40-pass
+  total. See Change 4.
+- **`report.py` shows the pass distribution / cap-hit count, every
+  renamed field cross-referenced to its CP-C/D meaning:** rendered
+  section, from `collect_from_path()` against the run's own store:
+  ```
+  2i. intent loop (CP-D — from the daemon log's six markers; window)
+    retrieval may iterate (CP-J) — produced/executed below are PASS counts, not turn counts
+    passes produced     40
+    passes executed     40
+    declined (turns)    0
+    consolidator fired  40  (per pass)
+    candidates created  40  (candidates table, same window: 3)
+    pass distribution (turns by pass count)  1=1;2=18;3=1
+    turns hitting the cap  1
+  ```
+  `candidates created 40 (candidates table, same window: 3)` is not a
+  discrepancy: the log-derived count is per-pass-firing (40, unchanged
+  meaning from what `CANDIDATE_CREATED` always counted, per Change 7),
+  the `candidates` table count is post-dedup distinct-or-strengthened
+  rows (3 — `retrieval finds nothing`, `retrieval finds relevant
+  context`, `no repo context to cite`, the last from turn 16's unrelated
+  repo_query branch) — the same two-numbers-same-window shape CP-E
+  established for exactly this reason, unmodified by this checkpoint.
+- **Latency (median/max over 20 turns), recorded as a number:** median
+  368.12ms, max 1120.76ms. No pre-checkpoint single-pass baseline exists
+  to compare against from a prior live run in this environment (CP-D
+  through CP-I's own DONE-WHEN sections record turn counts and outcome
+  shapes, not latency numbers) — recorded here as this checkpoint's own
+  first measurement, honestly, rather than fabricating a "regression" or
+  "no regression" claim against a number that was never taken.
+  Inter-turn gaps measured from the log's own `tick source=conversation`
+  timestamps (a proxy for per-turn latency, not the script's own
+  `perf_counter` figure, as a cross-check): 42ms (turn 1->2) rising
+  roughly to the 700-800ms range by turns 11-15, dipping back to 50-90ms
+  for turns 16-18, then 1121ms for the final turn (19->20, matching the
+  script's own max exactly). Not cleanly monotonic — turn 16 asked about
+  the repo index and triggered the unrelated `repo_query` path instead of
+  a second-and-third retrieval pass, and the queries after it happened to
+  match less of the accumulated store — so this tracks each turn's actual
+  pass count and each pass's `SELECT ... WHERE atom_ids IN (...)`-shaped
+  work over a growing store (80 atoms by the end), not a fixed per-pass
+  cost that would rise smoothly turn over turn.
+- **Both test suites green:** `lyra_ai` 442 passed (435 before this
+  checkpoint's test additions + 7 new: 2 in `test_core.py` for `record_
+  retrieval_outcome()`'s `pass_index`/`kind=retrieval;` environment
+  format, 4 for `retrieve_context_passes()`'s stop conditions and query
+  expansion, 1 for `record_deliberation_pass()`; plus renamed-field
+  updates in `test_report.py` and `_FakeCore`/assertion updates in
+  `test_runtime.py`, in place, not counted as new). `lyra-memory` 283
+  passed, 4 skipped — the one failure this checkpoint's `SOURCES` change
+  caused (`test_vocabularies_match_the_sheet`) fixed in the same
+  checkpoint (Files touched outside the FILES set), not left red.

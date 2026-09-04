@@ -28,7 +28,15 @@ import pytest
 from lyra.assistant import LAYER1_FACTS, LyraClient
 from lyra_core import runtime
 from lyra_core.affect import AffectEngine
-from lyra_core.interface import AffectState, AffectVector, CognitiveCore, Intent, IntentKind, RepoContext
+from lyra_core.interface import (
+    AffectState,
+    AffectVector,
+    CognitiveCore,
+    Intent,
+    IntentKind,
+    RepoContext,
+    RetrievalPass,
+)
 from lyra_core.runtime import (
     CANDIDATE_CREATED,
     CONSOLIDATOR_FIRED,
@@ -262,16 +270,26 @@ class _FakeCore:
         repo_context: "RepoContext | None" = None,
         repo_citations: tuple[int, int] = (0, 0),
         repo_query_pressure: float | None = None,
+        context_passes: list | None = None,
     ) -> None:
         self.ticks: list[tuple[str, str, float]] = []
         self.exchanges: list[tuple[str, str, object, object]] = []
         self.retrieval_outcomes: list[tuple] = []
+        self.deliberations: list[tuple] = []
         self.consolidations: list[tuple] = []
         self.promote_traits_calls: int = 0
         self._promotions: list[dict] = []
         self._affect = affect or AffectState()
         self._context = context if context is not None else _context_result("")
         self._retrieve_context_error = retrieve_context_error
+        # CP-J: None (the default) means a single pass using self._context,
+        # preserving every existing single-pass test's behavior exactly.
+        # Pass a list of ContextResult-like objects to simulate a real
+        # multi-pass turn — each becomes one yielded RetrievalPass, "new"
+        # computed the same way the real retrieve_context_passes() computes
+        # it (against atom_ids accumulated across the earlier ones in the
+        # list).
+        self._context_passes = context_passes
         self._produces_retrieval = produces_retrieval
         self._produces_repo_query = produces_repo_query
         self._repo_context = repo_context if repo_context is not None else RepoContext(text="", commit_hashes=[])
@@ -314,13 +332,34 @@ class _FakeCore:
             raise self._retrieve_context_error
         return self._context
 
+    async def retrieve_context_passes(self, query):
+        """Fake of CP-J's async-generator multi-pass retrieval. Default
+        (context_passes=None): one pass, self._context — identical to
+        every pre-CP-J test's expectation of retrieve_context()'s old
+        single-pass behavior."""
+        if self._retrieve_context_error is not None:
+            raise self._retrieve_context_error
+        contexts = self._context_passes if self._context_passes is not None else [self._context]
+        assembled_ids: set = set()
+        for i, ctx in enumerate(contexts, start=1):
+            new_ids = [aid for aid in getattr(ctx, "atom_ids", []) if aid not in assembled_ids]
+            assembled_ids.update(new_ids)
+            yield RetrievalPass(
+                index=i, query=query, context=ctx, new_atom_ids=new_ids,
+                is_final=(i == len(contexts)),
+            )
+
     async def ingest_exchange(self, user_text, lyra_text, context, session_id, source="cli"):
         self.exchanges.append((user_text, lyra_text, context, session_id))
         return (1, 2, 99)
 
-    async def record_retrieval_outcome(self, user_atom_id, context_log_id, atom_count, path):
-        self.retrieval_outcomes.append((user_atom_id, context_log_id, atom_count, path))
+    async def record_retrieval_outcome(self, user_atom_id, context_log_id, atom_count, path, pass_index=1):
+        self.retrieval_outcomes.append((user_atom_id, context_log_id, atom_count, path, pass_index))
         return len(self.retrieval_outcomes)
+
+    async def record_deliberation_pass(self, pass_index, query, atom_count, new_atom_count):
+        self.deliberations.append((pass_index, query, atom_count, new_atom_count))
+        return len(self.deliberations)
 
     async def consolidate_retrieval_outcome(self, had_context, outcome_id=None):
         self.consolidations.append((had_context, outcome_id))
@@ -456,10 +495,11 @@ def test_handle_executed_retrieval_calls_record_outcome_with_atom_count_and_path
     asyncio.run(handler.handle("hello", "s1"))
 
     assert len(core.retrieval_outcomes) == 1
-    user_atom_id, context_log_id, atom_count, path = core.retrieval_outcomes[0]
+    user_atom_id, context_log_id, atom_count, path, pass_index = core.retrieval_outcomes[0]
     assert atom_count == 3
     assert path == "both"  # no misses recorded on this ContextResult
     assert context_log_id == 99  # the third element of _FakeCore.ingest_exchange's return
+    assert pass_index == 1
 
 
 def test_handle_executed_retrieval_fires_the_consolidator_with_had_context():
@@ -940,11 +980,18 @@ def test_runtime_serves_a_turn_and_writes_history_and_atoms_in_the_daemon(tmp_pa
         rows = conn.execute("SELECT session, role, content FROM turns ORDER BY id").fetchall()
     assert rows == [("s1", "user", "hello"), ("s1", "assistant", "echo: hello")]
     with sqlite3.connect(tmp_path / "store.db") as conn:
-        atoms = conn.execute("SELECT speaker, text FROM atoms ORDER BY id").fetchall()
+        atoms = conn.execute("SELECT speaker, source, text FROM atoms ORDER BY id").fetchall()
         affect = conn.execute(
             f"SELECT text FROM facts WHERE subject = '{_AFFECT_SUBJECT}' AND valid_until IS NULL"
         ).fetchone()
-    assert atoms == [("wilson", "hello"), ("lyra", "echo: hello")]
+    # CP-J: a real retrieval-executed turn now also writes one deliberation
+    # atom per pass (change 3) — here, one pass, nothing found, so exactly
+    # one "system"/"deliberation" atom lands between the two exchange atoms.
+    assert atoms == [
+        ("wilson", "cli", "hello"),
+        ("lyra", "cli", "echo: hello"),
+        ("system", "deliberation", "[retrieval pass 1] query='hello' found 0 atom(s), 0 new"),
+    ]
     assert affect is not None, "affect persisted on clean stop"
     assert (tmp_path / "runs.db").is_file()
 

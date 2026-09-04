@@ -28,6 +28,7 @@ from enum import Enum
 # agnostic like the rest of CognitiveCore, so there is no genericity to
 # preserve by deferring this one. Cheap to import: store.context only
 # type-imports the heavy embedding model lazily, inside embed() itself.
+from lyra_core.config import RETRIEVAL_PASS_CAP
 from lyra_memory.candidate_pool import CandidatePool
 from lyra_memory.store.context import build_context as _build_context
 
@@ -313,6 +314,17 @@ class RepoContext:
     commit_hashes: list[str]
 
 
+@dataclass
+class RetrievalPass:
+    """CP-J: one iteration of CognitiveCore.retrieve_context_passes()'s
+    multi-pass retrieval loop (change 2)."""
+    index: int
+    query: str
+    context: object  # lyra_memory.store.context.ContextResult, duck-typed
+    new_atom_ids: list[int]
+    is_final: bool
+
+
 # CP-H change 1: the closed candidate vocabulary for a citation outcome.
 # Exactly four branches, distinguished by two independent facts that must
 # not collapse into each other:
@@ -555,6 +567,87 @@ class CognitiveCore:
         """
         return await _build_context(self._memory, query=query)
 
+    async def _atom_texts(self, atom_ids: list[int]) -> list[str]:
+        """Raw `atoms.text` for the given ids, in no particular order — CP-J's
+        "accumulated context" (change 2) is built from this, not from a
+        ContextResult's own (possibly synthesized) recall text: what informs
+        pass N+1 must be what passes 1..N actually found, not a paraphrase."""
+        db = getattr(self._memory, "db", None)
+        if db is None or not atom_ids:
+            return []
+        placeholders = ",".join("?" * len(atom_ids))
+        async with db.execute(
+            f"SELECT text FROM atoms WHERE id IN ({placeholders})", atom_ids
+        ) as cur:
+            rows = await cur.fetchall()
+        return [r[0] for r in rows]
+
+    async def retrieve_context_passes(self, query: str):
+        """CP-J change 2: iterative retrieval as an async generator — one
+        RetrievalPass yielded per pass, indices 1..RETRIEVAL_PASS_CAP.
+
+        Pass 1 queries with `query` unchanged, exactly like the single-pass
+        retrieve_context() always has. After each pass, if it surfaced any
+        atom id not already assembled by an earlier pass THIS turn, the next
+        pass's query is `query` plus the literal text of every such newly-
+        found atom (see _atom_texts) — CHANGES' own "retrieve again with the
+        accumulated context." Stops (this pass is `is_final`) the moment a
+        pass finds nothing new, or at RETRIEVAL_PASS_CAP, whichever comes
+        first — never by asking the model (OUT OF SCOPE: "Model self-report
+        as a stopping condition"); no LLM call happens anywhere in this
+        method.
+
+        A caller that only wants single-pass behavior can still get it: the
+        loop stops after pass 1 whenever pass 1 found nothing new (the
+        common case for a store with little content, or a query nothing
+        matches) — multi-pass is something a turn MAY do, per SCOPE, not
+        something forced every time retrieval executes.
+        """
+        assembled_ids: set[int] = set()
+        assembled_texts: list[str] = []
+        for pass_index in range(1, RETRIEVAL_PASS_CAP + 1):
+            current_query = query if not assembled_texts else query + "\n" + "\n".join(assembled_texts)
+            context = await self.retrieve_context(current_query)
+            new_ids = [aid for aid in context.atom_ids if aid not in assembled_ids]
+            assembled_ids.update(new_ids)
+            is_final = (not new_ids) or (pass_index == RETRIEVAL_PASS_CAP)
+            yield RetrievalPass(
+                index=pass_index, query=current_query, context=context,
+                new_atom_ids=new_ids, is_final=is_final,
+            )
+            if is_final:
+                return
+            assembled_texts.extend(await self._atom_texts(new_ids))
+
+    async def record_deliberation_pass(
+        self, pass_index: int, query: str, atom_count: int, new_atom_count: int,
+    ) -> int | None:
+        """CP-J change 3: one atom per retrieval pass — "internal
+        deliberation IS experience and is written to the store" (settled
+        design). `source="deliberation"` (added to lyra_memory.store.
+        schema.SOURCES — a Python-enforced vocabulary, not a schema change;
+        see DECISIONS.md) marks it distinguishably from a lived exchange;
+        `speaker="system"`, the same speaker vision atoms already use for
+        content that is not either party's turn.
+
+        Deliberately NOT excluded from anything: unlike a repo commit (CP-G,
+        never written as an atom at all) or sandbox_read (DREAM_EXCLUDED_
+        SOURCES), a deliberation atom is eligible for dream input, the
+        candidate pool, and ordinary conversational recall — the settled
+        design's own words: filtering happens "by retrievability decay, not
+        at write time." Whether recall actually retrieves it, and what (if
+        anything) stops it from competing with lived exchanges, is measured
+        and recorded in DECISIONS.md change 3, not assumed here.
+        """
+        append_atom = getattr(self._memory, "append_atom", None)
+        if append_atom is None:
+            return None
+        text = (
+            f"[retrieval pass {pass_index}] query={query!r} "
+            f"found {atom_count} atom(s), {new_atom_count} new"
+        )
+        return await append_atom(speaker="system", source="deliberation", text=text)
+
     async def ingest_exchange(
         self, user_text: str, lyra_text: str, context, session_id, source: str = "cli",
     ) -> tuple[int, int, int | None]:
@@ -623,21 +716,38 @@ class CognitiveCore:
 
     async def record_retrieval_outcome(
         self, user_atom_id: int, context_log_id: int | None, atom_count: int, path: str,
+        pass_index: int = 1,
     ) -> int | None:
-        """One outcomes row per executed retrieval intent (CP-D change 4).
+        """One outcomes row per executed retrieval PASS (CP-D change 4;
+        CP-J change 6 — "as CP-D records them", now once per pass rather
+        than once per turn, since a turn can take more than one pass).
 
         The outcome bit is deliberately weak: whether the assembly returned
         at least one atom above the retrievability floor (atom_count > 0),
         encoded as `valence` (1.0/0.0) so it reads the same way every other
         outcome's success bit does. `record_outcome()`'s own columns have no
-        room for atom_count/path/context_log_id as first-class fields (OUT
-        OF SCOPE does not license changing Store's schema for them) — `path`
-        goes in `actual` (Store's own free-text convention, e.g.
-        lyra_core.outcomes' ENGAGEMENT/SILENCE), `predicted` names what a
-        retrieval intent always wants ("context_available"), and
-        `environment` carries context_log_id/atom_count as a small
+        room for atom_count/path/context_log_id/pass_index as first-class
+        fields (OUT OF SCOPE does not license changing Store's schema for
+        them) — `path` goes in `actual` (Store's own free-text convention,
+        e.g. lyra_core.outcomes' ENGAGEMENT/SILENCE), `predicted` names what
+        a retrieval intent always wants ("context_available"), and
+        `environment` carries context_log_id/atom_count/pass as a small
         `key=value;...` string — parseable later, not a new column. See
         DECISIONS.md.
+
+        `pass_index` (CP-J) defaults to 1 for any caller that never
+        multi-passes (there are none left in this codebase, but the default
+        keeps this method's contract sane on its own). All PASSES of one
+        turn share the same `context_log_id` (context_log stays one row per
+        TURN, deliberately — see DECISIONS.md change 1), so "how many passes
+        did turn X take" is `COUNT(*)` — or `MAX(pass)` — of retrieval-kind
+        outcome rows sharing that context_log_id, recoverable from the store
+        alone (DONE-WHEN). `environment` now starts with `kind=retrieval;`
+        (previously unprefixed — retrieval predates CP-G's `kind=` prefix
+        convention for repo_query/repo_query_loss outcomes) so report.py can
+        select retrieval-kind rows by prefix the same way it already
+        selects repo_query-kind ones, rather than relying on the ABSENCE of
+        a prefix to mean "this is retrieval."
         """
         record_outcome = getattr(self._memory, "record_outcome", None)
         if record_outcome is None:
@@ -648,7 +758,10 @@ class CognitiveCore:
             valence=valence,
             actual=path,
             predicted="context_available",
-            environment=f"context_log_id={context_log_id};atom_count={atom_count}",
+            environment=(
+                f"kind=retrieval;context_log_id={context_log_id};"
+                f"atom_count={atom_count};pass={pass_index}"
+            ),
         )
 
     async def consolidate_retrieval_outcome(

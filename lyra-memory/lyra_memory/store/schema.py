@@ -30,7 +30,17 @@ SCHEMA_VERSION = 1
 # `sandbox_read` dream exclusion, which is a safety boundary, not a nicety.
 
 SPEAKERS: frozenset[str] = frozenset({"wilson", "lyra", "system"})
-SOURCES: frozenset[str] = frozenset({"cli", "wakeword", "ambient", "vision", "sandbox_read"})
+# CP-J: "deliberation" added — one atom per retrieval pass (change 3),
+# marked distinguishably in the growing-vocabulary sense this comment
+# already describes, not a schema change (no CREATE TABLE/CHECK constraint
+# touched; validate_atom is what enforces this set, in Python). Unlike
+# "sandbox_read", NOT added to DREAM_EXCLUDED_SOURCES below — the settled
+# design for this checkpoint is that her own deliberation IS experience,
+# not external content to fence out of identity formation the way a file
+# on disk is.
+SOURCES: frozenset[str] = frozenset({
+    "cli", "wakeword", "ambient", "vision", "sandbox_read", "deliberation",
+})
 ENVIRONMENTS: frozenset[str] = frozenset({"cli", "shell", "physics", "bns"})
 
 # A file on disk must never be able to assert what she is. Atoms from this

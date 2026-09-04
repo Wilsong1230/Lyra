@@ -358,8 +358,8 @@ async def test_collect_from_path_counts_loop_markers_from_the_log(tmp_path):
 
     m = await collect_from_path(tmp_path / "store.db", tmp_path / "runs.db", None, log_path=log_path)
 
-    assert m["intents_produced_window"] == 1
-    assert m["intents_executed_window"] == 1
+    assert m["retrieval_passes_produced_window"] == 1
+    assert m["retrieval_passes_executed_window"] == 1
     assert m["intents_declined_window"] == 1
     assert m["consolidator_fired_window"] == 1
     assert m["candidates_created_window_log"] == 1
@@ -373,7 +373,7 @@ async def test_collect_from_path_loop_counts_unavailable_without_a_log(tmp_path)
         tmp_path / "store.db", tmp_path / "runs.db", None,
         log_path=tmp_path / "no_such_log.log",
     )
-    assert m["intents_produced_window"] == UNAVAILABLE
+    assert m["retrieval_passes_produced_window"] == UNAVAILABLE
     assert m["consolidator_fired_window"] == UNAVAILABLE
 
 
@@ -517,6 +517,73 @@ async def test_collect_measurements_repo_citations_does_not_count_retrieval_outc
     )
     assert m["repo_citations_checked_window"] == 0
     assert m["outcomes_total"] == 1
+
+
+# ── CP-J: multi-pass retrieval, pass-count distribution (change 8) ─────────
+
+async def test_collect_measurements_retrieval_pass_distribution_fresh_store(store, tmp_path):
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["retrieval_pass_distribution_window"] == "(none)"
+    assert m["retrieval_cap_hit_window"] == 0
+
+
+async def test_collect_measurements_retrieval_pass_distribution_groups_by_context_log_id(store, tmp_path):
+    """Two passes of one turn (shared context_log_id=1) and one pass of a
+    second turn (context_log_id=2) must land in the "2 passes: 1 turn" /
+    "1 pass: 1 turn" buckets, not be counted as three separate one-pass
+    turns — pass count is derived from outcomes rows sharing a
+    context_log_id, per CP-J change 8."""
+    from lyra_core.interface import CognitiveCore
+
+    core = CognitiveCore(memory=store)
+    user_id = await store.append_atom(speaker="wilson", source="cli", text="hi")
+    await core.record_retrieval_outcome(user_id, context_log_id=1, atom_count=3, path="both", pass_index=1)
+    await core.record_retrieval_outcome(user_id, context_log_id=1, atom_count=1, path="vector", pass_index=2)
+    await core.record_retrieval_outcome(user_id, context_log_id=2, atom_count=0, path="neither", pass_index=1)
+
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["retrieval_pass_distribution_window"] == "1=1;2=1"
+    assert m["retrieval_cap_hit_window"] == 0
+
+
+async def test_collect_measurements_retrieval_cap_hit_counts_turns_at_the_cap(store, tmp_path):
+    from lyra_core.config import RETRIEVAL_PASS_CAP
+    from lyra_core.interface import CognitiveCore
+
+    core = CognitiveCore(memory=store)
+    user_id = await store.append_atom(speaker="wilson", source="cli", text="hi")
+    for i in range(1, RETRIEVAL_PASS_CAP + 1):
+        await core.record_retrieval_outcome(
+            user_id, context_log_id=1, atom_count=1, path="vector", pass_index=i)
+
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["retrieval_pass_distribution_window"] == f"{RETRIEVAL_PASS_CAP}=1"
+    assert m["retrieval_cap_hit_window"] == 1
+
+
+def test_render_includes_retrieval_pass_fields():
+    m = {
+        "retrieval_passes_produced_window": 7,
+        "retrieval_passes_executed_window": 7,
+        "intents_declined_window": 2,
+        "retrieval_pass_distribution_window": "1=4;2=2;3=1",
+        "retrieval_cap_hit_window": 1,
+    }
+    text = render(m, window_days=7)
+    assert "passes produced     7" in text
+    assert "passes executed     7" in text
+    assert "declined (turns)    2" in text
+    assert "pass distribution (turns by pass count)  1=4;2=2;3=1" in text
+    assert "turns hitting the cap  1" in text
 
 
 def test_render_includes_repo_index_section():

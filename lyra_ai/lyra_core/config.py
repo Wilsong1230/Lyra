@@ -68,6 +68,19 @@ MAX_TICK_DT_SECONDS = 600.0
 # CORE_CONSTRUCTED" needs a log that outlives the terminal it started in.
 LOG_PATH = Path.home() / ".lyra" / "lyra_core.log"
 
+# ── retrieval passes (CP-J) ──────────────────────────────────────────────────
+# A turn's retrieval may iterate: after a pass, if it surfaced atoms not
+# already assembled, CognitiveCore.retrieve_context_passes() retrieves again
+# with an accumulated-context-expanded query. This is the hard stop on that
+# loop, independent of whether a pass is still finding anything new — three
+# passes at the store's own CONTEXT_TOTAL_BUDGET each is already several
+# times a single-pass turn's retrieval cost; the loop's other stop condition
+# (a pass adds nothing new) is expected to fire first in the common case.
+# Not tuned against a real workload — a first, conservative value pending
+# an actual pass-count distribution to tune against (see report.py's
+# retrieval_pass_distribution_window, added alongside this constant).
+RETRIEVAL_PASS_CAP = 3
+
 # ── self-report (CP-C) ──────────────────────────────────────────────────────
 # How often the daemon emits its periodic SELF_REPORT telemetry line
 # (lyra_core.runtime, lyra_core.report). One hour: frequent enough to catch

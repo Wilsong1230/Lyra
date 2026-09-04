@@ -43,6 +43,15 @@ output:
     only ever been queried with bad search terms would show clean
     `logged_*` numbers (every real query got what it asked for) while
     `selftest_*` against the same content might reveal it.
+
+CP-J: a turn's retrieval may now iterate (bounded by RETRIEVAL_PASS_CAP).
+`context_log` still gets exactly one row per turn (unchanged); `outcomes`
+gets one row per pass. Every field whose meaning shifted from "per turn" to
+"per pass" as a result was renamed rather than left to mean something new
+under its old name -- see FIELDS' inline comments and DECISIONS.md, CP-J
+change 7. `retrieval_pass_distribution_window` and `retrieval_cap_hit_window`
+(change 8) are new, DB-derived from grouping retrieval-kind `outcomes` rows
+by shared `context_log_id`.
 """
 from __future__ import annotations
 
@@ -103,10 +112,30 @@ FIELDS: tuple[str, ...] = (
     "selftest_both", "selftest_neither",
     # CP-D: the intent loop (change 7) — log-derived counts (runtime.py's
     # six markers) plus the outcomes/candidates rows they produced.
-    "intents_produced_window", "intents_executed_window", "intents_declined_window",
+    # CP-J change 7: a turn's retrieval may now iterate, so INTENT_PRODUCED/
+    # INTENT_EXECUTED fire once per PASS, not once per turn — renamed to
+    # retrieval_passes_produced_window/retrieval_passes_executed_window so
+    # the field states what it now counts rather than silently meaning
+    # something different under its old name. intents_declined_window keeps
+    # its name: a turn either attempts retrieval (>=1 pass) or declines it
+    # once, so decline stays turn-scoped, unchanged by CP-J.
+    # consolidator_fired_window and candidates_created_window_log also now
+    # fire once per pass (CONSOLIDATOR_FIRED/CANDIDATE_CREATED are tied 1:1
+    # to each pass's own outcome_id) — left under their existing names:
+    # they always counted "how many times this step ran," which was
+    # turn-scoped only because a turn was always exactly one pass before
+    # CP-J, not because the field promised turn-scoping (see DECISIONS.md).
+    "retrieval_passes_produced_window", "retrieval_passes_executed_window",
+    "intents_declined_window",
     "outcomes_total",
     "consolidator_fired_window",
     "candidates_created_window_log", "candidates_created_window",
+    # CP-J change 8: pass-count distribution (turns by how many passes their
+    # retrieval took) and how many turns hit RETRIEVAL_PASS_CAP — both
+    # DB-derived from outcomes.environment's kind=retrieval;...;pass=N
+    # field, grouped by shared context_log_id, per CP-J's requirement that
+    # pass count be recoverable from the store alone.
+    "retrieval_pass_distribution_window", "retrieval_cap_hit_window",
     # CP-E: candidates by GROUP, not a bare count — dedup now collapses
     # matching candidates into one row (see candidate_pool.py), so a row is
     # already a distinct, post-dedup group; these three make the collapse
@@ -125,7 +154,8 @@ FIELDS: tuple[str, ...] = (
     # is an explicit one-off act, not a per-window flow), the repo-query
     # intent's own produced/executed counts (log-derived, its own markers —
     # see runtime.py's REPO_QUERY_PRODUCED/EXECUTED comment for why these
-    # are not folded into intents_produced_window/intents_executed_window),
+    # are not folded into retrieval_passes_produced_window/
+    # retrieval_passes_executed_window, CP-J's renamed fields),
     # and the citation check itself: how many were checked, how many
     # existed, how many did not, and the false rate as a number (change 8's
     # own requirement — "The false rate must be a visible number").
@@ -453,6 +483,55 @@ async def _repo_citation_candidates_section(db: aiosqlite.Connection) -> dict:
     return {"_repo_citation_labels": [(name, ec, _gap_to_threshold(ec)) for name, ec in rows]}
 
 
+# CP-J change 8. Matches record_retrieval_outcome()'s environment string —
+# "kind=retrieval;context_log_id=N;atom_count=N;pass=N" — pulling out
+# context_log_id and pass so distinct passes of one turn can be grouped by
+# their shared context_log_id without touching context_log itself (which
+# stays one row per turn by design; see DECISIONS.md CP-J).
+_RETRIEVAL_OUTCOME_ENV_RE = re.compile(r"kind=retrieval;context_log_id=(\d+);atom_count=\d+;pass=(\d+)")
+
+
+async def _retrieval_pass_distribution_section(db: aiosqlite.Connection, window_start: float) -> dict:
+    """CP-J change 8: turns by pass count, plus how many hit the cap.
+
+    Pass count for a turn = the number of retrieval-kind outcome rows that
+    share its context_log_id (each pass writes exactly one, per change 6).
+    Rows written before CP-J have no "kind=retrieval;" prefix and no
+    "pass=" field at all — they simply don't match this regex, so a window
+    straddling the CP-J rollout undercounts only its pre-CP-J turns, never
+    misattributes them to a pass count.
+    """
+    from lyra_core.config import RETRIEVAL_PASS_CAP
+
+    async with db.execute(
+        "SELECT environment FROM outcomes"
+        " WHERE environment LIKE 'kind=retrieval%' AND ts >= ?",
+        (window_start,),
+    ) as cur:
+        rows = await cur.fetchall()
+
+    passes_by_turn: dict[str, int] = {}
+    for (env,) in rows:
+        m = _RETRIEVAL_OUTCOME_ENV_RE.search(env or "")
+        if not m:
+            continue
+        context_log_id = m.group(1)
+        passes_by_turn[context_log_id] = passes_by_turn.get(context_log_id, 0) + 1
+
+    distribution: dict[int, int] = {}
+    cap_hit = 0
+    for pass_count in passes_by_turn.values():
+        distribution[pass_count] = distribution.get(pass_count, 0) + 1
+        if pass_count >= RETRIEVAL_PASS_CAP:
+            cap_hit += 1
+
+    dist_str = ";".join(f"{k}={v}" for k, v in sorted(distribution.items()))
+    return {
+        "retrieval_pass_distribution_window": dist_str if dist_str else "(none)",
+        "retrieval_cap_hit_window": cap_hit,
+    }
+
+
 async def _affect_section(db: aiosqlite.Connection, log_path: Path, window_start: float) -> dict:
     async with db.execute(
         "SELECT text FROM facts WHERE subject = '_lyra_internal_affect_state'"
@@ -568,8 +647,11 @@ _LOOP_LINE_RE = re.compile(
 
 
 def _loop_log_section(log_path: Path, window_start: float) -> dict:
+    # CP-J change 7: INTENT_PRODUCED/EXECUTED now fire once per pass, so the
+    # counts below are pass counts, not turn counts — see FIELDS' comment.
     fields = (
-        "intents_produced_window", "intents_executed_window", "intents_declined_window",
+        "retrieval_passes_produced_window", "retrieval_passes_executed_window",
+        "intents_declined_window",
         "consolidator_fired_window", "candidates_created_window_log",
     )
     if not log_path.is_file():
@@ -592,8 +674,8 @@ def _loop_log_section(log_path: Path, window_start: float) -> dict:
         counts[m.group("marker")] += 1
 
     return {
-        "intents_produced_window": counts["INTENT_PRODUCED"],
-        "intents_executed_window": counts["INTENT_EXECUTED"],
+        "retrieval_passes_produced_window": counts["INTENT_PRODUCED"],
+        "retrieval_passes_executed_window": counts["INTENT_EXECUTED"],
         "intents_declined_window": counts["INTENT_DECLINED"],
         "consolidator_fired_window": counts["CONSOLIDATOR_FIRED"],
         "candidates_created_window_log": counts["CANDIDATE_CREATED"],
@@ -603,8 +685,9 @@ def _loop_log_section(log_path: Path, window_start: float) -> dict:
 # CP-G change 8: repo_query's own two markers (runtime.py's
 # REPO_QUERY_PRODUCED/EXECUTED) — a separate regex/section rather than
 # folding them into _LOOP_LINE_RE/_loop_log_section above, so
-# intents_produced_window/intents_executed_window (CP-D's own fields, about
-# retrieval) stay exactly what they have always measured.
+# retrieval_passes_produced_window/retrieval_passes_executed_window (CP-D's
+# own fields, about retrieval, renamed by CP-J change 7) stay exactly what
+# they have always measured.
 _REPO_LOOP_LINE_RE = re.compile(
     r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ \S+ lyra_core\.runtime: "
     r"(?P<marker>REPO_QUERY_PRODUCED|REPO_QUERY_EXECUTED)\b"
@@ -714,6 +797,11 @@ async def collect_measurements(
     )
     await _section("outcomes", ("outcomes_total",), _outcomes_section(db))
     await _section(
+        "retrieval_pass_distribution",
+        ("retrieval_pass_distribution_window", "retrieval_cap_hit_window"),
+        _retrieval_pass_distribution_section(db, window_start),
+    )
+    await _section(
         "repo",
         ("commits_indexed", "repo_citations_checked_window",
          "repo_citations_hit_window", "repo_citations_miss_window",
@@ -744,7 +832,8 @@ async def collect_measurements(
         out.update(_loop_log_section(log_path, window_start))
     except Exception:
         for f in (
-            "intents_produced_window", "intents_executed_window", "intents_declined_window",
+            "retrieval_passes_produced_window", "retrieval_passes_executed_window",
+            "intents_declined_window",
             "consolidator_fired_window", "candidates_created_window_log",
         ):
             out[f] = UNAVAILABLE
@@ -879,12 +968,15 @@ def render(measurements: dict, window_days: int) -> str:
     lines.append(f"  history.db bytes    {measurements.get('history_db_bytes', UNAVAILABLE)}")
 
     lines.append("\n2i. intent loop (CP-D — from the daemon log's six markers; window)")
-    lines.append(f"  produced            {measurements.get('intents_produced_window', UNAVAILABLE)}")
-    lines.append(f"  executed            {measurements.get('intents_executed_window', UNAVAILABLE)}")
-    lines.append(f"  declined            {measurements.get('intents_declined_window', UNAVAILABLE)}")
-    lines.append(f"  consolidator fired  {measurements.get('consolidator_fired_window', UNAVAILABLE)}")
+    lines.append("  retrieval may iterate (CP-J) — produced/executed below are PASS counts, not turn counts")
+    lines.append(f"  passes produced     {measurements.get('retrieval_passes_produced_window', UNAVAILABLE)}")
+    lines.append(f"  passes executed     {measurements.get('retrieval_passes_executed_window', UNAVAILABLE)}")
+    lines.append(f"  declined (turns)    {measurements.get('intents_declined_window', UNAVAILABLE)}")
+    lines.append(f"  consolidator fired  {measurements.get('consolidator_fired_window', UNAVAILABLE)}  (per pass)")
     lines.append(f"  candidates created  {measurements.get('candidates_created_window_log', UNAVAILABLE)}"
                   f"  (candidates table, same window: {measurements.get('candidates_created_window', UNAVAILABLE)})")
+    lines.append(f"  pass distribution (turns by pass count)  {measurements.get('retrieval_pass_distribution_window', UNAVAILABLE)}")
+    lines.append(f"  turns hitting the cap  {measurements.get('retrieval_cap_hit_window', UNAVAILABLE)}")
 
     lines.append("\n2j. repo index (CP-G)")
     lines.append(f"  commits indexed     {measurements.get('commits_indexed', UNAVAILABLE)}")

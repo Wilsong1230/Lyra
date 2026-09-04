@@ -783,6 +783,105 @@ async def store(tmp_path):
     await s.close()
 
 
+# ── CP-J: retrieve_context_passes / record_deliberation_pass ────────────────
+
+class _Ctx:
+    """Minimal duck-typed ContextResult stand-in — retrieve_context_passes
+    only ever reads .atom_ids off what retrieve_context() returns."""
+
+    def __init__(self, atom_ids):
+        self.atom_ids = atom_ids
+
+
+async def test_retrieve_context_passes_yields_one_pass_when_nothing_found(store):
+    core = CognitiveCore(memory=store)
+
+    async def fake_retrieve_context(query):
+        return _Ctx([])
+    core.retrieve_context = fake_retrieve_context
+
+    passes = [p async for p in core.retrieve_context_passes("hello")]
+
+    assert len(passes) == 1
+    assert passes[0].index == 1
+    assert passes[0].new_atom_ids == []
+    assert passes[0].is_final is True
+
+
+async def test_retrieve_context_passes_stops_when_a_pass_finds_nothing_new(store):
+    core = CognitiveCore(memory=store)
+    calls = []
+
+    async def fake_retrieve_context(query):
+        calls.append(query)
+        return _Ctx([1, 2])  # same atoms every call: pass 2 finds nothing new
+    core.retrieve_context = fake_retrieve_context
+
+    passes = [p async for p in core.retrieve_context_passes("hello")]
+
+    assert len(passes) == 2
+    assert passes[0].new_atom_ids == [1, 2]
+    assert passes[0].is_final is False
+    assert passes[1].new_atom_ids == []
+    assert passes[1].is_final is True
+
+
+async def test_retrieve_context_passes_hits_the_cap(store):
+    from lyra_core.config import RETRIEVAL_PASS_CAP
+
+    core = CognitiveCore(memory=store)
+    calls = []
+
+    async def fake_retrieve_context(query):
+        calls.append(query)
+        return _Ctx([len(calls)])  # a brand-new atom id every call — never stops early
+    core.retrieve_context = fake_retrieve_context
+
+    passes = [p async for p in core.retrieve_context_passes("hello")]
+
+    assert len(passes) == RETRIEVAL_PASS_CAP
+    assert all(not p.is_final for p in passes[:-1])
+    assert passes[-1].is_final is True
+    assert passes[-1].index == RETRIEVAL_PASS_CAP
+
+
+async def test_retrieve_context_passes_expands_query_with_new_atom_text(store):
+    """CP-J change 2: pass N+1's query is the original query plus the
+    literal atoms.text of what pass N newly found — pulled by direct SQL
+    (_atom_texts), not a ContextResult's own synthesized recall text."""
+    atom_id = await store.append_atom(speaker="wilson", source="cli", text="xylophone lesson notes")
+    core = CognitiveCore(memory=store)
+    calls = []
+
+    async def fake_retrieve_context(query):
+        calls.append(query)
+        return _Ctx([atom_id])  # same atom both times -> pass 2 is final
+    core.retrieve_context = fake_retrieve_context
+
+    passes = [p async for p in core.retrieve_context_passes("hello")]
+
+    assert len(passes) == 2
+    assert calls[0] == "hello"
+    assert calls[1] == "hello\nxylophone lesson notes"
+
+
+async def test_record_deliberation_pass_writes_a_distinguishable_atom(store):
+    core = CognitiveCore(memory=store)
+
+    atom_id = await core.record_deliberation_pass(1, "hello", atom_count=2, new_atom_count=2)
+
+    assert atom_id is not None
+    async with store.db.execute(
+        "SELECT speaker, source, text FROM atoms WHERE id = ?", (atom_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    assert row[0] == "system"
+    assert row[1] == "deliberation"
+    assert "pass 1" in row[2]
+    assert "hello" in row[2]
+    assert "2 atom(s), 2 new" in row[2]
+
+
 async def test_ingest_exchange_against_a_real_store(store):
     core = CognitiveCore(memory=store)
     context = await core.retrieve_context("hello")
@@ -831,6 +930,37 @@ async def test_record_retrieval_outcome_valence_is_zero_when_nothing_was_found(s
     async with store.db.execute("SELECT valence FROM outcomes WHERE id = ?", (outcome_id,)) as cur:
         row = await cur.fetchone()
     assert row[0] == 0.0
+
+
+async def test_record_retrieval_outcome_environment_carries_kind_and_pass(store):
+    """CP-J change 6: environment now starts with 'kind=retrieval;' and
+    ends with 'pass=N' — report.py's pass-distribution section (change 8)
+    selects on the former and groups on the latter."""
+    core = CognitiveCore(memory=store)
+    user_id = await store.append_atom(speaker="wilson", source="cli", text="hello")
+
+    outcome_id = await core.record_retrieval_outcome(
+        user_id, context_log_id=7, atom_count=3, path="both", pass_index=2)
+
+    async with store.db.execute(
+        "SELECT environment FROM outcomes WHERE id = ?", (outcome_id,)
+    ) as cur:
+        (environment,) = await cur.fetchone()
+    assert environment == "kind=retrieval;context_log_id=7;atom_count=3;pass=2"
+
+
+async def test_record_retrieval_outcome_pass_index_defaults_to_one(store):
+    core = CognitiveCore(memory=store)
+    user_id = await store.append_atom(speaker="wilson", source="cli", text="hello")
+
+    outcome_id = await core.record_retrieval_outcome(
+        user_id, context_log_id=1, atom_count=0, path="neither")
+
+    async with store.db.execute(
+        "SELECT environment FROM outcomes WHERE id = ?", (outcome_id,)
+    ) as cur:
+        (environment,) = await cur.fetchone()
+    assert environment.endswith("pass=1")
 
 
 async def test_consolidate_retrieval_outcome_writes_a_candidates_row(store):

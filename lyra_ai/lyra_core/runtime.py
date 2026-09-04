@@ -90,12 +90,23 @@ DT_CLAMP_ENGAGED = "DT_CLAMP_ENGAGED"
 # CP-D: the intent loop, one marker per step, all sharing one per-turn id
 # (TurnHandler._turn_seq) so `grep` on any one of them and following the
 # turn= value finds the whole sequence for that turn.
+#
+# CP-J: retrieval's own four (INTENT_PRODUCED/EXECUTED, OUTCOME_RECORDED,
+# CONSOLIDATOR_FIRED — CANDIDATE_CREATED/TRAIT_PROMOTED are conditional, not
+# always present) now fire once per PASS rather than once per turn, all
+# still sharing the one turn= id, distinguished by a new pass= field
+# (change 5). `grep turn=N` still finds the complete sequence for turn N;
+# it is no longer one line per marker, it is one line per marker per pass.
 INTENT_PRODUCED = "INTENT_PRODUCED"
 INTENT_EXECUTED = "INTENT_EXECUTED"
 INTENT_DECLINED = "INTENT_DECLINED"
 OUTCOME_RECORDED = "OUTCOME_RECORDED"
 CONSOLIDATOR_FIRED = "CONSOLIDATOR_FIRED"
 CANDIDATE_CREATED = "CANDIDATE_CREATED"
+# CP-J change 3: logged once per pass whose deliberation atom was written
+# successfully — every write in this system gets a log line, and a
+# deliberation atom is a write like any other.
+DELIBERATION_RECORDED = "DELIBERATION_RECORDED"
 # CP-F: promotion is a write to identity — "must never be silent" (change
 # 4). Fires once per candidate that crosses into `traits` for the first
 # time this turn, zero or more times per turn (usually zero).
@@ -500,15 +511,37 @@ class TurnHandler:
         # anything itself. Producing and executing are one step apart here
         # (nothing currently separates them), but logged as two distinct
         # markers per change 6.
+        # CP-J: retrieval may take more than one pass (SCOPE) — the
+        # PRODUCED/EXECUTED pair below now fires once per pass, all still
+        # under this one turn_id, distinguished by pass= (change 5).
+        # `passes` (a list[RetrievalPass]) is threaded through to
+        # _finish_exchange, which does the per-pass outcome/deliberation/
+        # consolidation/promotion writes AFTER ingest_exchange() exists to
+        # give them a user_atom_id — the same two-phase shape single-pass
+        # retrieval already had (handle() executes and logs the retrieval
+        # itself; _finish_exchange() records what it produced), just
+        # iterated now instead of run once.
         retrieval_intended = any(i.kind == IntentKind.retrieval for i in self.last_intents)
+        passes: list = []
         if retrieval_intended:
-            log.info("%s turn=%d kind=retrieval", INTENT_PRODUCED, turn_id)
-            context = await self._core.retrieve_context(message)
-            atom_count, path = self._retrieval_path(context)
-            log.info(
-                "%s turn=%d kind=retrieval atom_count=%d path=%s",
-                INTENT_EXECUTED, turn_id, atom_count, path,
-            )
+            async for rp in self._core.retrieve_context_passes(message):
+                passes.append(rp)
+                log.info("%s turn=%d pass=%d kind=retrieval", INTENT_PRODUCED, turn_id, rp.index)
+                atom_count, path = self._retrieval_path(rp.context)
+                log.info(
+                    "%s turn=%d pass=%d kind=retrieval atom_count=%d path=%s"
+                    " new_atom_count=%d is_final=%s",
+                    INTENT_EXECUTED, turn_id, rp.index, atom_count, path,
+                    len(rp.new_atom_ids), rp.is_final,
+                )
+            # The LAST pass's context is what actually informs the prompt
+            # and what gets logged to context_log (one row per TURN,
+            # unchanged — see DECISIONS.md change 1): each pass's query is
+            # strictly more informed than the one before it, so the final
+            # pass's own ContextResult is the most complete single one to
+            # show her, not a union of every pass's independently-budgeted
+            # text.
+            context = passes[-1].context if passes else None
         else:
             # Declined: frustration outweighed the retrieval pressure this
             # tick (action_selection.py) — valence is logged as the
@@ -550,7 +583,7 @@ class TurnHandler:
                 await self._finish_exchange(
                     message, response, context, session, turn_id,
                     retrieval_intended, repo_query_intended, repo_context,
-                    repo_query_pressure,
+                    repo_query_pressure, passes,
                 )
                 return response
             self._history.add(session, "assistant", truncate_at_tool_call(response))
@@ -562,61 +595,75 @@ class TurnHandler:
         await self._finish_exchange(
             message, _VISION_FALLBACK, context, session, turn_id,
             retrieval_intended, repo_query_intended, repo_context,
-            repo_query_pressure,
+            repo_query_pressure, passes,
         )
         return _VISION_FALLBACK
 
     async def _finish_exchange(
         self, message: str, response: str, context, session: str, turn_id: int,
         retrieval_intended: bool, repo_query_intended: bool = False, repo_context=None,
-        repo_query_pressure: float = 0.0,
+        repo_query_pressure: float = 0.0, passes: list | None = None,
     ) -> None:
-        """ingest_exchange() always; the retrieval outcome/consolidator/
-        promotion steps only when a retrieval intent actually executed this
-        turn (change 4: "one outcome row per EXECUTED retrieval intent" —
-        a declined turn produced neither an intent to execute nor context
-        to score); the repo-query citation-check/outcome/consolidation
+        """ingest_exchange() always (once per TURN — context_log stays
+        turn-level, DECISIONS.md change 1); the retrieval outcome/
+        deliberation/consolidator/promotion steps once per PASS (CP-J
+        changes 3/5/6) — `passes` is empty when retrieval was declined, so
+        the loop below is simply a no-op then, same as "the retrieval
+        outcome steps only when a retrieval intent actually executed"
+        always meant; the repo-query citation-check/outcome/consolidation
         steps only when a repo_query intent executed — independently of
-        retrieval_intended, since the two are unrelated conditions and
-        either can be true without the other (CP-G change 6: even a repo
-        turn with nothing retrieved or nothing cited still gets its
+        retrieval_intended/passes, since the two are unrelated conditions
+        and either can be true without the other (CP-G change 6: even a
+        repo turn with nothing retrieved or nothing cited still gets its
         outcome row). `repo_context` is the RepoContext retrieve_repo_
         context() returned this turn (or None) — CP-H needs to know
         whether commit rows were actually retrieved, not just whether the
         intent executed, to pick the right citation label (change 1's
         third vs. fourth branch)."""
+        passes = passes or []
         user_atom_id, _lyra_atom_id, context_log_id = await self._core.ingest_exchange(
             message, response, context, session_id=session)
 
-        if retrieval_intended:
-            atom_count, path = self._retrieval_path(context)
+        for rp in passes:
+            atom_count, path = self._retrieval_path(rp.context)
             outcome_id = await self._core.record_retrieval_outcome(
-                user_atom_id, context_log_id, atom_count, path)
-            if outcome_id is not None:
+                user_atom_id, context_log_id, atom_count, path, pass_index=rp.index)
+            if outcome_id is None:
+                continue
+            log.info(
+                "%s turn=%d pass=%d outcome_id=%d atom_count=%d path=%s context_log_id=%s",
+                OUTCOME_RECORDED, turn_id, rp.index, outcome_id, atom_count, path, context_log_id,
+            )
+
+            # CP-J change 3: one deliberation atom per pass — a write like
+            # any other, logged like any other.
+            deliberation_id = await self._core.record_deliberation_pass(
+                rp.index, rp.query, atom_count, len(rp.new_atom_ids))
+            if deliberation_id is not None:
                 log.info(
-                    "%s turn=%d outcome_id=%d atom_count=%d path=%s context_log_id=%s",
-                    OUTCOME_RECORDED, turn_id, outcome_id, atom_count, path, context_log_id,
+                    "%s turn=%d pass=%d atom_id=%d",
+                    DELIBERATION_RECORDED, turn_id, rp.index, deliberation_id,
                 )
 
-                consolidated = await self._core.consolidate_retrieval_outcome(atom_count > 0, outcome_id)
-                log.info("%s turn=%d outcome_id=%d", CONSOLIDATOR_FIRED, turn_id, outcome_id)
-                if consolidated is not None:
-                    trait_name, _trait_value = consolidated
-                    log.info("%s turn=%d trait_name=%r", CANDIDATE_CREATED, turn_id, trait_name)
+            consolidated = await self._core.consolidate_retrieval_outcome(atom_count > 0, outcome_id)
+            log.info("%s turn=%d pass=%d outcome_id=%d", CONSOLIDATOR_FIRED, turn_id, rp.index, outcome_id)
+            if consolidated is not None:
+                trait_name, _trait_value = consolidated
+                log.info("%s turn=%d pass=%d trait_name=%r", CANDIDATE_CREATED, turn_id, rp.index, trait_name)
 
-                # CP-F change 2: promotion runs after consolidation, every
-                # turn — IdentityEngine.consolidate() is cheap (one SELECT
-                # over candidates plus, at most, the handful of rows that
-                # actually changed) and idempotent when nothing crosses a
-                # threshold, so there is no reason to gate it behind
-                # consolidated being non-None.
-                promotions = await self._core.promote_traits()
-                for promotion in promotions:
-                    log.info(
-                        "%s turn=%d trait_name=%r evidence_count=%d threshold=%d",
-                        TRAIT_PROMOTED, turn_id, promotion["trait_name"],
-                        promotion["evidence_count"], promotion["threshold"],
-                    )
+            # CP-F change 2: promotion runs after consolidation, every
+            # pass now (CP-J) — IdentityEngine.consolidate() is cheap (one
+            # SELECT over candidates plus, at most, the handful of rows
+            # that actually changed) and idempotent when nothing crosses a
+            # threshold, so there is no reason to gate it behind
+            # consolidated being non-None, or behind which pass this is.
+            promotions = await self._core.promote_traits()
+            for promotion in promotions:
+                log.info(
+                    "%s turn=%d pass=%d trait_name=%r evidence_count=%d threshold=%d",
+                    TRAIT_PROMOTED, turn_id, rp.index, promotion["trait_name"],
+                    promotion["evidence_count"], promotion["threshold"],
+                )
 
         if repo_query_intended:
             hit_count, miss_count = await self._core.check_repo_citations(response)
