@@ -14,6 +14,15 @@ Not rigorous. Sufficient to catch regressions, which is the entire claim.
 
 Run it before and after any retrieval change. Record the numbers *before*
 tuning anything, or the tuning has nothing to argue with.
+
+Against a throwaway store (the default) the labeled set supplies its own
+corpus, seeded fresh each run. Pass --store to score against real
+accumulated turns instead — the daemon's live store.db, say — in which case
+the labeled set's "corpus" is ignored (there is nothing to seed; the store
+already has whatever it has) and only its "turns" queries are scored:
+
+    python -m lyra_memory.store.evaluate eval/retrieval_baseline.json \\
+        --store ~/.lyra/store.db
 """
 from __future__ import annotations
 
@@ -142,13 +151,29 @@ async def evaluate(labeled: dict, store: Store | None = None) -> Report:
             await store.close()
 
 
+async def _run(labeled: dict, store_path: Path | None) -> Report:
+    if store_path is None:
+        return await evaluate(labeled)
+    store = await Store.open(store_path)
+    try:
+        return await evaluate(labeled, store=store)
+    finally:
+        await store.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("labeled", type=Path, help="path to a labeled JSON set")
+    parser.add_argument(
+        "--store", type=Path, default=None, dest="store_path",
+        help="score against this store.db (e.g. the daemon's live store) "
+             "instead of a throwaway store seeded from the labeled set's "
+             "own corpus",
+    )
     args = parser.parse_args()
 
     labeled = json.loads(args.labeled.read_text())
-    report = asyncio.run(evaluate(labeled))
+    report = asyncio.run(_run(labeled, args.store_path))
     print(report.render())
 
 

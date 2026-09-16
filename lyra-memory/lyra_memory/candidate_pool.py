@@ -40,6 +40,23 @@ def _pack(vec: list[float]) -> bytes:
     return struct.pack(f"{EMBED_DIM}f", *vec)
 
 
+def _append_evidence(existing: str | None, new: str | None) -> str | None:
+    """Accumulate evidence across a merge instead of replacing it.
+
+    The prior behaviour (`COALESCE(?, evidence_text)`) kept only the FIRST
+    evidence a candidate ever received and silently dropped every piece
+    offered on a later merge — provenance for everything but the founding
+    observation was unrecoverable. Newline-joined because it is the existing
+    `evidence_text` column, not a new one: each merge's evidence stays a
+    line a caller (or a human reading the row) can split back out.
+    """
+    if not new:
+        return existing
+    if not existing:
+        return new
+    return f"{existing}\n{new}"
+
+
 def _merge_centroid(stored: bytes, incoming: bytes, stored_weight: int) -> bytes:
     """Running mean of a cluster's member vectors, renormalized.
 
@@ -113,14 +130,15 @@ class CandidatePool:
         if nearest and nearest[1] < _L2_THRESHOLD:
             candidate_id = nearest[0]
             async with self._conn.execute(
-                "SELECT evidence_count FROM candidates WHERE id = ?", (candidate_id,)
+                "SELECT evidence_count, evidence_text FROM candidates WHERE id = ?", (candidate_id,)
             ) as cur:
                 row = await cur.fetchone()
             new_count = row[0] + 1
+            merged_evidence = _append_evidence(row[1], evidence)
             await self._conn.execute(
                 "UPDATE candidates SET trait_value = ?, evidence_count = ?, last_seen = ?,"
-                " evidence_text = COALESCE(?, evidence_text) WHERE id = ?",
-                (trait_value, new_count, ts, evidence, candidate_id),
+                " evidence_text = ? WHERE id = ?",
+                (trait_value, new_count, ts, merged_evidence, candidate_id),
             )
             async with self._conn.execute(
                 "SELECT embedding FROM vec_candidates WHERE rowid = ?", (candidate_id,)
@@ -160,7 +178,7 @@ class CandidatePool:
         """
         ts = time.time()
         async with self._conn.execute(
-            "SELECT id, evidence_count FROM candidates WHERE trait_name = ?", (trait_name,)
+            "SELECT id, evidence_count, evidence_text FROM candidates WHERE trait_name = ?", (trait_name,)
         ) as cur:
             row = await cur.fetchone()
 
@@ -173,10 +191,11 @@ class CandidatePool:
             print(f"[{datetime.now().isoformat()}] [CandidatePool] INSERT(exact) {trait_name!r}")
         else:
             new_count = row[1] + 1
+            merged_evidence = _append_evidence(row[2], evidence)
             await self._conn.execute(
                 "UPDATE candidates SET trait_value = ?, evidence_count = ?, last_seen = ?,"
-                " evidence_text = COALESCE(?, evidence_text) WHERE id = ?",
-                (trait_value, new_count, ts, evidence, row[0]),
+                " evidence_text = ? WHERE id = ?",
+                (trait_value, new_count, ts, merged_evidence, row[0]),
             )
             print(
                 f"[{datetime.now().isoformat()}] [CandidatePool] INCREMENT(exact) "

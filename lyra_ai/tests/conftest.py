@@ -1,34 +1,20 @@
-"""Test-time embedding backend — the same selection lyra-memory's tests make.
+"""Test-time embedding backend selection.
 
-The daemon's turn path writes every turn as an atom, and an atom write
-embeds. When `all-MiniLM-L6-v2` is not already cached (no network to
-huggingface.co, or none at all), select the package's deterministic
-offline stand-in so the mechanics stay verifiable. A machine with the model
-cached runs the real thing and this file changes nothing.
+Opt-in only (CP-B, change 8). This file used to probe whether
+all-MiniLM-L6-v2 was cached and silently set LYRA_EMBED_BACKEND=hashed on a
+cache miss — convenient, but it made a genuinely missing model
+indistinguishable from a deliberate offline choice, in tests and (had the
+same probe ever been reused there) on the daemon's own startup path, which
+change 8 requires to fail loudly instead. See lyra_core.runtime.Runtime.start
+for the daemon-side half of this: an embed("warmup") call it does not
+catch-and-fall-back from.
+
+There is nothing left to do here: lyra_memory.embeddings reads
+LYRA_EMBED_BACKEND from the environment at call time on its own. Set it
+yourself to run offline —
+
+    LYRA_EMBED_BACKEND=hashed python -m pytest
+
+— and leave it unset to require the real model, cached or not.
 """
 from __future__ import annotations
-
-import os
-
-from lyra_memory.config import EMBED_MODEL
-
-
-def _real_model_is_cached() -> bool:
-    previous = os.environ.get("HF_HUB_OFFLINE")
-    os.environ["HF_HUB_OFFLINE"] = "1"
-    try:
-        from sentence_transformers import SentenceTransformer
-
-        SentenceTransformer(EMBED_MODEL)
-        return True
-    except Exception:
-        return False
-    finally:
-        if previous is None:
-            os.environ.pop("HF_HUB_OFFLINE", None)
-        else:
-            os.environ["HF_HUB_OFFLINE"] = previous
-
-
-if os.environ.get("LYRA_EMBED_BACKEND", "minilm").lower() != "hashed" and not _real_model_is_cached():
-    os.environ["LYRA_EMBED_BACKEND"] = "hashed"

@@ -46,18 +46,35 @@ class IdentityEngine:
             return "surface"
         return None
 
-    async def consolidate(self, dream_id: int | None = None) -> None:
+    async def consolidate(self, dream_id: int | None = None) -> list[dict]:
+        """Read every candidate at or above the surface threshold and
+        upsert a trait for each. Returns one dict per candidate that
+        actually CROSSED FROM NONEXISTENT TO EXISTING this call (event=
+        "promoted", not "confidence_change"/"tier_change"/write-protected
+        no-op) — CP-F: callers that need to know a first promotion
+        happened (to log TRAIT_PROMOTED, or to test for one) previously
+        had no way to find out short of diffing `traits` themselves.
+        """
         candidates = await self._pool.get_candidates(min_evidence=1)
+        promotions: list[dict] = []
         for c in candidates:
             stability = self._stability_for(c.evidence_count)
             if stability is None:
                 continue
             confidence = min(c.evidence_count / TRAIT_THRESHOLDS["core"], 1.0)
-            await self._upsert_trait(
+            promoted = await self._upsert_trait(
                 c.trait_name, c.trait_value, confidence, stability, c.evidence_count,
                 dream_id=dream_id,
             )
+            if promoted:
+                promotions.append({
+                    "trait_name": c.trait_name,
+                    "evidence_count": c.evidence_count,
+                    "threshold": TRAIT_THRESHOLDS[stability],
+                    "stability": stability,
+                })
         await assert_trait_history_integrity(self._conn)
+        return promotions
 
     async def _upsert_trait(
         self,
@@ -67,8 +84,11 @@ class IdentityEngine:
         stability: str,
         evidence_count: int,
         dream_id: int | None = None,
-    ) -> None:
-        """Write or update a trait.
+    ) -> bool:
+        """Write or update a trait. Returns True iff this call is the
+        candidate's FIRST crossing into `traits` (a true promotion, event=
+        "promoted") — False for every other outcome (confidence_change,
+        tier_change, write-protected no-op, identical-state no-op).
 
         Hard rule: never mutate a trait without a trait_history row in the
         same transaction. Both statements run before the single commit below;
@@ -85,9 +105,9 @@ class IdentityEngine:
         if row:
             trait_id, old_value, old_conf, old_tier, old_evidence = row
             if old_tier == "core" and old_conf >= CORE_CONFIDENCE_LOCK:
-                return  # write-protected: no mutation, no history
+                return False  # write-protected: no mutation, no history
             if (old_value, old_conf, old_tier, old_evidence) == (value, confidence, stability, evidence_count):
-                return  # no-op: no mutation, no history
+                return False  # no-op: no mutation, no history
             await self._conn.execute(
                 "UPDATE traits SET value=?, confidence=?, stability=?, evidence_count=?, updated_at=? WHERE id=?",
                 (value, confidence, stability, evidence_count, ts, trait_id),
@@ -102,6 +122,8 @@ class IdentityEngine:
                  old_tier, stability, evidence_count, dream_id),
             )
             print(f"[{datetime.now().isoformat()}] [IdentityEngine] UPDATE {name!r} stability={stability!r} confidence={confidence:.2f}")
+            await self._conn.commit()
+            return False
         else:
             cur = await self._conn.execute(
                 "INSERT INTO traits (name, value, confidence, stability, evidence_count, updated_at)"
@@ -117,9 +139,14 @@ class IdentityEngine:
                 (ts, trait_id, name, "promoted", None, confidence,
                  None, stability, evidence_count, dream_id),
             )
-            print(f"[{datetime.now().isoformat()}] [IdentityEngine] PROMOTE {name!r} stability={stability!r}")
-
-        await self._conn.commit()
+            threshold = TRAIT_THRESHOLDS[stability]
+            print(
+                f"[{datetime.now().isoformat()}] [IdentityEngine] TRAIT_PROMOTED"
+                f" name={name!r} evidence_count={evidence_count} threshold={threshold}"
+                f" stability={stability!r}"
+            )
+            await self._conn.commit()
+            return True
 
     async def get_top_traits(self, limit: int = RETRIEVAL_TRAIT_LIMIT) -> list[Trait]:
         async with self._conn.execute(

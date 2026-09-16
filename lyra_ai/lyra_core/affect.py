@@ -1,15 +1,30 @@
-"""lyra_core.affect — three-timescale affect dynamics.
+"""lyra_core.affect — two-timescale affect dynamics, exactly integrated.
 
-AffectEngine holds a live AffectState with three timescales:
+AffectEngine holds a live AffectState:
   emotion     — fast; responds strongly/quickly to inputs; decays toward mood
   mood        — medium; slow running average; drifts toward recent emotion
-  temperament — the time constants themselves (~fixed in Phase 3.1)
+  temperament — the time constants (accum_rate, emotion_decay, mood_drift).
+                Fixed at construction/restore; update() never advances it.
+                Measured (CP-A.1, docs/AFFECT_CHARACTERIZATION.md): not a
+                third dynamic timescale, so "three timescales" above is
+                register language, not this module's behavior.
 
-Dynamics (simultaneous Euler step, applied to both valence and arousal axes):
-  Δemotion = accum_rate * input * dt  +  emotion_decay * (mood - emotion) * dt
-  Δmood    = mood_drift * (emotion - mood) * dt
+Dynamics, per axis (valence and arousal are independent copies of the same
+2x2 linear system):
+  emotion' = forcing + emotion_decay * (mood - emotion)
+  mood'    = mood_drift * (emotion - mood)
+where forcing = accum_rate * input, held constant over one update() step.
 
-Public valence/arousal delegate to emotion (Phase 0 surface preserved).
+CP-A.1 measured that integrating this pair as two independent single-variable
+relaxations (each exact in isolation, each using the OTHER variable's
+pre-step value — a Jacobi/operator-split scheme) does not agree across tick
+rates: at dt=60 with emotion_decay=2.0/mood_drift=0.2 the pair nearly swaps
+every step instead of converging. CP-A.2 replaces that split with the exact
+solution of the coupled 2x2 system over one step — see _step() — which is
+provably tick-rate invariant (docs/AFFECT_CHARACTERIZATION.md, "agreement
+check"): running the same wall-clock span at any dt produces the same
+terminal state to floating-point precision, because it is not a
+discretization of the ODE, it is that ODE's own solution evaluated at t=dt.
 """
 from __future__ import annotations
 
@@ -22,7 +37,7 @@ _ENCOURAGE_EPS = 1e-9
 
 
 class AffectEngine:
-    """Live affect substrate with three-timescale dynamics."""
+    """Live affect substrate: emotion and mood, exactly coupled; temperament static."""
 
     def __init__(
         self,
@@ -70,40 +85,50 @@ class AffectEngine:
 
         Pure, deterministic — no I/O, no randomness.  Control axis reserved.
         """
-        ev, ea = self._emotion_v, self._emotion_a
-        mv, ma = self._mood_v, self._mood_a
-
         valence_accum_rate = self._accum_rate
         if self._encourage_remaining > _ENCOURAGE_EPS and valence_input < 0.0:
             valence_accum_rate *= max(0.0, 1.0 - self._encourage_strength)
 
-        # Relaxation fractions. The decay terms are integrated EXACTLY rather
-        # than by an explicit Euler step: for dx/dt = -k(x - target) the closed
-        # form over an interval dt moves x a fraction (1 - e^(-k·dt)) of the
-        # way to target. That fraction is in [0, 1) for every dt > 0, so the
-        # step can never overshoot and the engine is stable at ANY dt.
-        #
-        # Explicit Euler used a fraction of k·dt, which exceeds 1 once
-        # dt > 1/k and exceeds 2 once dt > 2/k — at which point the state
-        # oscillates with growing amplitude. With emotion_decay=2.0 the limit
-        # is dt < 1.0, and the standalone runtime polls at dt=2.0: idle
-        # valence diverged past 3e14 within thirty ticks. For small dt the two
-        # forms agree to first order (1 - e^(-k·dt) ≈ k·dt), so tuned
-        # behaviour at the conversational dt=0.1 is essentially unchanged.
-        emotion_relax = 1.0 - math.exp(-self._emotion_decay * dt)
-        mood_relax    = 1.0 - math.exp(-self._mood_drift * dt)
-
-        # Emotion: accumulate input, then relax toward mood
-        self._emotion_v = ev + valence_accum_rate * valence_input * dt \
-                             + (mv - ev) * emotion_relax
-        self._emotion_a = ea + self._accum_rate * arousal_input * dt \
-                             + (ma - ea) * emotion_relax
-
-        # Mood: relax toward emotion (uses old emotion values)
-        self._mood_v = mv + (ev - mv) * mood_relax
-        self._mood_a = ma + (ea - ma) * mood_relax
+        self._emotion_v, self._mood_v = self._step(
+            self._emotion_v, self._mood_v, valence_accum_rate * valence_input, dt,
+        )
+        self._emotion_a, self._mood_a = self._step(
+            self._emotion_a, self._mood_a, self._accum_rate * arousal_input, dt,
+        )
 
         self._encourage_remaining = max(0.0, self._encourage_remaining - dt)
+
+    def _step(self, e0: float, m0: float, forcing: float, dt: float) -> tuple[float, float]:
+        """Exact solution at t=dt of e'=forcing+k_e(m-e), m'=k_m(e-m).
+
+        Decompose into the sum S = k_m*e + k_e*m and the difference D = e-m.
+        S has no restoring term of its own — k_m*e' + k_e*m' = k_m*forcing
+        exactly, regardless of e or m — so S is conserved when forcing=0 and
+        otherwise integrates forcing directly: S(dt) = S0 + k_m*forcing*dt.
+        D decouples into a single ordinary relaxation, D' = forcing - r*D
+        where r = k_e+k_m (rate 1/tau_e + 1/tau_m, per the register
+        correction), whose exact solution relaxes D toward its forced
+        offset forcing/r at fraction (1 - e^(-r·dt)) — the same
+        never-overshoots-at-any-dt closed form CP-A already used for a
+        single variable, now applied to the coupled pair's own difference
+        channel instead of to each variable against the other's stale
+        value. e and m are then read back off (S, D) algebraically; no
+        substep, no operator split, exact for any dt > 0 including a
+        single tick spanning the whole gap.
+        """
+        k_e, k_m = self._emotion_decay, self._mood_drift
+        r = k_e + k_m
+        relax = 1.0 - math.exp(-r * dt)
+
+        d0 = e0 - m0
+        s0 = k_m * e0 + k_e * m0
+
+        d1 = d0 * (1.0 - relax) + (forcing / r) * relax
+        s1 = s0 + k_m * forcing * dt
+
+        e1 = (s1 + k_e * d1) / r
+        m1 = (s1 - k_m * d1) / r
+        return e1, m1
 
     # ── State introspection ───────────────────────────────────────────────────
 

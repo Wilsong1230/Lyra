@@ -62,8 +62,12 @@ async def test_promotion_writes_history_row(tmp_db_path: Path):
     conn, _, engine = await _make_engine(tmp_db_path)
     await _insert_candidate(conn, "curiosity", 5)  # surface threshold
 
-    await engine.consolidate()
+    promotions = await engine.consolidate()
 
+    assert promotions == [{
+        "trait_name": "curiosity", "evidence_count": 5,
+        "threshold": 5, "stability": "surface",
+    }]
     rows = await _history_rows(conn)
     assert len(rows) == 1
     trait_id, label, event, conf_before, conf_after, tier_before, tier_after, evid, dream_id = rows[0]
@@ -87,11 +91,12 @@ async def test_confidence_change_writes_history_row(tmp_db_path: Path):
     await _insert_candidate(conn, "curiosity", 5)
     await engine.consolidate()
 
-    # more evidence, same tier → confidence_change
+    # more evidence, same tier → confidence_change, not a second promotion
     await conn.execute("UPDATE candidates SET evidence_count = 8 WHERE trait_name='curiosity'")
     await conn.commit()
-    await engine.consolidate()
+    promotions = await engine.consolidate()
 
+    assert promotions == []
     rows = await _history_rows(conn)
     assert len(rows) == 2
     _, _, event, conf_before, conf_after, tier_before, tier_after, evid, _ = rows[1]

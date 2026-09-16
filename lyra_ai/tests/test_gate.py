@@ -73,16 +73,21 @@ def test_every_non_allowed_kind_is_blocked():
 
 # ── Allow-list shape ──────────────────────────────────────────────────────────
 
-def test_allow_list_is_exactly_the_four_safe_kinds():
+def test_allow_list_is_exactly_the_six_reviewed_kinds():
     """Adding a new IntentKind without updating ALLOWED_KINDS must fail here.
 
     This is the tripwire: new capability + no deliberate allow-list edit = red.
+    IntentKind.retrieval added and reviewed at CP-D; IntentKind.repo_query
+    added and reviewed at CP-G — see gate.py's own comment at ALLOWED_KINDS
+    and DECISIONS.md.
     """
     expected = frozenset({
         IntentKind.speak,
         IntentKind.set_state,
         IntentKind.look,
         IntentKind.noop,
+        IntentKind.retrieval,
+        IntentKind.repo_query,
     })
     assert ALLOWED_KINDS == expected
 

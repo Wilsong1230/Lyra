@@ -20,11 +20,29 @@ from lyra_core.interface import Intent, IntentKind
 # Extend this set only after explicit review of the new capability.
 # Adding a kind here without a corresponding gate review is the mistake
 # this structure is designed to make visible.
+#
+# CP-G: IntentKind.repo_query reviewed and added. The capability is "read
+# from the repo-commit facts the daemon already owns, triggered by a
+# deterministic keyword check in CognitiveCore.tick() (interface.py) rather
+# than routed through ActionSelector/drives (action_selection.py is out of
+# this checkpoint's scope) — never write access, and the only thing the
+# executing path can do with it is a SELECT over `facts` plus one `outcomes`
+# row recording citation hit/miss counts. See DECISIONS.md.
+#
+# CP-D: IntentKind.retrieval reviewed and added. The capability is "read
+# from the store the daemon already owns, gated by frustration exactly like
+# boredom/relational" (action_selection.py) — no new external effect, no
+# write the daemon couldn't already do on the turn path. Not in the closed
+# FILES set for CP-D, but ALLOWED_KINDS is the one place a new IntentKind
+# MUST be added before it can ever execute (an ungated kind is silently
+# dropped by _gate_intents, never a bypass) — see DECISIONS.md.
 ALLOWED_KINDS: frozenset[IntentKind] = frozenset({
     IntentKind.speak,
     IntentKind.set_state,
     IntentKind.look,
     IntentKind.noop,
+    IntentKind.retrieval,
+    IntentKind.repo_query,
 })
 
 

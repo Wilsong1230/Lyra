@@ -34,7 +34,30 @@ Drive → intent mapping (within ALLOWED_KINDS only):
   "boredom" ≥ speak_threshold
                → IntentKind.speak (reach out — unprompted speech)
   "relational" → IntentKind.speak (address recurring friction)
+  "retrieval"  → IntentKind.retrieval (CP-D: retrieve context for the turn
+                 in progress — proposed by CognitiveCore.tick() at full
+                 strength whenever a "conversation" observation arrived
+                 this tick; the SAME frustration flip below can still
+                 override it, exactly as it can override boredom/relational)
+  "repo_query" → IntentKind.repo_query (CP-I: answer over indexed repo
+                 commit history — proposed by CognitiveCore.tick() at full
+                 strength whenever this tick's conversational text matches
+                 the repo keyword set; same frustration flip as retrieval)
   (nothing)    → IntentKind.noop  (abandon / wait)
+
+CP-D: retrieval reuses this file's one mechanism (drive pressure vs.
+frustration) rather than inventing a second way to decide anything,
+specifically so a frustrated-enough moment can make Lyra skip even pulling
+up context to answer — the same "abandons under frustration" shape this
+file already gives boredom and relational, not a new concept.
+
+CP-I: repo_query reuses the identical mechanism for the identical reason.
+CP-G had proposed it by appending directly to tick()'s intent list,
+bypassing this file entirely — never scored, always won when the keyword
+matched, and a decline was structurally impossible to represent (there was
+no comparison to lose). That is fixed here, not by inventing a second
+scoring path but by routing repo_query through the same one this file
+already has.
 
 WHY BOREDOM ALSO SPEAKS
 ───────────────────────
@@ -104,6 +127,22 @@ class ActionSelector:
         if relational > 0.0 and relational > frustration:
             # Drive wins: address recurring friction
             chosen.append(Intent(kind=IntentKind.speak, payload={"reason": "friction"}))
+
+        # CP-D: retrieval — same comparison, a different "drive" (not one of
+        # BoredomDrive/RelationalDrive; CognitiveCore.tick() sets this
+        # pressure directly from whether a turn is in progress this tick).
+        retrieval = drive_pressures.get("retrieval", 0.0)
+        if retrieval > 0.0 and retrieval > frustration:
+            chosen.append(Intent(kind=IntentKind.retrieval, payload={"reason": "turn"}))
+
+        # CP-I: repo_query — same comparison again. CognitiveCore.tick()
+        # sets this pressure from a keyword match against the turn's own
+        # text, zero otherwise; > 0.0 and it does not beat frustration is
+        # exactly the "lost the competition" case CP-I's caller (runtime.py)
+        # now records as an outcome row rather than dropping silently.
+        repo_query = drive_pressures.get("repo_query", 0.0)
+        if repo_query > 0.0 and repo_query > frustration:
+            chosen.append(Intent(kind=IntentKind.repo_query, payload={"reason": "repo"}))
 
         if not chosen:
             # All drives overridden or no drives active: abandon / wait

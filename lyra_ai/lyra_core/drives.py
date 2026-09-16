@@ -3,8 +3,9 @@
 Two drives, each emitting pressure and an AffectPush that the affect engine
 (Phase 3.6) will consume.  Nothing reads drives yet; Phase 3.3 wires them.
 
-BoredomDrive: self-directed.  Idle time → pressure rises.  Relief comes only
-  from engagement at the learnable edge (competence-increasing activity).  A
+BoredomDrive: self-directed.  Idle time → pressure rises toward a bounded
+  ceiling (CP-A.2; see _BOREDOM_PRESSURE_CEILING).  Relief comes only from
+  engagement at the learnable edge (competence-increasing activity).  A
   random non-learning action provides zero relief — the gating is explicit.
 
 RelationalDrive: recurrence signal.  Tracks flagged recurring problems.
@@ -22,6 +23,7 @@ CompetenceTracker: proxy substrate for BoredomDrive.  Tracks recent prediction
 """
 from __future__ import annotations
 
+import math
 from collections import deque
 from dataclasses import dataclass
 
@@ -90,6 +92,23 @@ class CompetenceTracker:
 _BOREDOM_VALENCE_SCALE = 0.2
 _BOREDOM_AROUSAL_SCALE = 0.1
 
+# CP-A.2: idle pressure approaches this ceiling instead of growing without
+# limit (CP-A.1 measured the old `pressure += idle_rate*dt` as unbounded —
+# docs/AFFECT_CHARACTERIZATION.md 3b). idle_rate is kept as the near-origin
+# slope (dPressure/dt at pressure=0 is still idle_rate, unchanged), so a
+# fresh drive's early behavior is exactly what it was before this constant
+# existed; only the long-run limit is new.
+#
+# Sized against expression.py's prose_hint threshold (_VALENCE_THRESHOLD =
+# 0.3 on the BLENDED emotion+mood valence), not just against |value| < 1: a
+# six-exchange conversation at realistic gaps must not cross that threshold
+# (CP-A.2's done-when says so explicitly — "does not turn her terse"). 0.5
+# crossed it (-4.46 blended); this value keeps the same six-exchange probe
+# scenario at -0.18, comfortably clear. See DECISIONS.md (CP-A.2) for how
+# this value and MAX_TICK_DT_SECONDS were chosen together, and
+# docs/AFFECT_CHARACTERIZATION.md for the measured numbers.
+_BOREDOM_PRESSURE_CEILING = 0.02
+
 
 class BoredomDrive:
     """Self-directed drive.  Idle time inflates pressure; only learnable-edge
@@ -101,10 +120,12 @@ class BoredomDrive:
         competence: CompetenceTracker,
         idle_rate: float = 0.1,
         relief_rate: float = 0.5,
+        pressure_ceiling: float = _BOREDOM_PRESSURE_CEILING,
     ) -> None:
         self._competence = competence
         self._idle_rate = idle_rate
         self._relief_rate = relief_rate
+        self._pressure_ceiling = pressure_ceiling
         self._pressure: float = 0.0
 
     def update(self, dt: float, engaged: bool = False) -> None:
@@ -112,7 +133,16 @@ class BoredomDrive:
         if engaged and self._competence.at_learnable_edge:
             self._pressure = max(0.0, self._pressure - self._relief_rate * dt)
         else:
-            self._pressure += self._idle_rate * dt
+            # Exact exponential approach to the ceiling: dPressure/dt =
+            # idle_rate * (1 - pressure/ceiling). At pressure=0 the slope is
+            # idle_rate, same as the old unbounded accumulation; as pressure
+            # approaches the ceiling the slope approaches zero. Closed form,
+            # like AffectEngine's own relaxation terms — never overshoots,
+            # tick-rate invariant (docs/AFFECT_CHARACTERIZATION.md 3b) at any
+            # dt on its own.
+            k = self._idle_rate / self._pressure_ceiling
+            relax = 1.0 - math.exp(-k * dt)
+            self._pressure += (self._pressure_ceiling - self._pressure) * relax
 
     @property
     def pressure(self) -> float:

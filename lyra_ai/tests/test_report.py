@@ -1,0 +1,668 @@
+"""Tests for lyra_core.report — read-only self-report (CP-C).
+
+Async tests here run under pytest-asyncio (asyncio_mode = "auto",
+lyra_ai/pyproject.toml — already configured before this checkpoint; see
+DECISIONS.md). No mocks for the store: a real Store, a real tmp sqlite
+file, real atoms — report.py's whole point is querying real data.
+"""
+from __future__ import annotations
+
+import time
+from pathlib import Path
+
+import pytest
+
+from lyra_core.report import (
+    FIELDS,
+    KNOWN_GAPS,
+    UNAVAILABLE,
+    classify_misses,
+    collect_from_path,
+    collect_measurements,
+    format_log_line,
+    open_read_only,
+    path_label,
+    render,
+)
+from lyra_core.interface import DECLINED_MARKER
+from lyra_memory.store import Store
+
+
+# ── classify_misses ─────────────────────────────────────────────────────────
+
+def test_classify_misses_both_hit_when_no_miss_recorded():
+    assert classify_misses([]) == (True, True)
+
+
+def test_classify_misses_vector_missed():
+    assert classify_misses(["semantic: nothing above similarity floor 0.35"]) == (False, True)
+
+
+def test_classify_misses_lexical_missed():
+    assert classify_misses(["lexical: no BM25 match"]) == (True, False)
+
+
+def test_classify_misses_neither_hit():
+    assert classify_misses(["semantic: nothing above similarity floor 0.35",
+                              "lexical: query had no selective tokens"]) == (False, False)
+
+
+def test_classify_misses_ignores_unrelated_miss_strings():
+    """A "recall: ..." miss (temporal withheld) says nothing about either
+    path on its own — must not be misread as a vector or lexical miss."""
+    assert classify_misses(["recall: no relevant hit on any path; temporal pool withheld"]) == (True, True)
+
+
+# ── path_label (CP-D: shared with runtime.py's INTENT_EXECUTED/OUTCOME_RECORDED) ──
+
+@pytest.mark.parametrize("vector_hit,fts_hit,expected", [
+    (True, True, "both"),
+    (True, False, "vector"),
+    (False, True, "fts"),
+    (False, False, "neither"),
+])
+def test_path_label(vector_hit, fts_hit, expected):
+    assert path_label(vector_hit, fts_hit) == expected
+
+
+# ── format_log_line / render ────────────────────────────────────────────────
+
+def test_format_log_line_covers_every_stable_field():
+    line = format_log_line({})
+    assert line.startswith("SELF_REPORT ")
+    for f in FIELDS:
+        assert f"{f}=" in line
+
+
+def test_format_log_line_uses_unavailable_for_missing_fields():
+    line = format_log_line({"atoms_today": 5})
+    assert "atoms_today=5" in line
+    assert f"atoms_total={UNAVAILABLE}" in line
+
+
+def test_format_log_line_formats_floats_with_fixed_precision():
+    line = format_log_line({"emotion_v": -0.1})
+    assert "emotion_v=-0.100000" in line
+
+
+def test_render_includes_every_known_gap_verbatim():
+    text = render({}, window_days=7)
+    for gap in KNOWN_GAPS:
+        assert gap in text
+
+
+def test_render_shows_window_days():
+    text = render({}, window_days=30)
+    assert "last 30 days" in text
+
+
+def test_render_never_raises_on_a_fully_unavailable_measurement_set():
+    """Mirrors the daemon's own fallback (open failed -> {}) — every field
+    read via .get(..., UNAVAILABLE), so an empty dict must render cleanly."""
+    text = render({}, window_days=7)
+    assert UNAVAILABLE in text
+
+
+# ── collect_measurements / collect_from_path — real Store, real atoms ─────────
+
+@pytest.fixture
+async def store(tmp_path: Path) -> Store:
+    s = await Store.open(tmp_path / "store.db")
+    yield s
+    await s.close()
+
+
+async def test_collect_measurements_counts_atoms_written_today(store, tmp_path):
+    await store.append_atom(speaker="wilson", source="cli", text="hello there")
+    await store.append_atom(speaker="lyra", source="cli", text="hi wilson")
+
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["atoms_today"] == 2
+    assert m["atoms_total"] == 2
+
+
+async def test_collect_measurements_splits_retrievability_by_floor(store, tmp_path):
+    id1 = await store.append_atom(speaker="wilson", source="cli", text="a")
+    id2 = await store.append_atom(speaker="wilson", source="cli", text="b")
+    await store.db.execute("UPDATE atoms SET retrievability = 0.05 WHERE id = ?", (id1,))
+    await store.db.execute("UPDATE atoms SET retrievability = 0.9 WHERE id = ?", (id2,))
+    await store.db.commit()
+
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["atoms_below_floor"] == 1
+    assert m["atoms_above_floor"] == 1  # NULL retrievability counts as above
+
+
+async def test_collect_measurements_selftest_finds_verbatim_match(store, tmp_path):
+    """Using an atom's own text as the query — both paths should hit
+    (exact FTS match, and cosine ~1.0 under any embedder)."""
+    await store.append_atom(speaker="wilson", source="cli", text="a distinctive sentence about retrieval")
+
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["selftest_assemblies"] == 1
+    assert m["selftest_with_hit"] == 1
+    assert m["selftest_both"] == 1
+    assert m["selftest_neither"] == 0
+
+
+async def test_collect_measurements_context_log_empty_reports_zero_not_missing(store, tmp_path):
+    """CP-D.0: context_log has no rows yet on a fresh store — the logged_*
+    fields must be present as zeros, not absent."""
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["logged_assemblies_window"] == 0
+    assert m["logged_empty_window"] == 0
+
+
+async def test_collect_measurements_context_log_counts_a_real_ingest_turn_row(store, tmp_path):
+    user_id, lyra_id = await store.ingest_turn(
+        user_text="hello", lyra_text="hi there",
+        injected={"atom_ids": [], "fact_ids": [], "dream_ids": [], "budget_used": 0},
+    )
+    assert (user_id, lyra_id) != (None, None)
+
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["logged_assemblies_window"] == 1
+    assert m["logged_empty_window"] == 1, "no atom_ids were injected — an empty retrieval, visible as a row"
+    assert m["logged_with_hit_window"] == 0
+
+
+async def test_collect_measurements_context_log_nonempty_atom_ids_counts_as_with_hit(store, tmp_path):
+    await store.ingest_turn(
+        user_text="q", lyra_text="a",
+        injected={"atom_ids": [1, 2], "fact_ids": [], "dream_ids": [], "budget_used": 10},
+    )
+
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["logged_with_hit_window"] == 1
+    assert m["logged_empty_window"] == 0
+    # No misses recorded -> both paths counted as having contributed.
+    assert m["logged_both_window"] == 1
+
+
+async def test_collect_measurements_context_log_declined_row_counted_separately(store, tmp_path):
+    """CP-D: a turn that declined to retrieve (interface.DECLINED_MARKER in
+    misses) must not be folded into vector/fts/both/neither — those all
+    describe retrieval that actually ran."""
+    await store.ingest_turn(
+        user_text="q", lyra_text="a",
+        injected={"atom_ids": [], "fact_ids": [], "dream_ids": [], "budget_used": 0,
+                  "misses": [DECLINED_MARKER]},
+    )
+
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["logged_assemblies_window"] == 1
+    assert m["logged_declined_window"] == 1
+    assert m["logged_empty_window"] == 0
+    assert m["logged_both_window"] == 0
+    assert m["logged_neither_window"] == 0
+
+
+async def test_collect_measurements_outcomes_zero_on_a_fresh_store(store, tmp_path):
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["outcomes_total"] == 0
+
+
+async def test_collect_measurements_current_affect_from_persisted_fact(store, tmp_path):
+    import json
+    now = time.time()
+    await store.db.execute(
+        "INSERT INTO facts (ts, subject, text, source_kind, confidence, valid_from)"
+        " VALUES (?, '_lyra_internal_affect_state', ?, 'inferred', 1.0, ?)",
+        (now, json.dumps({"emotion_v": 0.25, "emotion_a": -0.1, "mood_v": 0.0, "mood_a": 0.0}), now),
+    )
+    await store.db.commit()
+
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["emotion_v"] == 0.25
+    assert m["emotion_a"] == -0.1
+
+
+async def test_collect_measurements_affect_unavailable_when_never_persisted(store, tmp_path):
+    """The gap this checkpoint found: nothing writes the affect_state fact
+    except CognitiveCore.stop() — a store no session has ever cleanly
+    stopped against has no current affect to report."""
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["emotion_v"] == UNAVAILABLE
+
+
+async def test_collect_measurements_never_raises_on_a_broken_section(store, tmp_path, monkeypatch):
+    """change 5: a failing measurement query marks its own fields
+    unavailable rather than taking the whole collection down."""
+    async def _boom(*a, **kw):
+        raise RuntimeError("simulated failure")
+
+    import lyra_core.report as report_module
+    monkeypatch.setattr(report_module, "_outcomes_section", _boom)
+
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["outcomes_total"] == UNAVAILABLE
+    assert m["atoms_total"] == 0  # unaffected sections still work
+
+
+async def test_collect_from_path_is_read_only_and_never_writes(tmp_path):
+    """The store is opened mode=ro: this must succeed against a store it
+    cannot write to, and the store must be unchanged afterward."""
+    store = await Store.open(tmp_path / "store.db")
+    await store.append_atom(speaker="wilson", source="cli", text="only atom")
+    await store.close()
+
+    before = (tmp_path / "store.db").stat().st_size
+
+    m = await collect_from_path(
+        tmp_path / "store.db", tmp_path / "runs.db", None,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["atoms_total"] == 1
+
+    # A second read-only open must still work — nothing was left locked or
+    # mutated by the first.
+    m2 = await collect_from_path(
+        tmp_path / "store.db", tmp_path / "runs.db", None,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m2["atoms_total"] == 1
+    assert (tmp_path / "store.db").stat().st_size == before
+
+
+async def test_open_read_only_cannot_write(tmp_path):
+    store = await Store.open(tmp_path / "store.db")
+    await store.close()
+
+    store_like = await open_read_only(tmp_path / "store.db")
+    try:
+        with pytest.raises(Exception):
+            await store_like.db.execute(
+                "INSERT INTO atoms (ts, speaker, source, text) VALUES (0, 'wilson', 'cli', 'x')"
+            )
+    finally:
+        await store_like.db.close()
+
+
+async def test_collect_from_path_reports_file_sizes(tmp_path):
+    store = await Store.open(tmp_path / "store.db")
+    await store.close()
+    history_path = tmp_path / "history.db"
+    history_path.write_bytes(b"x" * 100)
+
+    m = await collect_from_path(
+        tmp_path / "store.db", tmp_path / "runs.db", history_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["store_db_bytes"] > 0
+    assert m["history_db_bytes"] == 100
+
+
+async def test_collect_from_path_history_bytes_unavailable_when_missing(tmp_path):
+    store = await Store.open(tmp_path / "store.db")
+    await store.close()
+
+    m = await collect_from_path(
+        tmp_path / "store.db", tmp_path / "runs.db", tmp_path / "no_such_history.db",
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["history_db_bytes"] == UNAVAILABLE
+
+
+# ── CP-D: the intent loop, parsed from the daemon's log (change 7) ────────────
+
+def _write_log(path: Path, lines: list[str]) -> None:
+    fmt = "2026-09-02 12:00:00,000 INFO lyra_core.runtime: {}\n"
+    path.write_text("".join(fmt.format(l) for l in lines))
+
+
+async def test_collect_from_path_counts_loop_markers_from_the_log(tmp_path):
+    store = await Store.open(tmp_path / "store.db")
+    await store.close()
+    log_path = tmp_path / "lyra_core.log"
+    _write_log(log_path, [
+        "INTENT_PRODUCED turn=1 kind=retrieval",
+        "INTENT_EXECUTED turn=1 kind=retrieval atom_count=2 path=both",
+        "OUTCOME_RECORDED turn=1 outcome_id=1 atom_count=2 path=both context_log_id=1",
+        "CONSOLIDATOR_FIRED turn=1 outcome_id=1",
+        "CANDIDATE_CREATED turn=1 trait_name='retrieval finds relevant context'",
+        "INTENT_DECLINED turn=2 kind=retrieval valence=-0.900000",
+    ])
+
+    m = await collect_from_path(tmp_path / "store.db", tmp_path / "runs.db", None, log_path=log_path)
+
+    assert m["retrieval_passes_produced_window"] == 1
+    assert m["retrieval_passes_executed_window"] == 1
+    assert m["intents_declined_window"] == 1
+    assert m["consolidator_fired_window"] == 1
+    assert m["candidates_created_window_log"] == 1
+
+
+async def test_collect_from_path_loop_counts_unavailable_without_a_log(tmp_path):
+    store = await Store.open(tmp_path / "store.db")
+    await store.close()
+
+    m = await collect_from_path(
+        tmp_path / "store.db", tmp_path / "runs.db", None,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["retrieval_passes_produced_window"] == UNAVAILABLE
+    assert m["consolidator_fired_window"] == UNAVAILABLE
+
+
+async def test_collect_measurements_candidates_created_window_from_db(store, tmp_path):
+    from lyra_core.interface import CognitiveCore
+
+    core = CognitiveCore(memory=store)
+    await core.consolidate_retrieval_outcome(had_context=True)
+
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["candidates_created_window"] == 1
+    assert m["candidates_total"] == 1
+
+
+# ── candidate evidence-vs-threshold gap (CP-F change 7) ────────────────────────
+
+async def test_collect_measurements_candidate_gap_before_any_promotion(store, tmp_path):
+    from lyra_core.interface import CognitiveCore
+
+    core = CognitiveCore(memory=store)
+    for _ in range(3):
+        await core.consolidate_retrieval_outcome(had_context=True)  # evidence_count=3
+
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["_candidate_gaps"] == [("retrieval finds relevant context", 3, 2)]
+
+
+async def test_collect_measurements_candidate_gap_reflects_next_untouched_threshold(store, tmp_path):
+    """Once evidence_count crosses TRAIT_THRESHOLDS['surface'] (5), the gap
+    reported is to 'character' (15), not to 'surface' again."""
+    from lyra_core.interface import CognitiveCore
+
+    core = CognitiveCore(memory=store)
+    for _ in range(6):
+        await core.consolidate_retrieval_outcome(had_context=True)  # evidence_count=6
+
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["_candidate_gaps"] == [("retrieval finds relevant context", 6, 9)]
+
+
+async def test_collect_measurements_candidate_gap_zero_at_or_above_core(store, tmp_path):
+    from lyra_core.interface import CognitiveCore
+
+    core = CognitiveCore(memory=store)
+    for _ in range(50):
+        await core.consolidate_retrieval_outcome(had_context=True)
+
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["_candidate_gaps"] == [("retrieval finds relevant context", 50, 0)]
+
+
+def test_render_includes_candidate_gap_line():
+    m = {"_candidate_gaps": [("retrieval finds relevant context", 3, 2)]}
+    text = render(m, window_days=7)
+    assert "retrieval finds relevant context: evidence=3  gap=2" in text
+
+
+# ── repo index / repo-query outcomes (CP-G change 8) ────────────────────────
+
+async def _index_one_commit(store, full_hash="a" * 40, valid_from=1_700_000_000.0):
+    await store.db.execute(
+        "INSERT INTO facts (ts, subject, text, source_atom_id, source_kind, confidence, valid_from, valid_until)"
+        " VALUES (?, ?, ?, NULL, 'repo_commit', 1.0, ?, NULL)",
+        (time.time(), full_hash, f"[{full_hash[:7]}] 2026-09-02 Claude: a commit", valid_from),
+    )
+    await store.db.commit()
+
+
+async def test_collect_measurements_commits_indexed_counts_repo_commit_facts(store, tmp_path):
+    await _index_one_commit(store, full_hash="a" * 40)
+    await _index_one_commit(store, full_hash="b" * 40)
+    await store.db.execute(
+        "INSERT INTO facts (ts, subject, text, source_kind, confidence, valid_from)"
+        " VALUES (?, 'Wilson', 'graduated from FGCU', 'stated', 0.9, ?)",
+        (time.time(), time.time()),
+    )
+    await store.db.commit()
+
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["commits_indexed"] == 2
+
+
+async def test_collect_measurements_repo_citations_zero_on_a_fresh_store(store, tmp_path):
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["commits_indexed"] == 0
+    assert m["repo_citations_checked_window"] == 0
+    assert m["repo_citations_hit_window"] == 0
+    assert m["repo_citations_miss_window"] == 0
+    assert m["repo_citation_false_rate_window"] == 0.0
+
+
+async def test_collect_measurements_repo_citations_reads_outcomes_environment(store, tmp_path):
+    from lyra_core.interface import CognitiveCore
+
+    core = CognitiveCore(memory=store)
+    await _index_one_commit(store, full_hash="a" * 40)
+    user_id = await store.append_atom(speaker="wilson", source="cli", text="what commit was that")
+    await core.record_repo_query_outcome(user_id, context_log_id=1, hit_count=2, miss_count=1)
+
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["repo_citations_checked_window"] == 3
+    assert m["repo_citations_hit_window"] == 2
+    assert m["repo_citations_miss_window"] == 1
+    assert m["repo_citation_false_rate_window"] == pytest.approx(1 / 3)
+
+
+async def test_collect_measurements_repo_citations_does_not_count_retrieval_outcomes(store, tmp_path):
+    """A retrieval outcome's `environment` (context_log_id=...;atom_count=...)
+    must not be mistaken for a repo-query outcome — only rows whose
+    environment starts with 'kind=repo_query' are counted."""
+    from lyra_core.interface import CognitiveCore
+
+    core = CognitiveCore(memory=store)
+    user_id = await store.append_atom(speaker="wilson", source="cli", text="hi")
+    await core.record_retrieval_outcome(user_id, context_log_id=1, atom_count=3, path="both")
+
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["repo_citations_checked_window"] == 0
+    assert m["outcomes_total"] == 1
+
+
+# ── CP-J: multi-pass retrieval, pass-count distribution (change 8) ─────────
+
+async def test_collect_measurements_retrieval_pass_distribution_fresh_store(store, tmp_path):
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["retrieval_pass_distribution_window"] == "(none)"
+    assert m["retrieval_cap_hit_window"] == 0
+
+
+async def test_collect_measurements_retrieval_pass_distribution_groups_by_context_log_id(store, tmp_path):
+    """Two passes of one turn (shared context_log_id=1) and one pass of a
+    second turn (context_log_id=2) must land in the "2 passes: 1 turn" /
+    "1 pass: 1 turn" buckets, not be counted as three separate one-pass
+    turns — pass count is derived from outcomes rows sharing a
+    context_log_id, per CP-J change 8."""
+    from lyra_core.interface import CognitiveCore
+
+    core = CognitiveCore(memory=store)
+    user_id = await store.append_atom(speaker="wilson", source="cli", text="hi")
+    await core.record_retrieval_outcome(user_id, context_log_id=1, atom_count=3, path="both", pass_index=1)
+    await core.record_retrieval_outcome(user_id, context_log_id=1, atom_count=1, path="vector", pass_index=2)
+    await core.record_retrieval_outcome(user_id, context_log_id=2, atom_count=0, path="neither", pass_index=1)
+
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["retrieval_pass_distribution_window"] == "1=1;2=1"
+    assert m["retrieval_cap_hit_window"] == 0
+
+
+async def test_collect_measurements_retrieval_cap_hit_counts_turns_at_the_cap(store, tmp_path):
+    from lyra_core.config import RETRIEVAL_PASS_CAP
+    from lyra_core.interface import CognitiveCore
+
+    core = CognitiveCore(memory=store)
+    user_id = await store.append_atom(speaker="wilson", source="cli", text="hi")
+    for i in range(1, RETRIEVAL_PASS_CAP + 1):
+        await core.record_retrieval_outcome(
+            user_id, context_log_id=1, atom_count=1, path="vector", pass_index=i)
+
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["retrieval_pass_distribution_window"] == f"{RETRIEVAL_PASS_CAP}=1"
+    assert m["retrieval_cap_hit_window"] == 1
+
+
+def test_render_includes_retrieval_pass_fields():
+    m = {
+        "retrieval_passes_produced_window": 7,
+        "retrieval_passes_executed_window": 7,
+        "intents_declined_window": 2,
+        "retrieval_pass_distribution_window": "1=4;2=2;3=1",
+        "retrieval_cap_hit_window": 1,
+    }
+    text = render(m, window_days=7)
+    assert "passes produced     7" in text
+    assert "passes executed     7" in text
+    assert "declined (turns)    2" in text
+    assert "pass distribution (turns by pass count)  1=4;2=2;3=1" in text
+    assert "turns hitting the cap  1" in text
+
+
+def test_render_includes_repo_index_section():
+    m = {
+        "commits_indexed": 159,
+        "repo_query_produced_window": 3,
+        "repo_query_executed_window": 3,
+        "repo_citations_checked_window": 4,
+        "repo_citations_hit_window": 3,
+        "repo_citations_miss_window": 1,
+        "repo_citation_false_rate_window": 0.25,
+    }
+    text = render(m, window_days=7)
+    assert "2j. repo index (CP-G)" in text
+    assert "commits indexed     159" in text
+    assert "citation false rate 0.2500" in text
+
+
+def test_format_log_line_includes_repo_fields():
+    m = {f: 0 for f in FIELDS}
+    line = format_log_line(m)
+    assert "commits_indexed=0" in line
+    assert "repo_citation_false_rate_window=0" in line
+
+
+# ── citation candidates, per label (CP-H change 6) ──────────────────────────
+
+async def test_collect_measurements_repo_citation_labels_empty_on_a_fresh_store(store, tmp_path):
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    assert m["_repo_citation_labels"] == []
+
+
+async def test_collect_measurements_repo_citation_labels_breaks_out_by_label(store, tmp_path):
+    from lyra_core.interface import CognitiveCore
+
+    core = CognitiveCore(memory=store)
+    await core.consolidate_repo_citation_outcome(True, hit_count=1, miss_count=0, outcome_id=1)
+    await core.consolidate_repo_citation_outcome(True, hit_count=1, miss_count=0, outcome_id=2)
+    await core.consolidate_repo_citation_outcome(True, hit_count=0, miss_count=1, outcome_id=3)
+
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    labels = {name: (ec, gap) for name, ec, gap in m["_repo_citation_labels"]}
+    assert labels["repo citations verified"] == (2, 3)
+    assert labels["repo citations include a false hash"] == (1, 4)
+
+
+async def test_collect_measurements_repo_citation_labels_excludes_other_categories(store, tmp_path):
+    """Only category='repo_citation' rows appear here — a retrieval
+    candidate (category='retrieval') must not bleed into this breakdown."""
+    from lyra_core.interface import CognitiveCore
+
+    core = CognitiveCore(memory=store)
+    await core.consolidate_retrieval_outcome(had_context=True)
+    await core.consolidate_repo_citation_outcome(True, hit_count=1, miss_count=0, outcome_id=1)
+
+    m = await collect_measurements(
+        store, store_path=tmp_path / "store.db", runs_path=store.runs_path,
+        log_path=tmp_path / "no_such_log.log",
+    )
+    names = [name for name, _ec, _gap in m["_repo_citation_labels"]]
+    assert names == ["repo citations verified"]
+    # sanity: the retrieval candidate is still in the generic, all-category list
+    generic_names = [name for name, _ec, _gap in m["_candidate_gaps"]]
+    assert "retrieval finds relevant context" in generic_names
+
+
+def test_render_includes_repo_citation_candidates_section():
+    m = {"_repo_citation_labels": [("repo citations verified", 3, 2)]}
+    text = render(m, window_days=7)
+    assert "2k. repo citation candidates, per label (CP-H)" in text
+    assert "repo citations verified: evidence=3  gap=2" in text
+
+
+def test_render_repo_citation_candidates_section_handles_no_labels_yet():
+    text = render({}, window_days=7)
+    assert "(none yet)" in text

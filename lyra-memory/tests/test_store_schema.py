@@ -150,7 +150,9 @@ async def test_rejected_atom_leaves_nothing_behind(store: Store):
 
 def test_vocabularies_match_the_sheet():
     assert SPEAKERS == {"wilson", "lyra", "system"}
-    assert SOURCES == {"cli", "wakeword", "ambient", "vision", "sandbox_read"}
+    # CP-J: "deliberation" added — one atom per retrieval pass, marked
+    # distinguishably from a lived exchange (see DECISIONS.md, CP-J change 3).
+    assert SOURCES == {"cli", "wakeword", "ambient", "vision", "sandbox_read", "deliberation"}
     assert ENVIRONMENTS == {"cli", "shell", "physics", "bns"}
 
 
